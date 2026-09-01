@@ -84,16 +84,23 @@ dev.conf.net = {
 
 -- Status LED for the controller's Locate action and its Manage > LED toggle.
 --
--- This board has no status LED to drive. Its device tree declares
--- led-status-blue / led-status-yellow (gpio-leds) but neither is registered:
--- /sys/class/leds holds only the two mt76 radio LEDs. mt76-phy0 (the 2.4 GHz
--- radio) is therefore the only thing Locate can blink, and led.lua snapshots
--- and restores its phy0tpt throughput trigger so identifying the AP does not
--- permanently kill the activity light. The Manage > LED toggle is a genuine
--- steady on/off and does leave the radio LED as a plain indicator until the
--- next Locate — an honest trade for a board with nothing better.
-dev.conf.led = "mt76-phy0"
-
+-- REQUIRES `kmod-leds-gpio` on the device. The board's single case LED is a
+-- blue/yellow pair on GPIO 521/522, declared in the device tree — but the
+-- stock OpenWrt 25.12 filogic image ships no gpio-leds driver, so nothing
+-- claims those GPIOs, /sys/class/leds holds only the two mt76 radio LEDs, and
+-- the case LED sits at whatever the bootloader left it (a steady orange: the
+-- yellow half on). Installing the module (9 KB) registers blue:status and
+-- yellow:status and the LED becomes drivable. Confirmed on the real board.
+--
+-- Do NOT be tempted by mt76-phy0 when the module is absent. It exists, it
+-- accepts writes, and it is connected to nothing on this board — Locate would
+-- report success and blink an LED that does not physically exist. Verified by
+-- forcing both mt76 LEDs to full brightness and watching the case: no change.
+--
+-- blue rather than yellow: on a UniFi AP a steady status LED means adopted
+-- and healthy, and yellow is this board's own "something is wrong" colour.
+-- The pair is on/off only (max_brightness 1), so there is no dimming.
+dev.conf.led = "blue:status"
 -- No dev.conf.vlan. There is no swconfig switch, so there is no physical port
 -- numbering to map, and switchvlan.detect_backend correctly declines to act
 -- (it returns "unknown" here: no `config switch`, no `config bridge-vlan`).

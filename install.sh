@@ -122,7 +122,17 @@ case "$1" in
 		# OPTIONAL: each one silently disables exactly one feature when absent
 		# -- provisioning still reports success while the feature does nothing
 		# -- so they are installed when affordable rather than merely mentioned.
-		try_optional lldpd         "LLDP topology / neighbour discovery"
+		# Only where the board declares gpio LEDs its running kernel cannot drive:
+	# a Xiaomi AX3000T's case LED is a gpio pair the stock filogic image has no
+	# driver for, so /sys/class/leds holds only the mt76 radio LEDs -- which on
+	# that board are wired to nothing. Locate then "succeeds" against an LED
+	# that does not physically exist. 9 KB, and pointless on a board whose LEDs
+	# already registered, hence the check rather than an unconditional install.
+	if [ -d /sys/bus/platform/devices/leds ] \
+		&& ! ls /sys/class/leds 2>/dev/null | grep -qv '^mt76-'; then
+		try_optional kmod-leds-gpio "status LED (Locate, Manage > LED)"
+	fi
+	try_optional lldpd         "LLDP topology / neighbour discovery"
 		try_optional hostapd-utils "Minimum RSSI, client kick, block-deauth"
 		try_optional usteer        "Band Steering"
 		try_optional ip-bridge     "wired clients behind the AP (bridge fdb)"

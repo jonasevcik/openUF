@@ -183,8 +183,8 @@ return {
 			local dev = dofile(MODELMAP_DIR .. "/xiaomi-ax3000t.lua")
 			assert_eq(dev.conf.net.lan_cpueth, "wan",
 				"the uplink socket, whose MAC is the board's label MAC")
-			assert_eq(dev.conf.led, "mt76-phy0",
-				"the only driveable LED on this board")
+			assert_eq(dev.conf.led, "blue:status",
+				"the board's real case LED, not the unwired mt76 radio LED")
 
 			local ports = dev.conf.net.ports
 			assert_eq(#ports, 4, "four sockets -- this board has no lan1")

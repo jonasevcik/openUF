@@ -163,7 +163,17 @@ The modelmap sets:
   **Manage → LED** toggle. Accepts a full sysfs path (`/sys/class/leds/tp-link:green:wlan`)
   or a bare LED name (`tp-link:green:wlan`). `nil` by default, since a generic profile can't
   know the board's LED — LED control is a silent no-op until you set it. Find yours with
-  `ls /sys/class/leds`
+  `ls /sys/class/leds`.
+  ⚠️ **Check the LED you name is actually wired.** `/sys/class/leds` lists what the drivers
+  registered, not what the case has. A radio LED (`mt76-phy0`, `phy0-led`) is registered by
+  the wireless driver on every board whether or not the pin goes anywhere — Locate will
+  report success and blink nothing. And a board whose LEDs are on GPIO needs the
+  `kmod-leds-gpio` module: without it the device tree's LEDs never register at all, the
+  GPIOs stay unclaimed at whatever the bootloader left, and only the radio LEDs show up.
+  Both were true of a Xiaomi AX3000T. Confirm by writing to it and looking at the box:
+  ```sh
+  echo none > /sys/class/leds/<led>/trigger; echo 1 > /sys/class/leds/<led>/brightness
+  ```
 - `dev.openuf.uap.ufmodel`  — Which ufmodel file to load (e.g. `"u6iw"`)
 - `dev.openuf.uap.hwassign` — UCI radio names to report to the controller
   (e.g. `{"radio0", "radio1"}`). Every other `wifi-device` on the board is left out of
