@@ -519,15 +519,42 @@ the wire.
 openUF applies it only on **swconfig** boards (ath79-era). It writes one
 `config switch_vlan` section per VLAN, named `openuf_swvlan<id>`, translating the
 controller's `untagged`/`tagged`/`exclude` per-port modes into swconfig's port syntax
-(`1`, `1t`, omitted) with the CPU port always tagged in. On a DSA board (OpenWrt 21.02+,
-where this would be `config bridge-vlan`) it logs and does nothing rather than emitting
-config nobody has verified.
+(`1`, `1t`, omitted) with the CPU port always tagged in.
 
-> Worth knowing before you go looking for it: openUF reports `hasOWRTSwitch` regardless
-> of backend, so on a DSA board the controller still **offers** Port VLAN and still
-> **accepts** an assignment. The device then refuses it, in the log and nowhere else —
-> the controller has no way to say "this device cannot". `logread -e openuf` is where
-> that shows up. VLAN-tagged *SSIDs* are a different path and do work on DSA (above).
+**On a DSA board it works differently, and deliberately not via `config bridge-vlan`.**
+The socket assigned to VLAN 10 is moved out of `br-lan` and into `br-openuf10` — the
+bridge that already holds the tagged uplink sub-device `wan.10`, and the IoT VAP if a
+tagged SSID sits on the same VLAN:
+
+```
+device on lan3 --untagged--> lan3 -> br-openuf10 -> wan.10 --tagged--> uplink -> gateway
+```
+
+That a wired port and a wireless client on VLAN 10 land in the *same* bridge is the point,
+not a coincidence: they are one broadcast domain and the controller models them as one
+network. `br-lan` keeps the uplink socket, the unassigned sockets and the AP's management
+address, untouched.
+
+The `bridge-vlan` + `vlan_filtering` route was rejected for two reasons, both worth knowing
+if you are tempted to add it:
+
+1. `br-lan` carries the AP's own management address. Turning `vlan_filtering` on there means
+   every VLAN — the management one included — must be declared exactly right, or the device
+   is stranded at the far end of a cable. Nothing openUF does should be able to do that.
+2. It would silently fight the tagged-SSID path. `wan.10` is an 8021q device on the `wan`
+   **bridge port**, and `vlan_do_receive()` runs ahead of the bridge's `rx_handler`, so
+   VLAN 10 frames are taken by `wan.10` before `br-lan` ever sees them. A `bridge-vlan`
+   declaring VLAN 10 on `br-lan` would receive nothing while looking perfectly correct.
+
+Scope on DSA: **Native VLAN only.** A bridge gives a port exactly one untagged home, which
+is what a Native VLAN is and what an AP's downstream socket needs. A port given nothing but
+*tagged* VLANs is refused with a log line rather than half-applied. (The controller's default
+"Tagged VLAN Management: Allow All" marks every non-native VLAN tagged — that is a default,
+not a request, and is not warned about.)
+
+Reversibility on DSA is `st.dsa_brlan_ports`: `br-lan`'s port list exactly as the board
+shipped it, snapshotted once before the first socket moves. Unticking **Port VLAN** puts it
+back verbatim and returns the sockets from the VLAN bridges.
 
 Three things must line up or the port is skipped rather than guessed at:
 

@@ -86,6 +86,51 @@ local function override()
 	}
 end
 
+-- A DSA board: no `config switch`, no `config bridge-vlan`, a br-lan device
+-- section holding the four sockets, and the bridge a tagged SSID already
+-- built for VLAN 10. Modelled on the Xiaomi AX3000T.
+local function dsa_board()
+	local u = new_mock_uci()
+	u.cursor:set("network", "brlan", "device")
+	u.cursor:set("network", "brlan", "type", "bridge")
+	u.cursor:set("network", "brlan", "name", "br-lan")
+	u.cursor:set("network", "brlan", "ports", {"lan2", "lan3", "lan4", "wan"})
+	u.cursor:set("network", "openuf_brdev10", "device")
+	u.cursor:set("network", "openuf_brdev10", "type", "bridge")
+	u.cursor:set("network", "openuf_brdev10", "name", "br-openuf10")
+	u.cursor:set("network", "openuf_brdev10", "ports", {"wan.10"})
+	return u
+end
+
+local DSA_CFG = {
+	net = {lan_name = "lan", lan_cpueth = "wan", lan_vlanid = 1, ports = {
+		{idx = 1, ifname = "wan"},
+		{idx = 2, ifname = "lan2"},
+		{idx = 3, ifname = "lan3"},
+		{idx = 4, ifname = "lan4"},
+	}},
+}
+
+-- Port 3 (lan3) assigned native VLAN 10.
+local function dsa_push(port_idx, vid)
+	return {
+		enabled = true,
+		vlans   = {[vid] = {mode = "tagged", enabled = true}},
+		ports   = {[port_idx] = {pvid = vid,
+			vlans = {[1] = "exclude", [vid] = "untagged"}}},
+	}
+end
+
+local function ports_of(u, section)
+	local v = u.db.network[section].ports
+	if type(v) == "string" then return {v} end
+	return v or {}
+end
+
+local function joined(u, section)
+	return table.concat(ports_of(u, section), ",")
+end
+
 local function with_capture(fn)
 	local cmds = {}
 	local orig = switchvlan._exec
@@ -702,6 +747,201 @@ return {
 				switchvlan._popen = orig
 				assert_not_nil(u.db.network.openuf_swvlan8, "VLAN 8 fits in 16 entries")
 				assert_eq(u.db.network.openuf_swvlan8.vlan, "8", "written as the id")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: an assigned socket moves from br-lan into the VLAN's bridge",
+		fn = function()
+			-- The whole feature. lan3 leaves br-lan and joins br-openuf10 --
+			-- the same bridge the tagged SSID's wan.10 is already in, because
+			-- a wired and a wireless client on VLAN 10 are one broadcast
+			-- domain and the controller models them as one network.
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				local st = {}
+				local changed = switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				assert_true(changed, "UCI changed")
+				assert_eq(joined(u, "brlan"), "lan2,lan4,wan", "lan3 left br-lan")
+				assert_eq(joined(u, "openuf_brdev10"), "wan.10,lan3",
+					"and joined the VLAN 10 bridge, behind its tagged uplink")
+				assert_eq(cmds[#cmds], "/etc/init.d/network reload 2>/dev/null",
+					"network reloaded once")
+				assert_eq(table.concat(st.dsa_brlan_ports, ","), "lan2,lan3,lan4,wan",
+					"br-lan's original ports are in the ledger, pristine")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: the uplink socket is never reassigned",
+		fn = function()
+			-- The rule that keeps the AP reachable. Moving the socket the
+			-- gateway is behind into an isolated bridge strands the device at
+			-- the far end of a cable with no way back.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				silently(function()
+					local changed = switchvlan.apply(dsa_push(1, 10), DSA_CFG, {}, {}, nil, "wan")
+					assert_false(changed, "nothing applied")
+				end)
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan", "br-lan untouched")
+				assert_eq(joined(u, "openuf_brdev10"), "wan.10", "and the uplink stayed put")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: an unknown uplink refuses every port, not just the uplink",
+		fn = function()
+			-- Fail closed. If the bridge FDB cannot say which socket faces the
+			-- gateway -- an ARP cache that has not populated yet is enough --
+			-- then applying ANY assignment is a coin flip on whether the one
+			-- being moved is the uplink.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				silently(function()
+					assert_false(switchvlan.apply(dsa_push(3, 10), DSA_CFG, {}, {}, nil, nil),
+						"nothing applied without a known uplink")
+				end)
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan", "br-lan untouched")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: un-assigning a socket brings it back to br-lan",
+		fn = function()
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				assert_eq(joined(u, "brlan"), "lan2,lan4,wan", "moved out")
+
+				-- Same push with the port assignment removed.
+				local off = {enabled = true, vlans = {}, ports = {}}
+				local changed = switchvlan.apply(off, DSA_CFG, st, {}, nil, "wan")
+				assert_true(changed, "the reconcile changed UCI")
+				assert_eq(joined(u, "brlan"), "lan2,lan4,wan,lan3", "lan3 is back in br-lan")
+				assert_eq(joined(u, "openuf_brdev10"), "wan.10",
+					"and out of the VLAN bridge, which keeps its tagged uplink")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: restore puts br-lan back exactly as the board shipped it",
+		fn = function()
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				assert_true(switchvlan.restore(st), "restore ran")
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan", "original port list, in order")
+				assert_eq(joined(u, "openuf_brdev10"), "wan.10",
+					"the VLAN bridge survives -- a tagged SSID may still need it")
+				assert_nil(st.dsa_brlan_ports, "ledger spent")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: the ledger records the board's config, never openUF's own",
+		fn = function()
+			-- The failure this guards is silent and unrecoverable: snapshot
+			-- after the first mutation and restore() faithfully puts back a
+			-- br-lan that is already missing the moved socket, while
+			-- reporting success. Same trap the swconfig ledger hit.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				local first = table.concat(st.dsa_brlan_ports, ",")
+				-- A second push moves another socket; the ledger must not move.
+				switchvlan.apply(dsa_push(4, 10), DSA_CFG, st, {}, nil, "wan")
+				assert_eq(table.concat(st.dsa_brlan_ports, ","), first,
+					"still the pristine list after a second mutation")
+				assert_eq(first, "lan2,lan3,lan4,wan", "which is the board's own")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: a tagged assignment is refused rather than half-applied",
+		fn = function()
+			-- A bridge gives a port exactly one untagged home, which is what a
+			-- Native VLAN is. Tagged membership would need a <ifname>.<vid>
+			-- sub-device; no AP port control emits it, so it is declined out
+			-- loud instead of shipped unverified.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local push = {enabled = true, vlans = {[10] = {mode = "tagged"}},
+					ports = {[3] = {pvid = 1, vlans = {[10] = "tagged"}}}}
+				silently(function()
+					assert_false(switchvlan.apply(push, DSA_CFG, {}, {}, nil, "wan"),
+						"nothing applied")
+				end)
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan", "br-lan untouched")
+			end)
+
+			-- ...but a port that DID get a native VLAN is not "refused"
+			-- anything just because other VLANs came through tagged. The
+			-- controller's default Tagged VLAN Management is "Allow All",
+			-- which marks every non-native VLAN tagged -- warning on that
+			-- logged a line per VLAN on every inform about a default nobody
+			-- chose. Confirmed live: "port lan3 tagged into VLAN 1" fired
+			-- twice a push for a port that had been assigned correctly.
+			local u2 = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u2.mock
+				local push = {enabled = true, vlans = {[10] = {mode = "tagged"}},
+					ports = {[3] = {pvid = 10,
+						vlans = {[1] = "tagged", [10] = "untagged"}}}}
+				local warned = false
+				local real = io.stderr
+				io.stderr = {write = function(_, t)
+					if tostring(t):find("tagged") then warned = true end
+				end}
+				local ok = pcall(switchvlan.apply, push, DSA_CFG, {}, {}, nil, "wan")
+				io.stderr = real
+				assert_true(ok, "applied")
+				assert_false(warned, "no tagged warning for a port with a native VLAN")
+				assert_eq(joined(u2, "openuf_brdev10"), "wan.10,lan3", "and it moved")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: a port left on the management VLAN stays in br-lan",
+		fn = function()
+			-- Its native VLAN already IS br-lan; moving it into a bridge of
+			-- its own would cut it off from the AP's own network for nothing.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local push = {enabled = true, vlans = {[1] = {mode = "untagged"}},
+					ports = {[3] = {pvid = 1, vlans = {[1] = "untagged"}}}}
+				assert_false(switchvlan.apply(push, DSA_CFG, {}, {}, nil, "wan"),
+					"no change")
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan", "lan3 stayed home")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: a steady-state re-push changes nothing and reloads nothing",
+		fn = function()
+			-- Every inform carries the same switch block. Rewriting the
+			-- bridges each time would reload the network every ~10s and bounce
+			-- the wired client the feature exists to serve.
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				local n = #cmds
+				assert_false(switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan"),
+					"second identical push is a no-op")
+				assert_eq(#cmds, n, "and issues no reload")
 			end)
 		end
 	},

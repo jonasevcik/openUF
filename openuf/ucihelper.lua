@@ -531,6 +531,15 @@ end
 --   bridge.2.port.2.devname=eth0.20   (the tagged uplink)
 -- which is a specification, not decoration.
 --
+-- OWNERSHIP, since two modules write this bridge. This function guarantees
+-- one thing: the tagged uplink sub-device is a member. Any OTHER member it
+-- finds is left alone, because on a DSA board switchvlan puts the physical
+-- sockets assigned to this VLAN into the same bridge -- per-port VLAN and a
+-- tagged SSID on the same VID are the same L2 there, and must be. An earlier
+-- version set `ports` outright, which meant each push handed the bridge back
+-- and forth: apply_config resetting it to the uplink alone, switchvlan adding
+-- the sockets again, and a network reload on every inform.
+--
 -- Returns the UCI network/interface section name.
 function M.ensure_vlan_network(cpueth, vlan_id)
 	local uci = get_uci()
@@ -550,6 +559,19 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 			cursor:set("network", br_section, "name", br_name)
 			cursor:set("network", br_section, "ports", {ifname})
 			changed = true
+		else
+			-- Section already there: add the uplink if it is missing and
+			-- leave every other member in place (see OWNERSHIP above).
+			local ports = cursor:get("network", br_section, "ports")
+			if type(ports) == "string" then ports = {ports} end
+			ports = ports or {}
+			local have = false
+			for _, p in ipairs(ports) do if p == ifname then have = true end end
+			if not have then
+				ports[#ports + 1] = ifname
+				cursor:set("network", br_section, "ports", ports)
+				changed = true
+			end
 		end
 		if cursor:get("network", section_name, "device") ~= br_name then
 			cursor:set("network", section_name, "interface")
@@ -810,7 +832,9 @@ end
 -- cfg:  device configuration (from conf.lua); used for dev.conf.net.lan_cpueth
 --       when a VAP requires a VLAN-tagged network. VLAN tagging is skipped
 --       (falls back to "lan") if cfg is nil.
--- opts: optional table; opts.band_steering_active (boolean) forces 802.11k +
+-- opts: optional table; opts.keep_vlans is a set of VLAN ids that must keep
+--       their L2 even when no WLAN sits on them -- a wired port assigned to
+--       that VLAN on a DSA board lives in the same bridge. opts.band_steering_active (boolean) forces 802.11k +
 --       BSS Transition on for every managed iface regardless of each WLAN's
 --       own bss_transition setting, since usteer (Band Steering) needs it
 --       network-wide to function at all -- see openuf/usteer.lua. nil/false
@@ -1112,6 +1136,18 @@ function M.apply_config(resp, cfg, opts)
 
 			M.wlan_add(vap.radio, vap.ssid, vap.security, vap.x_passphrase, extra,
 				network, vap.wlanconf_id)
+		end
+	end
+
+	-- A VLAN no WLAN uses may still be wanted by a wired port assigned to it
+	-- (DSA per-port VLAN puts the socket in this same bridge -- see
+	-- ensure_vlan_network's OWNERSHIP note). Its bridge must survive the
+	-- prune below, and be built even when no WLAN mentions the VID at all.
+	for vid in pairs((opts and opts.keep_vlans) or {}) do
+		local n = tonumber(vid) or vid
+		if not wanted_vlans[n] and cpueth then
+			M.ensure_vlan_network(cpueth, n)
+			wanted_vlans[n] = true
 		end
 	end
 

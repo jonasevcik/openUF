@@ -90,6 +90,10 @@ M.FIELDS = {
 	-- every switch_vlan section openUF overwrote. Without it restore() has
 	-- nothing to put back and the board keeps openUF's VLAN config forever.
 	swvlan_backup             = "table",
+	-- The DSA counterpart: br-lan's port list exactly as the board shipped
+	-- it, before per-port VLAN moved any socket out of it. Same job, and the
+	-- same "only record of what to put back".
+	dsa_brlan_ports           = "table",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security

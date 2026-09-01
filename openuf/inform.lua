@@ -2519,6 +2519,25 @@ function M.handle_response(json_str, st, cfg)
 			-- empty trunk list that fails silently.
 			local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
 
+			-- VLANs that a WIRED port is assigned to. Computed before the
+			-- WiFi pass because their L2 is the same bridge a tagged SSID
+			-- uses, and apply_config prunes any bridge no WLAN wants --
+			-- which would delete the one a per-port assignment is about to
+			-- need, on every push, then have switchvlan rebuild it. DSA
+			-- only: on swconfig a port VLAN is a switch table entry, not a
+			-- bridge. Safe when nothing is pushed (an empty set).
+			local port_vlans = {}
+			if M._switchvlan and M._switchvlan.dsa_members
+				and not (cfg and cfg.vlan and cfg.vlan.ports) then
+				local br = M._sysinfo.bridge_of(cfg and cfg.net and cfg.net.lan_cpueth)
+				local up = br and M._sysinfo.uplink_bridge_port(br) or nil
+				local ok_pv, m = pcall(M._switchvlan.dsa_members,
+					M._parse_switch_system_cfg(sys_raw), cfg, up)
+				if ok_pv then
+					for vid in pairs(m or {}) do port_vlans[vid] = true end
+				end
+			end
+
 			local ufuci = M._ucihelper
 			if ufuci and ufuci.apply_config then
 				if #radio_table > 0 or #vap_table > 0 then
@@ -2536,7 +2555,8 @@ function M.handle_response(json_str, st, cfg)
 					M._usteer.set_enabled(steering_active, cfg)
 					pcall(ufuci.apply_config,
 						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
-						cfg, {band_steering_active = steering_active, device_name = device_name})
+						cfg, {band_steering_active = steering_active,
+							device_name = device_name, keep_vlans = port_vlans})
 				end
 			end
 
@@ -2557,10 +2577,15 @@ function M.handle_response(json_str, st, cfg)
 					end
 					-- Which socket the uplink cable is in, so a pushed port
 					-- VLAN can never be applied to it (see physical_port).
-					local uplink_phys = nil
+					-- Asked of whichever source this board has: the switch's
+					-- ARL table on swconfig, the bridge FDB on DSA.
+					local uplink_phys, uplink_ifname = nil, nil
 					if cfg and cfg.vlan and cfg.vlan.ports then
 						local swst = M._sysinfo.switch_status(cfg.vlan.device)
 						uplink_phys = M._sysinfo.uplink_phys_port(swst.arl)
+					else
+						local br = M._sysinfo.bridge_of(cfg and cfg.net and cfg.net.lan_cpueth)
+						if br then uplink_ifname = M._sysinfo.uplink_bridge_port(br) end
 					end
 					local sw = M._parse_switch_system_cfg(sys_raw)
 					if sw and not sw.enabled then
@@ -2583,12 +2608,14 @@ function M.handle_response(json_str, st, cfg)
 						-- the IoT WLAN's uplink. apply() reconciles both
 						-- concerns in one pass.
 						if #wireless_vlans > 0 then
-							M._switchvlan.apply(sw, cfg, st, wireless_vlans, uplink_phys)
+							M._switchvlan.apply(sw, cfg, st, wireless_vlans,
+								uplink_phys, uplink_ifname)
 						else
 							M._switchvlan.restore(st)
 						end
 					else
-						M._switchvlan.apply(sw, cfg, st, wireless_vlans, uplink_phys)
+						M._switchvlan.apply(sw, cfg, st, wireless_vlans,
+							uplink_phys, uplink_ifname)
 					end
 				end)
 			end

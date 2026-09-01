@@ -267,15 +267,19 @@ end
 --   switch_vlan section -- two writers would race to define the same VID.
 -- uplink_phys: the physical port the uplink cable is currently in, from
 --   sysinfo.uplink_phys_port -- see M.physical_port for why it is refused.
+-- uplink_ifname: the same answer on a DSA board, from
+--   sysinfo.uplink_bridge_port -- the socket's netdev name rather than a
+--   switch port number. Refused for exactly the same reason.
 -- Returns true when UCI was changed and a reload was issued.
-function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
+function M.apply(sw, cfg, st, wireless_vlans, uplink_phys, uplink_ifname)
 	local has_wireless = wireless_vlans and #wireless_vlans > 0
 	if (not sw or not sw.enabled) and not has_wireless then return false end
-	if not (cfg and cfg.vlan and cfg.vlan.ports and cfg.vlan.cpu_lan) then
-		io.stderr:write("switchvlan: no dev.conf.vlan for this board -- "
-			.. "per-port VLAN not applied (a guessed switch port map strands the device)\n")
-		return false
-	end
+	if not cfg then return false end
+	-- dev.conf.vlan is a SWCONFIG requirement -- it is the physical port-number
+	-- map. A DSA board correctly has none (each socket is its own netdev), so
+	-- that check waits until the backend is known, below. Checking it here
+	-- logged a scary line about a missing map on every single inform of a
+	-- board that neither has one nor needs one.
 	-- No early return on empty sw.ports: an enabled push whose last per-port
 	-- override was removed must still reach the reconcile below, or the
 	-- now-orphaned openuf_swvlan* sections would keep programming VLANs the
@@ -286,8 +290,16 @@ function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 
 	local backend = M.detect_backend(cursor)
 	if backend ~= "swconfig" then
-		io.stderr:write(("switchvlan: %s board -- per-port VLAN not applied "
-			.. "(only swconfig is implemented and verifiable here)\n"):format(backend))
+		-- DSA needs no trunk for a tagged SSID (the switch passes tags with
+		-- vlan_filtering off, and the 8021q device on the uplink bridge port
+		-- takes the VID before the bridge sees it), so wireless_vlans has
+		-- nothing to do here. Per-port VLAN is a bridge membership move --
+		-- see the DSA section below.
+		return M.dsa_apply(sw, cfg, st, uplink_ifname)
+	end
+	if not (cfg.vlan and cfg.vlan.ports and cfg.vlan.cpu_lan) then
+		io.stderr:write("switchvlan: no dev.conf.vlan for this swconfig board -- "
+			.. "per-port VLAN not applied (a guessed switch port map strands the device)\n")
 		return false
 	end
 
@@ -524,11 +536,307 @@ function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 	return true
 end
 
+-- === DSA: per-port VLAN without touching br-lan ============================
+--
+-- The swconfig path above programs a switch ASIC's VLAN table. DSA has no such
+-- table to write and no `swconfig` to write it with, and the obvious
+-- translation -- `config bridge-vlan` sections plus vlan_filtering on br-lan --
+-- is the wrong answer here twice over:
+--
+--   1. br-lan carries the AP's own management address and the uplink socket.
+--      Turning vlan_filtering on there means every VLAN, the management one
+--      included, must be declared exactly right or the device is stranded at
+--      the far end of a cable with no way back. That is the single most
+--      dangerous thing this module could do.
+--   2. It would silently fight the tagged-SSID path. `wan.10` is an 8021q
+--      device on the `wan` BRIDGE PORT, and vlan_do_receive() runs ahead of
+--      the bridge's rx_handler in __netif_receive_skb_core -- so VLAN 10
+--      frames are claimed by wan.10 before br-lan ever sees them. A
+--      bridge-vlan declaring VLAN 10 on br-lan would therefore never receive
+--      anything, while looking perfectly correct in UCI.
+--
+-- What DSA wants instead is the L2 openUF already builds for a tagged SSID.
+-- Assigning a socket to VLAN 10 means moving it out of br-lan and into
+-- br-openuf10 -- the bridge that already holds `wan.10`. Then:
+--
+--     device on lan3 --untagged--> lan3 -> br-openuf10 -> wan.10 --tagged--> uplink
+--
+-- and the return path is the same in reverse. br-lan keeps the uplink, the
+-- unassigned sockets and the management address, entirely untouched; nothing
+-- anywhere runs with vlan_filtering. A wired device and a wireless client on
+-- the same VLAN land in the same bridge, which is not a coincidence but the
+-- point -- they are one broadcast domain and the controller models them as
+-- one network.
+--
+-- Verified on a Xiaomi AX3000T (mt7530): the driver accepts a user port in a
+-- second bridge while br-lan keeps the rest. It drops that bridge to software
+-- forwarding (the port enters promiscuous mode), which costs nothing at the
+-- rates an AP's downstream socket carries.
+--
+-- OWNERSHIP of br-openuf<vid>: ucihelper.ensure_vlan_network guarantees the
+-- tagged uplink is a member and never removes anyone else; this module owns
+-- the socket members. Neither touches the other's.
+
+local OPENUF_BRDEV_PREFIX = "openuf_brdev"
+
+-- Which netdev a UniFi port_idx is on a DSA board, or nil plus a reason.
+--
+-- Same refusals as M.physical_port and for the same reasons: the uplink
+-- socket is never reassignable (moving it strands the device), and a board
+-- that cannot say which socket that is refuses every port rather than taking
+-- a coin flip on it.
+function M.dsa_ifname(cfg, port_idx, uplink_ifname)
+	local net = cfg and cfg.net
+	if not (net and net.ports) then return nil, "no dev.conf.net.ports" end
+	for _, p in ipairs(net.ports) do
+		if p.idx == port_idx then
+			if not p.ifname then return nil, "no ifname in modelmap" end
+			if p.uplink then return nil, "uplink" end
+			if not uplink_ifname then return nil, "uplink port unknown" end
+			if p.ifname == uplink_ifname then return nil, "uplink" end
+			return p.ifname
+		end
+	end
+	return nil, "no such port_idx"
+end
+
+-- Invert the controller's per-port matrix into {[vid] = {ifname, ...}}, the
+-- sockets that should become untagged members of each VLAN's bridge.
+--
+-- Only "untagged" is honoured. A bridge gives a port exactly one untagged
+-- home, which is precisely what a Native VLAN is, and that is the whole of
+-- what an AP's downstream socket needs. "tagged" would mean carrying a VID
+-- the attached device itself tags -- expressible as a <ifname>.<vid>
+-- sub-device, but no UniFi AP port control emits it and it would ship
+-- unverified, so it is refused out loud instead of half-done.
+--
+-- A port whose native VLAN is the management VLAN is deliberately absent from
+-- the result: its home is br-lan, which is where it already is.
+function M.dsa_members(sw, cfg, uplink_ifname)
+	local out = {}
+	if not (sw and sw.enabled and sw.ports) then return out end
+	local mgmt = (cfg and cfg.net and cfg.net.lan_vlanid) or 1
+	local idxs = {}
+	for idx in pairs(sw.ports) do idxs[#idxs + 1] = idx end
+	table.sort(idxs)
+	for _, port_idx in ipairs(idxs) do
+		local p = sw.ports[port_idx]
+		local ifname, why = M.dsa_ifname(cfg, port_idx, uplink_ifname)
+		if not ifname then
+			io.stderr:write(("switchvlan: skipping port_idx %s (%s)\n")
+				:format(tostring(port_idx), why or "unmappable"))
+		else
+			local native, tagged = nil, {}
+			for vid, mode in pairs(p.vlans or {}) do
+				local n = tonumber(vid)
+				if n and mode == "untagged" and n ~= mgmt then
+					native = n
+				elseif n and mode == "tagged" and n ~= mgmt then
+					tagged[#tagged + 1] = n
+				end
+			end
+			if native then
+				out[native] = out[native] or {}
+				out[native][#out[native] + 1] = ifname
+			elseif #tagged > 0 then
+				-- Only worth saying when tagged membership is ALL the port was
+				-- given. The controller's default Tagged VLAN Management is
+				-- "Allow All", which marks every VLAN the port is not native
+				-- to as tagged -- so warning per tagged VID logged a line per
+				-- VLAN per inform about a default nobody chose. A port with a
+				-- native VLAN got what it asked for; only one with nothing but
+				-- tagged VLANs is actually being refused something.
+				table.sort(tagged)
+				io.stderr:write(("switchvlan: port %s is tagged-only (VLAN %s) "
+					.. "-- not applied. DSA per-port VLAN implements the "
+					.. "native/untagged assignment; set a Native VLAN on the "
+					.. "port instead\n"):format(ifname, table.concat(tagged, ", ")))
+			end
+		end
+	end
+	for _, list in pairs(out) do table.sort(list) end
+	return out
+end
+
+-- The bridge device section a VLAN's L2 lives in, matching the names
+-- ucihelper.ensure_vlan_network writes.
+local function brdev_section(vid) return OPENUF_BRDEV_PREFIX .. tostring(vid) end
+
+-- Read a UCI list option that may come back as a bare string.
+local function as_list(v)
+	if type(v) == "table" then return v end
+	if type(v) == "string" and v ~= "" then return {v} end
+	return {}
+end
+
+-- The `config device` section that defines br-lan, and its port list. Found by
+-- the bridge's NAME rather than by a section name, because it is the board's
+-- own anonymous section (network.@device[0]) and openUF must not assume where
+-- in the file it sits.
+local function find_lan_bridge(cursor, br_name)
+	local found
+	cursor:foreach("network", "device", function(s)
+		if s.name == br_name and s.type == "bridge" then found = s[".name"] end
+	end)
+	return found
+end
+
+-- Apply a parsed switch table on a DSA board.
+--
+-- Moves each assigned socket out of br-lan and into its VLAN's bridge, and
+-- reconciles both directions: a socket the controller no longer assigns comes
+-- back to br-lan, and a bridge left with no sockets keeps only its uplink.
+--
+-- st.dsa_brlan_ports is the reversibility ledger -- br-lan's port list exactly
+-- as the board shipped it, snapshotted once before the first mutation. It is
+-- the only record of what to put back, so it is written before anything else
+-- changes and cleared only by dsa_restore.
+--
+-- Returns true when UCI changed and a reload was issued.
+function M.dsa_apply(sw, cfg, st, uplink_ifname)
+	local uci = get_uci()
+	local cursor = uci.cursor()
+
+	local lan_name = "br-" .. ((cfg and cfg.net and cfg.net.lan_name) or "lan")
+	local lan_sec  = find_lan_bridge(cursor, lan_name)
+	if not lan_sec then
+		io.stderr:write(("switchvlan: no `config device` for %s -- per-port VLAN "
+			.. "not applied (nothing to move sockets out of)\n"):format(lan_name))
+		return false
+	end
+
+	local members = M.dsa_members(sw, cfg, uplink_ifname)
+
+	-- Every socket openUF is entitled to move: the modelmap's ports, minus the
+	-- uplink and anything unmappable. Anything outside this set is the user's
+	-- and is never added to or removed from br-lan.
+	local managed = {}
+	for _, p in ipairs((cfg and cfg.net and cfg.net.ports) or {}) do
+		if M.dsa_ifname(cfg, p.idx, uplink_ifname) then managed[p.ifname] = true end
+	end
+
+	local assigned = {}   -- ifname -> vid
+	for vid, list in pairs(members) do
+		for _, ifname in ipairs(list) do assigned[ifname] = vid end
+	end
+
+	local changed = false
+
+	-- br-lan: it keeps every port that is not assigned elsewhere. Ports
+	-- outside `managed` pass through untouched whatever the push says.
+	local lan_ports = as_list(cursor:get("network", lan_sec, "ports"))
+	local keep, dropped = {}, false
+	for _, ifname in ipairs(lan_ports) do
+		if assigned[ifname] and managed[ifname] then
+			dropped = true
+		else
+			keep[#keep + 1] = ifname
+		end
+	end
+	-- ...and takes back any managed socket this push no longer assigns.
+	for _, p in ipairs((cfg and cfg.net and cfg.net.ports) or {}) do
+		local ifname = p.ifname
+		if ifname and managed[ifname] and not assigned[ifname] then
+			local present = false
+			for _, k in ipairs(keep) do if k == ifname then present = true end end
+			if not present then keep[#keep + 1] = ifname; dropped = true end
+		end
+	end
+	if dropped or #keep ~= #lan_ports then
+		-- Ledger first, always, and only ever the pristine list: taking the
+		-- snapshot after a mutation would file openUF's own output as the
+		-- board's original and make restore() a no-op that looks like a
+		-- success. Same discipline as swvlan_backup above.
+		if st and st.dsa_brlan_ports == nil then st.dsa_brlan_ports = lan_ports end
+		cursor:set("network", lan_sec, "ports", keep)
+		changed = true
+	end
+
+	-- Each VLAN bridge: openUF's socket members, leaving the tagged uplink
+	-- sub-device (ucihelper's) and anything else alone.
+	local vids = {}
+	cursor:foreach("network", "device", function(s)
+		local vid = s[".name"] and s[".name"]:match("^" .. OPENUF_BRDEV_PREFIX .. "(%d+)$")
+		if vid then vids[tonumber(vid)] = true end
+	end)
+	for vid in pairs(members) do vids[vid] = true end
+
+	for vid in pairs(vids) do
+		local sec = brdev_section(vid)
+		if cursor:get("network", sec, "name") then
+			local want = {}
+			for _, ifname in ipairs(members[vid] or {}) do want[ifname] = true end
+			local cur, out, diff = as_list(cursor:get("network", sec, "ports")), {}, false
+			for _, ifname in ipairs(cur) do
+				-- Drop only sockets openUF manages and this push dropped;
+				-- the uplink sub-device and any hand-added member survive.
+				if managed[ifname] and not want[ifname] then diff = true
+				else out[#out + 1] = ifname; want[ifname] = nil end
+			end
+			for _, ifname in ipairs(members[vid] or {}) do
+				if want[ifname] then out[#out + 1] = ifname; diff = true end
+			end
+			if diff then
+				cursor:set("network", sec, "ports", out)
+				changed = true
+			end
+		end
+	end
+
+	if not changed then return false end
+	cursor:commit("network")
+	M._exec("/etc/init.d/network reload 2>/dev/null")
+	return true
+end
+
+-- Undo dsa_apply: put br-lan's original port list back and drop openUF's
+-- socket members from the VLAN bridges. The bridges themselves belong to
+-- ucihelper (a tagged SSID may still need them) and are left standing.
+function M.dsa_restore(st)
+	if not (st and st.dsa_brlan_ports) then return false end
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local orig = as_list(st.dsa_brlan_ports)
+
+	local was = {}
+	for _, ifname in ipairs(orig) do was[ifname] = true end
+
+	local changed = false
+	cursor:foreach("network", "device", function(s)
+		local vid = s[".name"] and s[".name"]:match("^" .. OPENUF_BRDEV_PREFIX .. "(%d+)$")
+		if not vid then return end
+		local out, diff = {}, false
+		for _, ifname in ipairs(as_list(s.ports)) do
+			-- A socket that br-lan originally owned goes home; the tagged
+			-- uplink sub-device (which br-lan never had) stays.
+			if was[ifname] then diff = true else out[#out + 1] = ifname end
+		end
+		if diff then cursor:set("network", s[".name"], "ports", out); changed = true end
+	end)
+
+	local lan_name = "br-lan"
+	local lan_sec  = find_lan_bridge(cursor, lan_name)
+	if lan_sec then
+		cursor:set("network", lan_sec, "ports", orig)
+		changed = true
+	end
+	st.dsa_brlan_ports = nil
+
+	if changed then
+		cursor:commit("network")
+		M._exec("/etc/init.d/network reload 2>/dev/null")
+	end
+	return changed
+end
+
 -- Undo everything apply() wrote: drop openUF's sections and put the stock
 -- sections' port strings back.
 function M.restore(st)
 	local uci = get_uci()
 	local cursor = uci.cursor()
+	-- A DSA board has no switch_vlan sections to drop and a different thing to
+	-- put back; the presence of its ledger is what says so.
+	if st and st.dsa_brlan_ports then return M.dsa_restore(st) end
 	local removed = false
 	local doomed = {}
 	cursor:foreach("network", "switch_vlan", function(s)
