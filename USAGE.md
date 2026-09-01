@@ -464,6 +464,15 @@ gets `HE20`, an n-only one gets `HT20`. Reading the token literally pinned every
 shows the width, which was right) and visible only in `iw dev`. An explicit
 `vht`/`he`/`eht` token, if one ever arrives, is honoured as written.
 
+> **SSID punctuation is sanitized into the UCI section name.** A UCI section name may
+> contain only `[A-Za-z0-9_]`, so an SSID of `Guest-WiFi` becomes the section
+> `openuf_radio0_Guest_WiFi` — the SSID *itself* is stored and broadcast unchanged. This
+> matters because libuci enforces the rule **silently**: `set()` returns true, `commit()`
+> returns true, and a section whose name contains anything else is discarded before it
+> reaches `/etc/config`. An unsanitized character therefore costs the entire WLAN with
+> nothing logged anywhere. Two SSIDs differing only in punctuation (`a-b` and `a_b`) share
+> one section, which has always been true of spaces.
+
 **Fast Roaming (802.11r) and the `ft_psk_generate_local` trap.** openUF sets
 `ieee80211r`, a `mobility_domain` derived from the SSID (so every AP computes the same one
 with no coordination) and `ft_over_ds=0` — and deliberately does **not** set

@@ -455,10 +455,26 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	-- purely by SSID collapsed both calls into the same UCI section, so the
 	-- second call's "device" silently overwrote the first -- confirmed live
 	-- against a real controller: only the last-processed radio's VAP
-	-- survived. name:gsub("[^%w_-]", "_") sanitizes radio the same way ssid
-	-- already was, though UCI radio names ("radio0"/"radio1") never need it.
-	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_-]", "_")
-		.. "_" .. ssid:gsub("[^%w_-]", "_")
+	-- survived. The radio is sanitized the same way the ssid is, though UCI
+	-- radio names ("radio0"/"radio1") never need it.
+	--
+	-- The character class must NOT keep "-". A UCI section name may contain
+	-- only [A-Za-z0-9_], and libuci enforces that in the most unhelpful way
+	-- available: cursor:set() returns true, cursor:commit() returns true, and
+	-- the section is silently discarded -- it never reaches /etc/config and
+	-- never appears in `uci show`. So an SSID with a hyphen produced a
+	-- wlan_add that reported success at every step and left no WLAN behind,
+	-- with nothing in any log to say so. Confirmed live: creating
+	-- "openuf-verify" in the controller pushed correctly, parsed correctly
+	-- into vap_table, and simply never provisioned. Hyphens are common in
+	-- SSIDs, so this was a wide hole.
+	--
+	-- Two SSIDs differing only in punctuation ("a-b" and "a_b") now collapse
+	-- to one section, which is the pre-existing behaviour for every other
+	-- punctuation character (a space already did it) and is preferable to a
+	-- name the config layer throws away.
+	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_")
+		.. "_" .. ssid:gsub("[^%w_]", "_")
 	local enc = SECURITY_MAP[security] or "psk2"
 	cursor:set("wireless", section_name, "wifi-iface")
 	cursor:set("wireless", section_name, "device", radio)

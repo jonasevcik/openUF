@@ -14,6 +14,16 @@ local function new_mock_uci()
 	local cursor = {}
 
 	function cursor:set(config, section, a, b)
+		-- libuci accepts only [A-Za-z0-9_] in a section name, and enforces it
+		-- SILENTLY: set() returns true, commit() returns true, and the section
+		-- is discarded before it ever reaches /etc/config. A permissive mock
+		-- therefore hides the one bug this can cause -- and did: wlan_add's
+		-- sanitizer kept "-", so every SSID with a hyphen provisioned nothing
+		-- while every test passed. Fail loudly here instead.
+		if not tostring(section):match("^[%w_]+$") then
+			error("mock uci: invalid section name '" .. tostring(section)
+				.. "' -- libuci would silently discard this", 2)
+		end
 		db[config] = db[config] or {}
 		if not db[config][section] then
 			db[config][section] = {[".name"] = section}
@@ -222,6 +232,34 @@ return {
 				ucihelper.wlan_add("radio0", "myssid", "wpa2", "hunter22")
 				assert_eq(db.wireless.openuf_radio0_myssid.network, "lan", "defaults to lan")
 			end)
+		end
+	},
+	{
+		name = "ucihelper: an SSID with punctuation still lands in a valid UCI section",
+		fn = function()
+			-- A UCI section name may contain only [A-Za-z0-9_]. libuci enforces
+			-- it silently: set() returns true, commit() returns true, and the
+			-- section never reaches /etc/config. So an unsanitized character
+			-- costs the whole WLAN with nothing reported anywhere -- confirmed
+			-- live, where an SSID of "openuf-verify" pushed correctly, parsed
+			-- correctly, and simply never provisioned. Hyphens are common in
+			-- SSIDs; this was a wide hole.
+			for _, ssid in ipairs({"openuf-verify", "Guest WiFi", "caf\195\169!",
+					"a.b:c", "5GHz-Fast"}) do
+				with_ucihelper(function(db)
+					ucihelper.wlan_add("radio0", ssid, "wpa2", "hunter22")
+					local found
+					for name in pairs(db.wireless or {}) do
+						if name:match("^openuf_radio0_") then found = name end
+					end
+					assert_not_nil(found, ssid .. ": a section was created")
+					assert_true(found:match("^[%w_]+$") ~= nil,
+						ssid .. ": section name " .. tostring(found)
+							.. " is valid for libuci")
+					assert_eq(db.wireless[found].ssid, ssid,
+						ssid .. ": the SSID itself is stored unmangled")
+				end)
+			end
 		end
 	},
 	{

@@ -53,6 +53,16 @@ local function new_apply_env()
 	local section_order = {}
 	local cursor = {}
 	function cursor:set(config, section, a, b)
+		-- libuci accepts only [A-Za-z0-9_] in a section name, and enforces it
+		-- SILENTLY: set() returns true, commit() returns true, and the section
+		-- is discarded before it ever reaches /etc/config. A permissive mock
+		-- therefore hides the one bug this can cause -- and did: wlan_add's
+		-- sanitizer kept "-", so every SSID with a hyphen provisioned nothing
+		-- while every test passed. Fail loudly here instead.
+		if not tostring(section):match("^[%w_]+$") then
+			error("mock uci: invalid section name '" .. tostring(section)
+				.. "' -- libuci would silently discard this", 2)
+		end
 		db[config] = db[config] or {}
 		if not db[config][section] then
 			db[config][section] = {[".name"] = section}
@@ -1792,9 +1802,10 @@ return {
 			local radio_table, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 			ucihelper.apply_config({radio_table = radio_table, vap_table = vap_table}, nil)
 
-			-- wlan_add's sanitizer keeps "-", so the section is
-			-- openuf_radio0_openuf-test (bracket syntax, not a dotted key).
-			local s = db.wireless and db.wireless["openuf_radio0_openuf-test"]
+			-- The hyphen is sanitized to "_": a UCI section name may only
+			-- contain [A-Za-z0-9_], and libuci discards anything else without
+			-- reporting an error. Bracket syntax, not a dotted key.
+			local s = db.wireless and db.wireless["openuf_radio0_openuf_test"]
 			assert_true(s ~= nil, "vap section created from a real system_cfg blob")
 			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
 			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")

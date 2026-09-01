@@ -11,6 +11,16 @@ local function new_mock_uci()
 	local cursor = {}
 
 	function cursor:set(config, section, a, b)
+		-- libuci accepts only [A-Za-z0-9_] in a section name, and enforces it
+		-- SILENTLY: set() returns true, commit() returns true, and the section
+		-- is discarded before it ever reaches /etc/config. A permissive mock
+		-- therefore hides the one bug this can cause -- and did: wlan_add's
+		-- sanitizer kept "-", so every SSID with a hyphen provisioned nothing
+		-- while every test passed. Fail loudly here instead.
+		if not tostring(section):match("^[%w_]+$") then
+			error("mock uci: invalid section name '" .. tostring(section)
+				.. "' -- libuci would silently discard this", 2)
+		end
 		db[config] = db[config] or {}
 		if not db[config][section] then
 			db[config][section] = {[".name"] = section}
