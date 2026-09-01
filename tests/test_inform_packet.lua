@@ -109,6 +109,28 @@ local function new_apply_env()
 end
 
 -- Capture what fn() writes to stderr, restoring the real handle afterwards.
+-- Drive _parse_wifi_system_cfg with a known set of per-band PHY capabilities.
+-- Without this every ieee_mode test would silently exercise only the
+-- hardware-unknown fallback and prove nothing about the upgrade.
+-- `caps` is {ng = "HE", na = "EHT", ...}, the string "any" for a stub that
+-- answers the same PHY for every band it is asked about (so a test cannot
+-- pass merely because the lookup key missed), or nil for "hardware unknown"
+-- -- which is what the dev machine really is, there being no `iw` here.
+local function with_best_phy(caps, fn)
+	-- Swapped wholesale rather than patched: other tests in this file leave
+	-- inform._ucihelper nil behind them, which is also the shape the parser
+	-- has to survive.
+	local orig = inform._ucihelper
+	inform._ucihelper = {best_phy = function(band)
+		if caps == "any" then return "EHT" end
+		return caps and caps[band] or nil
+	end}
+	local ok, out = pcall(fn)
+	inform._ucihelper = orig
+	if not ok then error(out, 2) end
+	return out
+end
+
 local function with_stderr(fn)
 	local buf = {}
 	local real = io.stderr
@@ -1150,14 +1172,55 @@ return {
 				.. "radio.1.ieee_mode=11nght20\n"
 				.. "radio.2.phyname=radio1\nradio.2.channel=36\n"
 				.. "radio.2.ieee_mode=11naht40\n"
-			local radio_table = inform._parse_wifi_system_cfg(sys_cfg)
+			-- Hardware capabilities unknown (no `iw`): the token is read
+			-- literally, which is the conservative fallback, not the answer.
+			local radio_table = with_best_phy(nil, function()
+				return inform._parse_wifi_system_cfg(sys_cfg)
+			end)
 			assert_eq(radio_table[1].htmode, "HT20", "11nght20 -> HT20")
 			assert_eq(radio_table[2].htmode, "HT40", "11naht40 -> HT40")
 		end
 	},
 	{
+		name = "inform packet: a plain 'ht' ieee_mode takes the band's real PHY, not 802.11n",
+		fn = function()
+			-- The wire's vocabulary is Atheros-era -- the same push names the
+			-- VAPs ath0/ath1/ath2 -- and "11naht40" is all a real controller
+			-- ever sends, to a real U6-InWall as much as to us. It carries the
+			-- BAND and the WIDTH; the PHY generation is the device's own
+			-- business. Reading the "ht" literally pinned an 802.11ax radio to
+			-- 802.11n forever: confirmed live on an AX3000T whose 5GHz radio
+			-- came up HT40 on hardware that does HE160 (and runs HE40 fine).
+			local sys_cfg = "radio.1.phyname=radio0\nradio.1.ieee_mode=11nght20\n"
+				.. "radio.2.phyname=radio1\nradio.2.ieee_mode=11naht40\n"
+			local t = with_best_phy({ng = "HE", na = "HE"}, function()
+				return inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(t[1].htmode, "HE20", "the 2.4GHz radio runs HE at the pushed width")
+			assert_eq(t[2].htmode, "HE40", "and so does the 5GHz one")
+
+			-- The width always comes from the wire, never from the hardware:
+			-- this is a PHY upgrade, not a widening.
+			local wide = with_best_phy({na = "EHT"}, function()
+				return inform._parse_wifi_system_cfg(
+					"radio.1.phyname=radio0\nradio.1.ieee_mode=11naht20\n")
+			end)
+			assert_eq(wide[1].htmode, "EHT20", "40 was not asked for, so 20 it stays")
+
+			-- An HT-only radio is unchanged, which is the whole reason this
+			-- was invisible until 802.11ax hardware arrived.
+			local legacy = with_best_phy({ng = "HT", na = "HT"}, function()
+				return inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(legacy[2].htmode, "HT40", "an n-only radio still gets HT40")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg maps 11ac/11ax/11be ieee_mode tokens",
 		fn = function()
+			-- An explicit PHY token is honoured as written, even when the
+			-- hardware could do better: only the bare "ht" default is treated
+			-- as "the wire is not saying".
 			local cases = {
 				["11acvht80"] = "VHT80",
 				["11axhe80"]  = "HE80",
@@ -1166,7 +1229,11 @@ return {
 			}
 			for token, expected in pairs(cases) do
 				local sys_cfg = "radio.1.phyname=radio0\nradio.1.ieee_mode=" .. token .. "\n"
-				local radio_table = inform._parse_wifi_system_cfg(sys_cfg)
+				-- "any": the stub answers EHT whatever it is asked, so this
+				-- cannot pass just because the capability lookup missed.
+				local radio_table = with_best_phy("any", function()
+					return inform._parse_wifi_system_cfg(sys_cfg)
+				end)
 				assert_eq(radio_table[1].htmode, expected, token .. " -> " .. expected)
 			end
 		end

@@ -1515,11 +1515,36 @@ local _IEEE_MODE_WIDTHS = { ["20"] = true, ["40"] = true, ["80"] = true,
 
 local function _htmode_from_ieee_mode(ieee_mode)
 	if type(ieee_mode) ~= "string" then return nil end
-	-- The band ("ng"/"na"/...) between the "11" and the PHY is deliberately
-	-- dropped: OpenWrt derives the band from the channel, and the controller
-	-- can send channel=auto (leave as-is) while still naming a band here.
 	local head, width = ieee_mode:match("^(11%a+)(%d+)$")
 	if not (head and _IEEE_MODE_WIDTHS[width]) then return nil end
+
+	-- The two letters after the "11" are the band ("ng"/"na"), the rest is
+	-- the PHY token. The band is not used to pick a channel -- OpenWrt
+	-- derives that from the channel, and the controller can send
+	-- channel=auto while still naming a band here -- but it IS what says
+	-- which radio's capabilities to read below.
+	local band, token = head:match("^11(%a%a)(%a*)$")
+
+	-- A plain "ht" is not a request for 802.11n. It is all this wire format
+	-- has ever said: the vocabulary is Atheros-era (the same push calls the
+	-- VAPs ath0/ath1/ath2), and a real controller sends "11naht40" to a real
+	-- U6-InWall, which runs it as HE40. The token carries the BAND and the
+	-- WIDTH; the PHY generation is the device's own business, and reading
+	-- the "ht" literally pinned an 802.11ax radio to 802.11n forever --
+	-- confirmed live on an AX3000T, whose 5GHz radio came up HT40 on
+	-- hardware that does HE160.
+	--
+	-- So: honour an explicit vht/he/eht token if one ever arrives, and
+	-- otherwise run the best PHY the band's hardware has. Unknown
+	-- capabilities (no `iw`, unparseable output) fall back to the literal
+	-- reading rather than guessing upward -- same contract as clamp_htmode,
+	-- which still caps the result downward from here.
+	if band and token == "ht" then
+		local best = M._ucihelper and M._ucihelper.best_phy
+			and M._ucihelper.best_phy(band)
+		if best then return best .. width end
+	end
+
 	for _, phy in ipairs(_IEEE_MODE_PHY) do
 		local kind, prefix = phy[1], phy[2]
 		if head:sub(-#kind) == kind then return prefix .. width end

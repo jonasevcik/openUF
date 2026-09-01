@@ -244,6 +244,18 @@ function M.phy_caps()
 	return M._phy_caps_cache
 end
 
+-- The best PHY generation the given band's hardware can run ("HT"/"VHT"/
+-- "HE"/"EHT"), or nil when the capabilities are unknown -- which callers must
+-- treat as "do not upgrade anything".
+--
+-- The counterpart to clamp_htmode: that one refuses to give a radio a PHY it
+-- cannot do, this one says what it CAN do, for a caller whose only other
+-- source is a wire format that does not carry the answer.
+function M.best_phy(band)
+	local caps = M.phy_caps()[band]
+	return caps and RANK_PHY[caps.max_kind] or nil
+end
+
 -- Clamp an OpenWrt htmode ("HE80", "VHT40", "HT20", ...) to what the given
 -- band's hardware can actually do. Returns the (possibly adjusted) htmode and,
 -- when it was adjusted, the original -- callers log the pair, because a

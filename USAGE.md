@@ -436,6 +436,18 @@ written through unchanged rather than clamped to a guess. The same probe supplie
 each radio's real `max_txpower` (the ceiling the controller's TX Power slider
 uses) instead of a static default.
 
+**The PHY generation comes from the hardware, not from the wire.** What a real
+controller actually sends is `radio.<n>.ieee_mode=11nght20` / `11naht40` — its
+vocabulary is Atheros-era (the same push names the VAPs `ath0`/`ath1`/`ath2`),
+and that `ht` is *not* a request for 802.11n. It is the only thing this key has
+ever said: the **band** and the **width**. A real U6-InWall receiving `11naht40`
+runs it as HE40. So openUF takes the width from the wire and the PHY from
+`iw phy`, then clamps as above — a 2.4 GHz-capable ax radio given `11nght20`
+gets `HE20`, an n-only one gets `HT20`. Reading the token literally pinned every
+802.11ax radio to 802.11n permanently, which is invisible in the controller (it
+shows the width, which was right) and visible only in `iw dev`. An explicit
+`vht`/`he`/`eht` token, if one ever arrives, is honoured as written.
+
 **VLAN-tagged SSIDs** (assigning a WiFi network to a non-native network) need three
 things on the AP, and openUF builds all three:
 
