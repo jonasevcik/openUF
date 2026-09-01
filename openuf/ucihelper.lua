@@ -203,6 +203,15 @@ local function parse_phy_caps(out)
 			if b.vht or b.he then width = math.max(width, 80) end
 			if b.w160 then width = math.max(width, 160) end
 			if b.eht and b.w320 then width = math.max(width, 320) end
+			-- 2.4GHz stops at 40MHz -- there is no 80MHz channel in the band
+			-- to be had, whatever the PHY generation. The widths above are
+			-- derived from the PHY (a VHT or HE radio can do 80), which was
+			-- accurate while every 2.4GHz radio here was HT-only and wrong
+			-- the moment one was not: an HE 2.4GHz radio reported max_width
+			-- 80, clamp_htmode passed a pushed HE80 straight through (it
+			-- narrows to 40 only for kind "HT"), and hostapd treats a channel
+			-- width it cannot program as fatal -- the radio never starts.
+			if key == "ng" then width = math.min(width, 40) end
 			local prev = caps[key]
 			-- Two radios can serve the same band (rare, but a 2.4GHz-only and a
 			-- dual-band phy in one device do it); keep the more capable view.

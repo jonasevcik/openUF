@@ -167,6 +167,44 @@ Wiphy phy0
 		* [ AIRTIME_FAIRNESS ]: airtime fairness
 ]]
 
+-- Real `iw phy` output from a Xiaomi Mi Router AX3000T (mediatek/filogic,
+-- MT7981, OpenWrt 25.12.5): mt76 radios that are HE on BOTH bands -- phy1 is
+-- 5GHz with VHT160, phy0 is 2.4GHz with HE but only HT40 channels. Trimmed to
+-- the lines the parser reads, band indexes kept in their real order.
+--
+-- The 2.4GHz half is the point: every earlier board here was HT-only there,
+-- so "HE implies 80MHz" was never wrong before this hardware arrived.
+local AX3000T_IW_PHY = [[
+Wiphy phy1
+	Band 2:
+		Capabilities: 0x9ff
+			HT20/HT40
+		VHT Capabilities (0x339a59f6):
+			Supported Channel Width: 160 MHz
+		HE Iftypes: AP
+			HE PHY Capabilities: (0x0c204e926f12afd0000c00):
+				20MHz in 160/80+80MHz HE PPDU
+		Frequencies:
+			* 5180.0 MHz [36] (20.0 dBm)
+			* 5745.0 MHz [149] (20.0 dBm) (no IR)
+			* 5845.0 MHz [169] (disabled)
+	Supported extended features:
+		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
+Wiphy phy0
+	Band 1:
+		Capabilities: 0x9ff
+			HT20/HT40
+		HE Iftypes: AP
+			HE PHY Capabilities: (0x02204e926f09afc8000c00):
+				HE40/2.4GHz
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+			* 2437.0 MHz [6] (20.0 dBm)
+			* 2472.0 MHz [13] (20.0 dBm) (no IR)
+	Supported extended features:
+		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
+]]
+
 -- The same board if its 2.4GHz driver COULD set the beacon frame rate, to pin
 -- the capability gate in both directions. Only that phy's extended-feature
 -- list differs -- BEACON_RATE_LEGACY is reported per phy, and the gate has to
@@ -2209,6 +2247,45 @@ return {
 					{basic_rate = {"12000"}, beacon_rate = 12000})
 				assert_eq(db.wireless.radio1.beacon_rate, "120",
 					"unknown capability -> unchanged behavior")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: 2.4GHz caps at 40MHz even on an HE radio",
+		fn = function()
+			-- An HE 2.4GHz radio is HE *and* 40MHz-only; the band has no
+			-- 80MHz channel to widen into. Deriving the width from the PHY
+			-- alone reported 80 here, and clamp_htmode only narrows to 40 for
+			-- kind "HT", so a pushed HE80 reached hostapd unchanged -- which
+			-- treats a width it cannot program as fatal and never starts the
+			-- radio. Every earlier board was HT-only on 2.4GHz, so nothing
+			-- could reach this until real 802.11ax hardware did.
+			with_ucihelper(function()
+				ucihelper._popen = function() return AX3000T_IW_PHY end
+				local caps = ucihelper.phy_caps()
+				assert_eq(caps.ng.max_kind, 3, "the 2.4GHz radio really is HE")
+				assert_eq(caps.ng.max_width, 40, "and still tops out at 40MHz")
+				assert_eq(ucihelper.clamp_htmode("ng", "HE80"), "HE40",
+					"a wide 2.4GHz push is narrowed, not passed through")
+				local out, requested = ucihelper.clamp_htmode("ng", "HE40")
+				assert_eq(out, "HE40", "HE40 fits and is left alone")
+				assert_nil(requested, "so nothing is reported as clamped")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the 2.4GHz cap does not narrow 5GHz on the same board",
+		fn = function()
+			-- The cap is keyed on the band, not applied device-wide: this
+			-- board's 5GHz radio is VHT160 and must stay that way.
+			with_ucihelper(function()
+				ucihelper._popen = function() return AX3000T_IW_PHY end
+				local caps = ucihelper.phy_caps()
+				assert_eq(caps.na.max_width, 160, "5GHz keeps its 160MHz")
+				assert_eq(caps.na.max_kind, 3, "and its HE")
+				assert_eq(ucihelper.clamp_htmode("na", "HE160"), "HE160",
+					"an HE160 push on 5GHz is honoured")
+				assert_eq(ucihelper.clamp_htmode("na", "HE80"), "HE80", "as is HE80")
 			end)
 		end
 	},
