@@ -3,15 +3,24 @@
 
 local led = dofile("openuf/led.lua")
 
-local function with_capture(fn)
+local function with_capture(fn, trigger)
 	local writes = {}
-	local orig = led._write_file
+	local orig_w, orig_r = led._write_file, led._read_file
 	led._write_file = function(path, contents)
 		writes[#writes + 1] = {path = path, contents = contents}
 		return true
 	end
-	fn(writes)
-	led._write_file = orig
+	-- What sysfs really returns: every available trigger, the active one in
+	-- brackets. `trigger` nil means the file could not be read at all.
+	led._read_file = function(path)
+		if trigger and path:find("/trigger", 1, true) then return trigger end
+		return nil
+	end
+	led._saved_trigger = {}
+	local ok, err = pcall(fn, writes)
+	led._write_file, led._read_file = orig_w, orig_r
+	led._saved_trigger = {}
+	if not ok then error(err, 2) end
 end
 
 return {
@@ -132,6 +141,61 @@ return {
 				assert_false(led.locate_stop(bad), "locate_stop no-op")
 				assert_false(led.set_enabled(bad, true), "set_enabled no-op")
 			end
+		end
+	},
+	{
+		name = "led: locate restores the trigger the LED was already driving",
+		fn = function()
+			-- On a board whose only driveable LED belongs to a radio -- the
+			-- AX3000T has nothing but mt76-phy0/mt76-phy1 -- ending Locate
+			-- with a blanket "none" permanently kills the throughput blink.
+			-- A transient identify action must not make a one-way change.
+			with_capture(function(writes)
+				led.locate_start("/sys/class/leds/mt76-phy0")
+				assert_eq(writes[1].contents, "timer", "Locate still blinks")
+				led.locate_stop("/sys/class/leds/mt76-phy0")
+				assert_eq(writes[#writes].path,
+					"/sys/class/leds/mt76-phy0/trigger", "trigger written back")
+				assert_eq(writes[#writes].contents, "phy0tpt",
+					"and it is the trigger the LED had, not none")
+			end, "none timer heartbeat netdev [phy0tpt] phy1tpt\n")
+		end
+	},
+	{
+		name = "led: locate_stop falls back to none when the trigger is unreadable",
+		fn = function()
+			-- Unknown previous state is the one case where the old blanket
+			-- write is still the right answer: leaving the LED on the timer
+			-- would blink forever.
+			with_capture(function(writes)
+				led.locate_start("/sys/class/leds/test")
+				led.locate_stop("/sys/class/leds/test")
+				assert_eq(writes[#writes].contents, "none", "falls back to none")
+			end)   -- no trigger file
+			-- Present but with nothing bracketed: same fallback.
+			with_capture(function(writes)
+				led.locate_start("/sys/class/leds/test")
+				led.locate_stop("/sys/class/leds/test")
+				assert_eq(writes[#writes].contents, "none", "no active trigger -> none")
+			end, "none timer heartbeat\n")
+		end
+	},
+	{
+		name = "led: a second locate_stop does not re-restore a stale trigger",
+		fn = function()
+			-- The snapshot is consumed by the stop that uses it. A stop with
+			-- no preceding start (a restart mid-Locate, a duplicate response)
+			-- must not write back whatever the last Locate happened to see.
+			with_capture(function(writes)
+				led.locate_start("/sys/class/leds/mt76-phy0")
+				led.locate_stop("/sys/class/leds/mt76-phy0")
+				led.set_enabled("/sys/class/leds/mt76-phy0", false)
+				local before = #writes
+				led.locate_stop("/sys/class/leds/mt76-phy0")
+				assert_eq(#writes, before + 1, "one write")
+				assert_eq(writes[#writes].contents, "none",
+					"and it is none, not the trigger from the earlier Locate")
+			end, "none timer [phy0tpt]\n")
 		end
 	},
 }
