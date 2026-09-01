@@ -175,6 +175,43 @@ return {
 		end
 	},
 	{
+		name = "modelmap: xiaomi-ax3000t reports its real sockets on a DSA board",
+		fn = function()
+			-- The first non-swconfig board here, and the shape is different
+			-- enough to be worth pinning: netdev ports with no switch map at
+			-- all, because on DSA the netdev IS the socket.
+			local dev = dofile(MODELMAP_DIR .. "/xiaomi-ax3000t.lua")
+			assert_eq(dev.conf.net.lan_cpueth, "wan",
+				"the uplink socket, whose MAC is the board's label MAC")
+			assert_eq(dev.conf.led, "mt76-phy0",
+				"the only driveable LED on this board")
+
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 4, "four sockets -- this board has no lan1")
+			local names = {}
+			for _, p in ipairs(ports) do
+				-- No static uplink and no swport: the uplink is detected from
+				-- the bridge FDB, and there is no switch port numbering to
+				-- resolve a swport against. Declaring either would be a guess
+				-- that survives right up until someone moves the cable.
+				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
+				assert_nil(p.swport, "port " .. p.idx .. " carries no swconfig port")
+				assert_true(type(p.ifname) == "string" and p.ifname ~= "",
+					"port " .. p.idx .. " names its own netdev")
+				names[#names + 1] = p.ifname
+			end
+			table.sort(names)
+			assert_eq(table.concat(names, ","), "lan2,lan3,lan4,wan",
+				"the board's real DSA port names")
+
+			-- The absence is load-bearing, not an omission: dev.conf.vlan is
+			-- what makes inform.lua shell out to swconfig and what
+			-- switchvlan resolves a swport against. A guessed map here would
+			-- have openUF programming a switch that does not exist.
+			assert_nil(dev.conf.vlan, "no swconfig port map on a DSA board")
+		end
+	},
+	{
 		name = "modelmap: a board's LAN ports never collide with its WAN port",
 		fn = function()
 			-- The trunk a tagged SSID needs is built from dev.conf.vlan.ports,

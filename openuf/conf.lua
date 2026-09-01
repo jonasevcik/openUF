@@ -5,6 +5,7 @@
 	Known-working modelmap files:
 	  archer-c5-v1.lua        — TP-Link Archer C5 v1 (dual-band, board-specific)
 	  tl-wdr3500-v1.lua       — TP-Link TL-WDR3500 v1 (dual-band, board-specific)
+	  xiaomi-ax3000t.lua      — Xiaomi Mi Router AX3000T (802.11ax, DSA)
 	  generic-dualband-ap.lua — any other dual-band board
 	  tl-wr1043ndv2.lua       — TP-Link WR1043ND v2 (single-band)
 

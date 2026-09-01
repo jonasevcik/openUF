@@ -111,6 +111,9 @@ dev = dofile("modelmap/archer-c5-v1.lua")
 -- For TP-Link TL-WDR3500 v1 (dual-band, board-specific):
 dev = dofile("modelmap/tl-wdr3500-v1.lua")
 
+-- For Xiaomi Mi Router AX3000T (802.11ax, DSA — no swconfig):
+dev = dofile("modelmap/xiaomi-ax3000t.lua")
+
 -- For any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 
@@ -122,6 +125,14 @@ Prefer a board-specific map where one exists. A generic profile cannot know your
 board's LED name (so Locate and the LED toggle do nothing) or which of its ports
 is the uplink — and it gets the uplink wrong on an Archer C5 deployed as an AP,
 which uses `eth1` and never touches `eth0`.
+
+**swconfig or DSA?** `which swconfig` on the device settles it. A board with no
+`swconfig` binary (anything on a modern target — mediatek/filogic, ath79's
+successors, ipq40xx…) is DSA, and its map looks different: each socket is
+already its own netdev, so the ports are listed by `ifname` and there is **no
+`dev.conf.vlan` at all**. Don't invent one — it is what makes openUF shell out
+to a `swconfig` that isn't there. `modelmap/xiaomi-ax3000t.lua` is the worked
+example.
 
 The modelmap sets:
 - `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`); also the trunk port
@@ -141,7 +152,11 @@ The modelmap sets:
   board can report only the CPU port's internal link. The two mix: a socket wired to its
   own MAC/PHY instead of the switch (the TL-WDR3500's WAN socket, `eth1`) is listed with an
   `ifname` and no `swport`, and sysfs then describes that socket correctly. Count the RJ45
-  sockets on the case — the list should have one entry each
+  sockets on the case — the list should have one entry each.
+  On a **DSA** board every socket takes the netdev shape and still gets no `uplink` flag:
+  there the uplink is detected from the bridge FDB (`bridge fdb show br br-lan`, which
+  names the port each MAC was learned on) instead of from a switch ARL table. Keep the
+  flag only for a board where neither source can answer
 - `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
 - `dev.conf.switch`         — Switch device name (e.g. `switch0`)
 - `dev.conf.led`            — status LED, driven by the controller's Locate action and its
@@ -440,6 +455,12 @@ things on the AP, and openUF builds all three:
    If the uplink cannot be resolved openUF leaves any existing trunk alone rather than
    guessing.
 
+   **On a DSA board step 3 does not exist and is not needed.** With bridge VLAN
+   filtering off — the OpenWrt default, and the state a `config bridge-vlan`-free
+   `br-lan` is in — the switch passes tagged frames straight through, and the
+   sub-device on the uplink socket (`wan.<vlan>` on an AX3000T) takes its VID
+   before the bridge ever sees it. Steps 1 and 2 are the whole path there.
+
 > **Why not simply tag every socket.** openUF used to, and it broke every untagged
 > wired client behind an AP running a tagged SSID. On the `ar8216`/`ar8226`/`ar8229`/
 > `ar8236` driver family the tag flag is **not** per (port, VLAN): `ar8xxx_sw_set_ports()`
@@ -479,6 +500,12 @@ controller's `untagged`/`tagged`/`exclude` per-port modes into swconfig's port s
 (`1`, `1t`, omitted) with the CPU port always tagged in. On a DSA board (OpenWrt 21.02+,
 where this would be `config bridge-vlan`) it logs and does nothing rather than emitting
 config nobody has verified.
+
+> Worth knowing before you go looking for it: openUF reports `hasOWRTSwitch` regardless
+> of backend, so on a DSA board the controller still **offers** Port VLAN and still
+> **accepts** an assignment. The device then refuses it, in the log and nowhere else —
+> the controller has no way to say "this device cannot". `logread -e openuf` is where
+> that shows up. VLAN-tagged *SSIDs* are a different path and do work on DSA (above).
 
 Three things must line up or the port is skipped rather than guessed at:
 
@@ -592,11 +619,21 @@ Whether that bites is pure luck of the board's port naming:
 |---|---|---|---|---|
 | TL-WDR3500 v1 | LAN trunk | `eth0` | matches identity | resolves by accident |
 | Archer C5 v1 | unused WAN socket | `eth1` | **`eth0`, wrong** | Parent Device wrong |
+| Mi Router AX3000T | DSA conduit | `wan` | **`eth0`, wrong** | Parent Device wrong |
 
 Setting `cid_interface` to the LAN network makes the chassis ID the same MAC
 openUF reports, and the controller resolves the uplink immediately — confirmed
 live: an Archer C5 went from no `uplink_mac` at all to
 `Cloud Gateway Ultra, port 4` on the next LLDP advertisement.
+
+On a **DSA** board name the socket, not the network: `br-lan` covers every
+socket and carries `eth0`'s MAC, so `cid_interface='lan'` reproduces the very
+mismatch it is meant to fix. Use the one `lan_cpueth` names —
+
+```sh
+uci set lldpd.config.cid_interface='wan'   # the AX3000T's uplink socket
+uci commit lldpd && /etc/init.d/lldpd restart
+```
 
 Verify the two agree:
 ```sh
