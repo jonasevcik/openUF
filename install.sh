@@ -56,10 +56,20 @@ case "$1" in
 		# of Lua and the install "succeeded" with no /opt/openuf on disk.
 		# Product first means a space shortage costs a feature, never openUF.
 
-		# Copy Lua source. etc/ is excluded deliberately: the init script
-		# belongs in /etc/init.d (installed further down) and a second copy
-		# under $INSTALL_DIR would never be executed.
+		# An existing conf.lua is the DEVICE'S, and survives. It carries the
+		# modelmap selection, l2_announce and bootstrap_adopt_user -- all
+		# hand-set per board and none of them re-derivable. Overwriting it
+		# resets the board to generic-dualband-ap, which on an adopted AP means
+		# a different lan_cpueth, a different identity MAC, and a device the
+		# controller stops recognising. That hazard is why re-running the
+		# installer to pick up a new dependency was previously unsafe -- and
+		# why a live AP ended up without `tc` at all, because nobody dared.
+		# The shipped default lands beside it as conf.lua.dist for reference.
 		mkdir -p "$INSTALL_DIR"
+		KEEP_CONF=
+		if [ -f "$INSTALL_DIR/conf.lua" ]; then
+			KEEP_CONF=$(mktemp) && cp "$INSTALL_DIR/conf.lua" "$KEEP_CONF"
+		fi
 		cp -r openuf/* "$INSTALL_DIR/" || {
 			echo "ERROR: failed to copy openUF into $INSTALL_DIR"
 			echo "  Free space: $(overlay_free_kb "$INSTALL_DIR")KB. openUF needs ~130KB"
@@ -67,6 +77,11 @@ case "$1" in
 			exit 1
 		}
 		rm -rf "$INSTALL_DIR/etc"
+		if [ -n "$KEEP_CONF" ]; then
+			mv "$INSTALL_DIR/conf.lua" "$INSTALL_DIR/conf.lua.dist"
+			cp "$KEEP_CONF" "$INSTALL_DIR/conf.lua" && rm -f "$KEEP_CONF"
+			echo "Kept the existing conf.lua (shipped default -> conf.lua.dist)."
+		fi
 
 		# Release tarballs arrive already comment-stripped (tools/dist.sh).
 		# When installing from a git clone, strip on the way in using the same
@@ -140,6 +155,13 @@ case "$1" in
 		# shaper.lua shells out to `tc` for the WiFi Speed Limit, and nothing
 		# installed it -- busybox has no tc. tc-tiny is enough (htb + fq_codel).
 		try_optional tc-tiny       "WiFi Speed Limit (tc)"
+		# ...and the DOWNLINK half needs sch_htb while the UPLINK half needs the
+		# act_police action, which is a separate module and is not in every
+		# image. A filogic board has sch_htb, sch_ingress, act_gact, act_mirred
+		# and act_skbedit but NO act_police: `tc filter ... police` fails with
+		# "Failed to load TC action module", so the download cap applies and the
+		# upload cap silently does not. Half a feature reporting success.
+		try_optional kmod-sched-act-police "WiFi Speed Limit, upload half (tc police)"
 		# inform.lua detects an out-of-process state.json write (syswrapper's
 		# SSH set-adopt, a manual reset-inform) with `stat -c %Y`. Some builds
 		# ship no stat applet at all -- confirmed on a real WDR3500 -- and

@@ -84,7 +84,13 @@ ssh root@<device-ip> "cd /tmp/openuf && sh install.sh install"
 ```
 
 What `install.sh install` does:
-- Copies `openuf/` to `/opt/openuf/`
+- Copies `openuf/` to `/opt/openuf/` — **an existing `conf.lua` is kept**, and the shipped
+  default lands beside it as `conf.lua.dist`. That file holds the modelmap selection,
+  `l2_announce` and `bootstrap_adopt_user`, none of it re-derivable; overwriting it on an
+  adopted AP resets the board to the generic profile, which changes `lan_cpueth`, changes
+  the identity MAC, and leaves the controller unable to recognise the device. Because it is
+  preserved, **re-running the installer is safe** — which is how you top up a dependency
+  added by a later version
 - Creates `/etc/openuf/` (state directory)
 - Symlinks `/opt/openuf/hook/syswrapper.sh` → `/usr/bin/syswrapper.sh`
 - Creates `/etc/init.d/openuf` with two procd service instances (announce + inform)
