@@ -481,7 +481,7 @@ end
 -- both APs, a genuinely 24%-busy 2.4GHz channel was reported to the
 -- controller as 100% and a 1.9%-busy 5GHz channel as 75%, which is what made
 -- the APs look like they were drowning in interference. The same wrong entry
--- also supplied the noise floor used to convert Minimum RSSI back to dBm.
+-- also supplied the noise floor Minimum RSSI was (wrongly) converted with.
 --
 -- Falls back to the first entry when nothing is marked, which keeps drivers
 -- (and test doubles) that omit the marker behaving exactly as before.
@@ -591,8 +591,8 @@ function M.build_json(st, cfg, ufhw)
 		local radio_stats_by_name = {}
 		-- Minimum RSSI enforcement data, keyed by radio name (e.g. "radio0"),
 		-- consumed by the per-station loop below -- kept as absolute dBm
-		-- thresholds (already converted using this same loop's live noise
-		-- reading) so the enforcement check further down is a plain
+		-- thresholds (converted from the wire's fixed encoding in this same
+		-- loop) so the enforcement check further down is a plain
 		-- sta.signal comparison.
 		local minrssi_threshold_by_radio = {}
 		for _, radio in ipairs(radio_table) do
@@ -714,22 +714,37 @@ function M.build_json(st, cfg, ufhw)
 					end
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
-				-- min_rssi (outbound field, confirmed via decompile alongside
-				-- radio_caps/tx_power/athstats in the same DTO) needs the
-				-- live noise floor to convert rf_config()'s stored raw wire
-				-- units back to dBm -- minrssi.rssi is an offset from the
-				-- driver's noise floor, NOT plain dBm (confirmed live: UI
-				-- "-80 dBm" <-> wire "15", UI "-85 dBm" <-> wire "10", both
-				-- consistent with raw = dbm + 95). Falls back to that -95
-				-- assumption only when a live noise reading isn't available.
 				local in_use = ok_rs and _in_use_survey(stats) or nil
-				local noise = (in_use and in_use.noise) or -95
+				-- min_rssi (outbound field, confirmed via decompile alongside
+				-- radio_caps/tx_power/athstats in the same DTO) converts
+				-- rf_config()'s stored raw wire units back to dBm with the
+				-- SAME FIXED offset the controller encoded them with:
+				-- confirmed live, UI "-80 dBm" <-> wire "15" and UI "-85 dBm"
+				-- <-> wire "10", i.e. raw = dbm + 95 exactly.
+				--
+				-- This used to add the LIVE noise floor instead, on the reading
+				-- that the value is "dB above noise". It is not, and cannot be:
+				-- the controller never learns a radio's noise floor, so it has
+				-- nothing but a constant to encode with -- which is why both
+				-- data points land on one. Live noise also broke the round
+				-- trip, reporting a min_rssi the UI would render as a number
+				-- the operator never chose.
+				--
+				-- It looked right only because it was written against a radio
+				-- whose noise floor happens to be exactly -95 (an Archer C5's
+				-- ath10k 5GHz). Every other radio to hand disagreed, in both
+				-- directions: the same board's ath9k 2.4GHz reads -107, turning
+				-- a requested -80 into -92 and barely kicking anyone, while an
+				-- AX3000T's mt76 radios read -90/-92 and turned it into -75,
+				-- kicking clients the operator meant to keep. A threshold that
+				-- drifts 12 dB with the driver is worse than no threshold.
+				local MINRSSI_WIRE_OFFSET = 95
 				-- min_rssi_raw can legitimately be missing with the flag set
 				-- (inconsistent UCI, e.g. a hand-edit or interrupted write) --
-				-- without the guard this was `nil + noise`, killing the whole
-				-- inform build.
+				-- without the guard this was arithmetic on nil, killing the
+				-- whole inform build.
 				if radio.min_rssi_enabled and radio.min_rssi_raw then
-					radio.min_rssi = radio.min_rssi_raw + noise
+					radio.min_rssi = radio.min_rssi_raw - MINRSSI_WIRE_OFFSET
 					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
 				end
 				if in_use then

@@ -706,9 +706,9 @@ return {
 			-- chain: parse emits radio_table[].min_rssi (raw wire units),
 			-- apply_config writes UCI minrssi_rssi, get_radio_table reads it
 			-- back as min_rssi_raw, and build_json converts it to the
-			-- outbound min_rssi dBm with the live noise floor. A rename on
-			-- any hop keeps every per-side test green while the feature dies
-			-- silently -- this drives one value through all four.
+			-- outbound min_rssi dBm. A rename on any hop keeps every per-side
+			-- test green while the feature dies silently -- this drives one
+			-- value through all four.
 			local ucihelper, db = new_apply_env()
 			-- The wifi-device section exists on any real device (board
 			-- config); rf_config only sets options and the mock's foreach
@@ -732,15 +732,28 @@ return {
 			local orig_run   = inform._sysinfo._run_cmd
 			local orig_read  = inform._sysinfo._read_file
 			inform._ucihelper = ucihelper
-			inform._sysinfo.radio_stats = function()
-				return {{freq = 2437, noise = -90, channel_time = 100, channel_time_busy = 10}}
-			end
 			inform._sysinfo._run_cmd = function() return "" end
 			inform._sysinfo._read_file = function() return "" end
 			local ok, err = pcall(function()
-				local d = require("cjson").decode(inform.build_json(sample_state(), nil, nil))
-				assert_true(d.radio_table[1].min_rssi_enabled, "enabled flag survived the chain")
-				assert_eq(d.radio_table[1].min_rssi, -75, "15 raw + (-90 live noise) = -75 dBm")
+				-- Driven twice with wildly different noise floors, because the
+				-- conversion must NOT depend on one. The wire encoding is a
+				-- fixed raw = dbm + 95 (the controller never learns a radio's
+				-- noise floor, so it has nothing else to encode with), and
+				-- adding live noise instead made the same setting mean -75 on
+				-- an mt76 radio and -92 on an ath9k one -- it only looked
+				-- right on the ath10k radio it was written against, whose
+				-- floor happens to be exactly -95.
+				for _, noise in ipairs({-90, -107, -95}) do
+					inform._sysinfo.radio_stats = function()
+						return {{freq = 2437, noise = noise, in_use = true,
+							channel_time = 100, channel_time_busy = 10}}
+					end
+					local d = require("cjson").decode(inform.build_json(sample_state(), nil, nil))
+					assert_true(d.radio_table[1].min_rssi_enabled,
+						"enabled flag survived the chain")
+					assert_eq(d.radio_table[1].min_rssi, -80,
+						"15 raw -> -80 dBm, whatever the noise floor reads (" .. noise .. ")")
+				end
 			end)
 			inform._ucihelper = orig_uci
 			inform._sysinfo.radio_stats = orig_stats
