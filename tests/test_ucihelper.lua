@@ -433,9 +433,38 @@ return {
 				assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("corp"),
 					"mobility_domain derived from the ssid")
 				assert_eq(#s.mobility_domain, 4, "mobility_domain is 4 hex chars")
-				assert_eq(s.ft_psk_generate_local, "1", "local PMK generation enabled")
 				assert_eq(s.ft_over_ds, "0", "over-DS disabled by default")
+				-- Deliberately absent. Forcing it to "1" is FT-PSK-only local
+				-- key generation, and setting it at all stops OpenWrt
+				-- configuring the r0kh/r1kh key holders FT-SAE cannot work
+				-- without -- which silently cost every WPA3 client its fast
+				-- roaming. OpenWrt's own default already keys on auth_type.
+				assert_nil(s.ft_psk_generate_local,
+					"left to OpenWrt, which picks per auth_type (psk -> 1, sae -> 0)")
 			end)
+		end
+	},
+	{
+		name = "ucihelper: a WPA3 WLAN is left able to configure FT key holders",
+		fn = function()
+			-- The failure this pins is invisible in UCI and on the air: the
+			-- WLAN advertises FT-SAE and the right mobility domain, and the
+			-- transition still falls back to a full SAE + 4-way. It hinges
+			-- entirely on openUF NOT pinning ft_psk_generate_local, because
+			-- OpenWrt only derives r0kh/r1kh when that option is 0 -- and it
+			-- only defaults it to 0 when nothing overrode it.
+			for _, sec in ipairs({"wpa3", "wpa2/wpa3", "wpa2"}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = sec,
+						 x_passphrase = "hunter22", fast_roaming_enabled = true},
+					}}, nil)
+					local s = db.wireless.openuf_radio0_corp
+					assert_eq(s.ieee80211r, "1", sec .. ": FT enabled")
+					assert_nil(s.ft_psk_generate_local,
+						sec .. ": openUF does not pin the key-generation mode")
+				end)
+			end
 		end
 	},
 	{

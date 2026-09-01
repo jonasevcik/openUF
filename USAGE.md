@@ -458,6 +458,40 @@ gets `HE20`, an n-only one gets `HT20`. Reading the token literally pinned every
 shows the width, which was right) and visible only in `iw dev`. An explicit
 `vht`/`he`/`eht` token, if one ever arrives, is honoured as written.
 
+**Fast Roaming (802.11r) and the `ft_psk_generate_local` trap.** openUF sets
+`ieee80211r`, a `mobility_domain` derived from the SSID (so every AP computes the same one
+with no coordination) and `ft_over_ds=0` — and deliberately does **not** set
+`ft_psk_generate_local`. That option looks harmless and is not:
+
+- It means "derive PMK-R0/R1 locally from the PSK", which only exists for **FT-PSK**. FT-SAE
+  derives PMK-R0 from the per-session SAE PMK, which no passphrase can reproduce, so its
+  PMK-R1 has to be pulled from the origin AP over an `r0kh`/`r1kh` key-holder relationship.
+- OpenWrt only configures those key holders when `ft_psk_generate_local` is **0**, and only
+  defaults it to 0 when nothing has overridden it. Setting it to 1 therefore silently
+  disables fast roaming for every WPA3 client on a `sae-mixed` WLAN — which is most of them.
+
+Left unset, `hostapd.sh` keys it on the auth type (`psk` → 1, anything else → 0) and, at 0,
+derives wildcard key holders from `md5(mobility_domain/psk)`. That is deterministic, so
+independent APs sharing an SSID and passphrase arrive at the same key — the same reasoning
+behind the derived mobility domain. Worth knowing: that key is therefore derivable by anyone
+who knows the passphrase, i.e. anyone already on the network; a real UniFi controller
+distributes a random one instead.
+
+**How to tell whether a transition was actually fast**, since nothing in the controller
+shows it — force one and read the target AP's log:
+
+```sh
+hostapd_cli -i <vap> bss_tm_req <sta-mac> pref=1 \
+    neighbor=<target-bssid>,0x0000,<op-class>,<channel>,7 \
+    disassoc_imminent=1 disassoc_timer=30
+logread | grep AP-STA-CONNECTED
+```
+
+`auth_alg=ft` **and no `EAPOL-4WAY-HS-COMPLETED`** is a real fast transition. `auth_alg=sae`
+followed by a 4-way handshake is the fallback — the client roamed, it just paid full
+authentication for it. `hostapd_cli -i <vap> sta <mac>` shows the negotiated
+`AKMSuiteSelector`: `00-0f-ac-4` is FT-PSK, `00-0f-ac-9` FT-SAE, `00-0f-ac-8` plain SAE.
+
 **VLAN-tagged SSIDs** (assigning a WiFi network to a non-native network) need three
 things on the AP, and openUF builds all three:
 

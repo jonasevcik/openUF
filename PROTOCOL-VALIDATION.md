@@ -1037,6 +1037,40 @@ the identity MAC that `_warn_identity_change` compares against, which made that 
 diagnostic unreachable. Surfaced here because this is the first board whose LED idles at
 something other than off, so "the toggle forgets itself on reboot" was finally *visible*.
 
+### 802.11r was configured, advertised, and not working
+
+Everything visible said fast roaming worked: `ieee80211r=1` and `mobility_domain=82d8`
+identical on both APs, the Mobility Domain element in both beacons (`iw` prints it as
+`Unknown IE (54): 82 d8 00` — it does not decode element 54, which reads like an absence),
+and `PSK FT/PSK PSK/SHA-256 SAE FT/SAE` advertised in the RSN IE. Nothing in the controller
+contradicts any of it.
+
+Forcing a roam is what settled it. A station that had negotiated **FT-SAE** reassociated
+with `auth_alg=sae` plus a full `EAPOL-4WAY-HS-COMPLETED` — a real fast transition shows
+`auth_alg=ft` and no 4-way at all. It failed even between two BSSes on the *same radio*, so
+it was never about the APs failing to reach each other.
+
+Cause: openUF pinned `ft_psk_generate_local=1`. Local key generation is **FT-PSK only** —
+each AP derives PMK-R0/R1 from the PSK it already holds — while FT-SAE derives PMK-R0 from
+the per-session SAE PMK, which no passphrase can reproduce; its PMK-R1 must be pulled from
+the origin AP over an `r0kh`/`r1kh` relationship. OpenWrt configures those key holders only
+when the option is `0`, and only defaults it to `0` when nothing overrode it. Pinning it to
+`1` therefore removed the one mechanism FT-SAE needs, on a `sae-mixed` WLAN where every
+WPA3-capable client picks SAE. Measured AKMs at the time: 3× FT-SAE, 3× SAE, 1× PSK,
+**0× FT-PSK** — nothing was on the path that would have worked.
+
+Leaving the option unset lets `hostapd.sh` key it on auth type (`psk` → 1, else → 0) and
+derive wildcard key holders from `md5(mobility_domain/psk)` — deterministic, so independent
+APs sharing an SSID and passphrase compute the same key with no coordination, which is the
+same reasoning as the derived mobility domain. Both APs then produced
+`r0kh=ff:ff:ff:ff:ff:ff * 8f017bfa84f587a708a51c185973596e`, byte-identical, and the same
+forced roam gave `auth_alg=ft` with no 4-way — first between radios on one AP, then across
+the two APs, which is the case that needs the PMK-R1 actually pulled over `br-lan`.
+
+The lesson generalises past this option: a wireless feature can be correct in UCI, correct
+in the generated hostapd config, correct in the beacon, and still not happen. Only the
+station's own state transition proves it.
+
 ### Channel choice, for a two-AP site in CZ
 
 `iw reg get` after adoption: 5150–5250 at 23 dBm with no DFS, 5250–5350 and 5470–5725 DFS,

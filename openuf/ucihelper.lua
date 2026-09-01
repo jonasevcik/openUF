@@ -939,8 +939,36 @@ function M.apply_config(resp, cfg, opts)
 			if ft_enabled then
 				extra.ieee80211r = "1"
 				extra.mobility_domain = M.derive_mobility_domain(vap.ssid)
-				extra.ft_psk_generate_local = "1"
 				extra.ft_over_ds = "0"
+				-- ft_psk_generate_local is deliberately NOT set. It used to be
+				-- forced to "1", which silently disabled fast roaming for every
+				-- WPA3 client: local key generation is FT-PSK only (each AP
+				-- derives PMK-R0/R1 from the PSK it already has), while FT-SAE
+				-- derives PMK-R0 from the per-session SAE PMK, which no
+				-- passphrase can reproduce. Its PMK-R1 has to be pulled from
+				-- the originating AP over the r0kh/r1kh key-holder
+				-- relationship -- and forcing local generation is exactly what
+				-- stops OpenWrt configuring one.
+				--
+				-- Observed live on a sae-mixed WLAN: both APs advertised
+				-- FT-SAE and the mobility domain correctly, and a station that
+				-- had negotiated FT-SAE still reassociated with auth_alg=sae
+				-- plus a full EAPOL 4-way -- a fast transition shows
+				-- auth_alg=ft and no 4-way at all. It failed even roaming
+				-- between two BSSes on the SAME radio, so this was never about
+				-- the APs failing to reach each other.
+				--
+				-- OpenWrt's own default is already right, and better than
+				-- anything worth restating here: hostapd.sh keys it on
+				-- auth_type (psk -> 1, anything else -> 0) and, when it is 0,
+				-- auto-derives wildcard key holders from
+				-- md5(mobility_domain .. "/" .. psk) -- deterministic, so every
+				-- AP sharing an SSID and passphrase computes the same key with
+				-- no coordination, which is the same reasoning behind
+				-- derive_mobility_domain above. Leaving the option unset lets
+				-- that run: FT-PSK keeps local derivation and needs no
+				-- inter-AP traffic, FT-SAE gets the key holders it cannot work
+				-- without.
 			end
 			if opts and opts.band_steering_active then
 				-- usteer requires 802.11k (neighbor reports) + BSS
