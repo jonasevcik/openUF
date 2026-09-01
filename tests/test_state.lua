@@ -163,4 +163,82 @@ return {
 			end)
 		end
 	},
+	{
+		name = "state: every field any module writes survives a save/load round trip",
+		fn = function()
+			-- The invariant, checked against the SOURCE rather than a list
+			-- kept in step by hand: save() encodes the whole table, load()
+			-- copies back only what M.FIELDS names, so a field a caller sets
+			-- and nobody registered is written to disk, looks persisted, and
+			-- returns nil on the next start. Ten had accumulated that way --
+			-- the per-port VLAN reversibility ledger, the LED toggle, the
+			-- locate flag, the static-vs-DHCP guard, and the identity MAC the
+			-- IDENTITY MAC CHANGED diagnostic compares against, which could
+			-- therefore never fire at all.
+			local writers = {}
+			local h = io.popen(
+				"grep -rhoE 'st\\.[a-z_]+ *=[^=]' openuf/*.lua 2>/dev/null")
+			if not h then return end
+			for line in h:lines() do
+				local f = line:match("^st%.([a-z_]+)")
+				if f then writers[f] = true end
+			end
+			h:close()
+			assert_true(next(writers) ~= nil, "found state writers to check")
+
+			local missing = {}
+			for f in pairs(writers) do
+				if not state.FIELDS[f] then missing[#missing + 1] = f end
+			end
+			table.sort(missing)
+			assert_eq(table.concat(missing, ", "), "",
+				"fields written to state but not registered in state.FIELDS "
+					.. "(they persist to disk and load back as nil)")
+		end
+	},
+	{
+		name = "state: a registered field round-trips, and a wrong type is refused",
+		fn = function()
+			local path = os.tmpname()
+			local orig = state._state_file
+			state._state_file = path
+			local ok, err = pcall(function()
+				state.save({
+					adopted = true, authkey = "f00d",
+					mac = "d4:53:2a:38:80:cf", led_enabled = false,
+					locating = true, locate_prev_trigger = "phy0tpt",
+					ip_mode = "static", swvlan_backup = {["10"] = "0t 2 3"},
+				})
+				local st = state.load()
+				assert_eq(st.mac, "d4:53:2a:38:80:cf", "identity mac survives")
+				assert_false(st.led_enabled, "led_enabled survives as false, not nil")
+				assert_true(st.locating, "locating survives")
+				assert_eq(st.locate_prev_trigger, "phy0tpt", "the LED's trigger survives")
+				assert_eq(st.ip_mode, "static", "the static-vs-DHCP guard survives")
+				assert_eq(st.swvlan_backup["10"], "0t 2 3", "the VLAN ledger survives")
+
+				-- Absent stays absent: readers test `~= nil` for "never set",
+				-- so a field must not materialise out of nowhere.
+				state.save({adopted = true, authkey = "f00d"})
+				local bare = state.load()
+				assert_nil(bare.led_enabled, "an unset field loads as nil, not false")
+				assert_nil(bare.swvlan_backup, "and not as an empty table")
+
+				-- state.json is hand-editable and syswrapper-written; a wrong
+				-- type must be dropped at the boundary rather than reaching a
+				-- caller that will index it.
+				local f = io.open(path, "w")
+				f:write('{"adopted":true,"authkey":"f00d","blocked_stas":"not-a-table",'
+					.. '"led_enabled":"yes","mac":42}')
+				f:close()
+				local bad = state.load()
+				assert_eq(type(bad.blocked_stas), "table", "bad blocked_stas falls to the default")
+				assert_nil(bad.led_enabled, "a string led_enabled is refused")
+				assert_nil(bad.mac, "a numeric mac is refused")
+			end)
+			state._state_file = orig
+			os.remove(path)
+			if not ok then error(err, 0) end
+		end
+	},
 }

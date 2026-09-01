@@ -2,10 +2,26 @@
 	State persistence for openuf.
 
 	Reads and writes /etc/openuf/state.json (configurable via M._state_file).
-	Fields: authkey (32-char hex), adopted (bool), cfgversion (string),
-	        inform_url (string), use_gcm (bool), upgrade_requested_version
-	        (string), upgrade_requested_url (string), blocked_stas
-	        (array of MAC strings).
+
+	Load invariant: EVERY field save() writes must be listed in FIELDS below.
+	save() encodes the whole table, load() copies back only what it recognises
+	-- so a field added by a caller and not added here is written to disk,
+	looks persisted in the file, and comes back nil on the next start. Ten of
+	them had accumulated that way, and the failures were all silent:
+	  • swvlan_backup, the per-port VLAN reversibility ledger -- so unticking
+	    Port VLAN after any restart restored nothing and left the switch on
+	    openUF's config for good;
+	  • led_enabled, so the controller's Manage > LED toggle forgot itself on
+	    every reboot while the controller went on believing it took;
+	  • locating, so a Locate could never be cleaned up by a later start;
+	  • ip_mode, whose only reader guards "am I reverting my OWN static
+	    config", so across a restart a genuine static->DHCP push did nothing;
+	  • mac, read by M.run as prev_mac and compared against the live one --
+	    the entire IDENTITY MAC CHANGED diagnostic was unreachable, since its
+	    only producer returned nil every time.
+	The type is checked on the way in: state.json is not a trusted input (an
+	operator edits it, syswrapper writes it), and a wrong type reaching, say,
+	blocked_stas would crash the daemon at startup rather than at parse.
 
 	Security invariant: if adopted == false, authkey is always reset to the
 	default key on load, regardless of what the file contains. This prevents a
@@ -35,6 +51,47 @@ local function defaults()
 	}
 end
 
+-- Every persisted field and the type it must have on the way in. Fields with
+-- an entry in defaults() above always come back (with the default when the
+-- file is missing or the type is wrong); the rest come back only when the file
+-- carries them, which is the "never pushed / never set" signal their readers
+-- test for -- st.led_enabled ~= nil, st.ip_mode == "static", and so on. Adding
+-- a field to state means adding it here; see the header.
+M.FIELDS = {
+	authkey                   = "string",
+	adopted                   = "boolean",
+	cfgversion                = "string",
+	inform_url                = "string",
+	use_gcm                   = "boolean",
+	upgrade_requested_version = "string",
+	upgrade_requested_url     = "string",
+	blocked_stas              = "table",
+	-- Identity, re-derived at startup by inform's _populate_net_info. Kept
+	-- here so the PREVIOUS run's values are still readable at that moment:
+	-- M.run compares the loaded mac against the live one to catch a modelmap
+	-- change that silently re-identifies an adopted device.
+	mac                       = "string",
+	ip                        = "string",
+	hostname                  = "string",
+	-- Controller-pushed IP settings. ip_mode is the "was I static before?"
+	-- guard on the DHCP path, which must not flush a working lease just
+	-- because a steady-state push reaffirmed DHCP.
+	ip_mode                   = "string",
+	static_ip                 = "string",
+	static_netmask            = "string",
+	static_gateway            = "string",
+	static_dns                = "table",
+	-- Live kernel state, not UCI, so it is reapplied from here at startup the
+	-- way the blocked-client rules are.
+	led_enabled               = "boolean",
+	locating                  = "boolean",
+	locate_prev_trigger       = "string",
+	-- The per-port VLAN reversibility ledger: the stock `ports` strings of
+	-- every switch_vlan section openUF overwrote. Without it restore() has
+	-- nothing to put back and the board keeps openUF's VLAN config forever.
+	swvlan_backup             = "table",
+}
+
 -- Load state from disk. Missing file returns defaults. Applies security
 -- invariant: resets authkey if adopted == false.
 function M.load()
@@ -51,19 +108,8 @@ function M.load()
 	end
 
 	local st = defaults()
-	if type(tbl.authkey)    == "string"  then st.authkey    = tbl.authkey    end
-	if type(tbl.adopted)    == "boolean" then st.adopted    = tbl.adopted    end
-	if type(tbl.cfgversion) == "string"  then st.cfgversion = tbl.cfgversion end
-	if type(tbl.inform_url) == "string"  then st.inform_url = tbl.inform_url end
-	if type(tbl.use_gcm)    == "boolean" then st.use_gcm    = tbl.use_gcm    end
-	if type(tbl.upgrade_requested_version) == "string" then
-		st.upgrade_requested_version = tbl.upgrade_requested_version
-	end
-	if type(tbl.upgrade_requested_url) == "string" then
-		st.upgrade_requested_url = tbl.upgrade_requested_url
-	end
-	if type(tbl.blocked_stas) == "table" then
-		st.blocked_stas = tbl.blocked_stas
+	for field, want in pairs(M.FIELDS) do
+		if type(tbl[field]) == want then st[field] = tbl[field] end
 	end
 
 	-- Security invariant: never use a custom key when not adopted
