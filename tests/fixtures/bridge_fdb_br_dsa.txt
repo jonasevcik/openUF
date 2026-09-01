@@ -1,0 +1,42 @@
+2a:85:dc:4f:87:e4 dev wan master br-lan 
+f6:e0:eb:03:62:eb dev wan master br-lan 
+00:04:4b:86:81:77 dev wan master br-lan 
+c2:f4:e6:47:8e:db dev wan master br-lan 
+58:d6:1f:40:e2:f8 dev wan master br-lan 
+f4:f5:d8:b4:02:c2 dev wan master br-lan 
+00:04:74:25:d4:10 dev wan master br-lan 
+d8:6c:63:59:3c:77 dev wan master br-lan 
+e8:de:27:5f:62:77 dev wan master br-lan 
+64:4b:f0:13:9a:86 dev wan master br-lan 
+5a:d6:1f:40:e2:f6 dev wan master br-lan 
+30:b5:c2:d7:b6:5a dev wan master br-lan 
+20:df:b9:d1:8c:0b dev wan master br-lan 
+d4:53:2a:38:80:cf dev wan vlan 1 master br-lan permanent
+d4:53:2a:38:80:cf dev wan master br-lan permanent
+58:d6:1f:40:e2:f8 dev wan self 
+d8:6c:63:59:3c:77 dev wan self 
+c2:f4:e6:47:8e:db dev wan self 
+5a:d6:1f:40:e2:f6 dev wan self 
+00:04:4b:86:81:77 dev wan self 
+64:4b:f0:13:9a:86 dev wan self 
+30:b5:c2:d7:b6:5a dev wan self 
+f6:e0:eb:03:62:eb dev wan self 
+f4:f5:d8:b4:02:c2 dev wan self 
+2a:85:dc:4f:87:e4 dev wan self 
+20:df:b9:d1:8c:0b dev wan self 
+e8:de:27:5f:62:77 dev wan self 
+00:04:74:25:d4:10 dev wan self 
+d4:53:2a:b2:03:3c dev lan2 vlan 1 master br-lan permanent
+d4:53:2a:b2:03:3c dev lan2 master br-lan permanent
+33:33:00:00:00:01 dev br-lan self permanent
+33:33:00:00:00:02 dev br-lan self permanent
+01:00:5e:00:00:01 dev br-lan self permanent
+33:33:ff:b2:03:3c dev br-lan self permanent
+33:33:ff:00:00:00 dev br-lan self permanent
+01:80:c2:00:00:0e dev br-lan self permanent
+01:80:c2:00:00:03 dev br-lan self permanent
+01:80:c2:00:00:00 dev br-lan self permanent
+01:00:0c:cc:cc:cc dev br-lan self permanent
+01:00:81:00:01:00 dev br-lan self permanent
+00:e0:2b:00:00:00 dev br-lan self permanent
+01:e0:52:cc:cc:cc dev br-lan self permanent

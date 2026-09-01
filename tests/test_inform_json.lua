@@ -190,6 +190,80 @@ local function build_switch(opts)
 	return cjson.decode(inform.build_json(st, opts.cfg, ufhw))
 end
 
+-- A DSA board's modelmap: no switch map at all (there is no swconfig switch
+-- to map), one netdev per socket, and no static uplink flag -- the uplink is
+-- detected from the bridge FDB. Modelled on the Xiaomi AX3000T, whose four
+-- sockets are wan/lan2/lan3/lan4 in br-lan.
+local DSA_CFG = {
+	net = {
+		lan_cpueth = "wan", lan_vlanid = 1,
+		ports = {
+			{idx = 1, ifname = "wan"},
+			{idx = 2, ifname = "lan2"},
+			{idx = 3, ifname = "lan3"},
+			{idx = 4, ifname = "lan4"},
+		},
+	},
+}
+
+-- build() for a DSA board: no swconfig output at all (there is no such
+-- binary), so everything comes from sysfs per socket plus the bridge FDB.
+-- opts.fdb overrides the captured `bridge fdb show br br-lan`.
+local function build_dsa(opts)
+	opts = opts or {}
+	inject_sysinfo(false, false, false, false)
+	local base_read = inform._sysinfo._read_file
+	local base_cmd  = inform._sysinfo._run_cmd
+	inform._sysinfo._read_file = function(path)
+		if path:find("net/arp") then return fixture("proc_net_arp_dsa.txt") end
+		return base_read(path)
+	end
+	inform._sysinfo._run_cmd = function(cmd)
+		if cmd:find("swconfig") then return "" end   -- no such binary on DSA
+		if cmd:find("ip route") then
+			return "default via 192.168.200.1 dev br-lan \n"
+		end
+		if cmd:find("readlink") then
+			return "../../../../../../../../virtual/net/br-lan\n"
+		end
+		if cmd:find("bridge fdb show br", 1, true) then
+			return opts.fdb or fixture("bridge_fdb_br_dsa.txt")
+		end
+		-- `bridge fdb show dev <socket>`: on DSA each socket is its own
+		-- bridge port, so the per-port FDB is the per-socket host list.
+		if cmd:find("bridge fdb show dev lan3", 1, true) then
+			return "aa:bb:cc:dd:ee:01 master br-lan\n"
+		end
+		if cmd:find("bridge fdb show dev", 1, true) then return "" end
+		return base_cmd(cmd)
+	end
+	-- Per-socket sysfs: the uplink is up at gigabit, the rest are empty.
+	local orig_rf = inform._read_file
+	inform._read_file = function(path)
+		local iface = path:match("/sys/class/net/([^/]+)/")
+		if iface == (opts.live or "wan") then
+			if path:find("speed")   then return "1000\n" end
+			if path:find("duplex")  then return "full\n" end
+			if path:find("carrier") then return "1\n"    end
+		elseif iface then
+			if path:find("speed")   then return "-1\n"   end
+			if path:find("carrier") then return "0\n"    end
+		end
+		return nil
+	end
+	local st = {
+		authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
+		inform_url = "http://192.168.200.1:8080/inform",
+		mac = "d4:53:2a:38:80:cf", ip = "192.168.200.4", hostname = "testap",
+	}
+	local ok, out = pcall(function()
+		return cjson.decode(inform.build_json(st, opts.cfg or DSA_CFG, ufhw))
+	end)
+	inform._read_file = orig_rf
+	if not ok then error(out, 0) end
+	return out
+end
+
 -- Index a payload's port_table by port_idx.
 local function by_idx(port_table)
 	local out = {}
@@ -1341,6 +1415,89 @@ return {
 			assert_eq(#d2.port_table, 5, "four LAN sockets plus the WAN socket")
 			assert_true(p2[1].is_uplink, "lan1 (physical 2) carries the gateway on this board")
 			assert_false(p2[4].is_uplink, "not the socket the other board used")
+		end
+	},
+	{
+		name = "inform json: a DSA board reports each socket from its own netdev",
+		fn = function()
+			-- No swconfig, no ARL, and none needed: on DSA every socket is a
+			-- netdev, so sysfs is already per-socket rather than describing
+			-- the internal CPU link the way it does on ath79.
+			local d = build_dsa()
+			assert_eq(#d.port_table, 4, "one entry per socket")
+			local p = by_idx(d.port_table)
+			assert_true(p[1].up, "the cabled socket is up")
+			assert_eq(p[1].speed, 1000, "at the speed it negotiated")
+			assert_true(p[1].full_duplex, "and its duplex")
+			assert_false(p[2].up, "an empty socket has no link")
+			assert_eq(p[2].speed, 0, "and no speed, rather than the 1000 fallback")
+		end
+	},
+	{
+		name = "inform json: is_uplink follows the cable on DSA too",
+		fn = function()
+			-- The same discipline the swconfig path established, on the only
+			-- source a DSA board has for it. A modelmap constant would be
+			-- wrong the moment the cable moves, and the socket wrongly
+			-- treated as downstream reports the whole LAN as plugged into it.
+			local d = build_dsa()
+			local p = by_idx(d.port_table)
+			assert_true(p[1].is_uplink, "wan carries the gateway as cabled today")
+			assert_true(p[1].mac_table == nil, "so it reports no hosts of its own")
+			assert_false(p[2].is_uplink, "and no other socket claims to")
+
+			-- Cable moved to lan3. Nothing in the modelmap changed.
+			local moved = build_dsa({
+				live = "lan3",
+				fdb  = "5a:d6:1f:40:e2:f6 dev lan3 master br-lan \n"
+					.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n",
+			})
+			local q = by_idx(moved.port_table)
+			assert_true(q[3].is_uplink, "the flag followed the cable to lan3")
+			assert_false(q[1].is_uplink, "and left wan")
+			assert_true(q[3].mac_table == nil, "lan3 now suppresses its hosts")
+			assert_eq(#q[1].mac_table, 0, "and wan reports its own again")
+		end
+	},
+	{
+		name = "inform json: an undetectable DSA uplink falls back, never to nobody",
+		fn = function()
+			-- Detection that names a socket this board does not report (a
+			-- guest bridge port, a stale FDB) must not silently leave every
+			-- entry unflagged: the uplink would then publish a mac_table of
+			-- the entire far side, which is strictly worse than the static
+			-- flag the modelmap can still carry.
+			local cfg = {
+				net = {
+					lan_cpueth = "wan", lan_vlanid = 1,
+					ports = {
+						{idx = 1, ifname = "wan", uplink = true},
+						{idx = 2, ifname = "lan2"},
+					},
+				},
+			}
+			local d = build_dsa({cfg = cfg,
+				fdb = "5a:d6:1f:40:e2:f6 dev tap0 master br-lan \n"})
+			local p = by_idx(d.port_table)
+			assert_true(p[1].is_uplink, "fell back to the modelmap's own flag")
+			assert_false(p[2].is_uplink, "and only that one")
+
+			-- Gateway not learned at all: same fallback.
+			local d2 = build_dsa({cfg = cfg, fdb = ""})
+			assert_true(by_idx(d2.port_table)[1].is_uplink, "empty FDB falls back too")
+		end
+	},
+	{
+		name = "inform json: DSA wired hosts are reported on the socket they are on",
+		fn = function()
+			-- The per-port bridge FDB is already per-socket here, so no ARL
+			-- equivalent is needed for the host list -- only for deciding
+			-- which socket to suppress.
+			local d = build_dsa()
+			local p = by_idx(d.port_table)
+			assert_eq(#p[3].mac_table, 1, "the host plugged into lan3")
+			assert_eq(p[3].mac_table[1].mac, "aa:bb:cc:dd:ee:01", "its mac")
+			assert_eq(#p[2].mac_table, 0, "and nothing on the empty socket")
 		end
 	},
 	{

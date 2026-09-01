@@ -648,6 +648,26 @@ function M.switch_status(device)
 	return status
 end
 
+-- The MAC of the default gateway: its IP from the default route, then that
+-- IP's hardware address from the kernel's ARP cache. Lowercased. nil whenever
+-- any link of the chain is missing -- no default route, no ARP entry yet.
+--
+-- This is the "which way is the controller" question, and both uplink
+-- detectors below are only different ways of asking the switch where that MAC
+-- lives: swconfig's ARL table on ath79, the bridge FDB on DSA.
+function M._default_gateway_mac()
+	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
+		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	if not gw_ip then return nil end
+	local arp_out = M._read_file("/proc/net/arp")
+	if not arp_out then return nil end
+	for line in arp_out:gmatch("[^\n]+") do
+		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if ip == gw_ip and mac then return mac:lower() end
+	end
+	return nil
+end
+
 -- Which physical switch port the uplink cable is in, from an ARL table as
 -- returned by M.switch_status().arl -- the port the default gateway's MAC was
 -- learned on. Verified against both real boards: the same gateway MAC appears
@@ -661,16 +681,64 @@ end
 -- callers must then fall back to the netdev-only port rather than guess.
 function M.uplink_phys_port(arl)
 	if type(arl) ~= "table" then return nil end
-	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
-		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
-	if not gw_ip then return nil end
-	local arp_out = M._read_file("/proc/net/arp")
-	if not arp_out then return nil end
-	for line in arp_out:gmatch("[^\n]+") do
-		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-		if ip == gw_ip and mac then return arl[mac:lower()] end
-	end
+	local gw_mac = M._default_gateway_mac()
+	return gw_mac and arl[gw_mac] or nil
+end
+
+-- === DSA: the same questions, asked of the bridge ==========================
+--
+-- A DSA board (mediatek/filogic, and every other 21.02+ target) has no
+-- swconfig and no ARL to read. It does not need one: each socket is its own
+-- netdev, so sysfs answers link speed and duplex per socket honestly rather
+-- than describing an internal CPU link, and the bridge FDB answers the one
+-- thing sysfs cannot -- which socket a MAC sits behind.
+--
+-- Confirmed on a Xiaomi Mi Router AX3000T, whose four sockets are the netdevs
+-- wan/lan2/lan3/lan4, all enslaved to br-lan.
+
+-- The bridge a netdev is enslaved to, or nil when it is not a bridge port.
+-- /sys/class/net/<if>/master symlinks to the enslaving device.
+function M.bridge_of(ifname)
+	if not ifname then return nil end
+	local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
+	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
+	if m and m ~= "" and m ~= ifname then return m end
 	return nil
+end
+
+-- {[mac] = port_ifname} for every host the bridge has LEARNED, from one
+-- `bridge fdb show br <bridge>`. The DSA analogue of switch_status().arl.
+--
+-- Same filter discipline as M.mac_table, and for the same reasons. The
+-- load-bearing half is "permanent": the port's own address arrives as
+-- `<mac> dev wan master br-lan permanent` -- a master line like any other,
+-- separable only by that word, and counting it would put the AP's own socket
+-- MAC in its own client list. The "self" half is belt-and-braces (the
+-- AX3000T lists every learned MAC a second time as "dev wan self", but those
+-- lines carry no "master" and are already excluded).
+function M.bridge_fdb_ports(bridge)
+	local ports = {}
+	if not bridge then return ports end
+	local out = M._run_cmd("bridge fdb show br " .. bridge)
+	if not out or out == "" then return ports end
+	for line in out:gmatch("[^\n]+") do
+		if line:find("master") and not line:find("self")
+			and not line:find("permanent") then
+			local mac, port = line:match(
+				"^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+dev%s+(%S+)")
+			if mac and port then ports[mac:lower()] = port end
+		end
+	end
+	return ports
+end
+
+-- Which bridge port -- i.e. which socket -- the uplink cable is in, as an
+-- ifname. Same contract as M.uplink_phys_port: measured, never declared, and
+-- nil rather than a guess when the chain cannot be completed.
+function M.uplink_bridge_port(bridge)
+	local gw_mac = M._default_gateway_mac()
+	if not gw_mac then return nil end
+	return M.bridge_fdb_ports(bridge)[gw_mac]
 end
 
 -- The wired hosts learned on one physical switch port, in the same shape

@@ -1216,6 +1216,30 @@ function M.build_json(st, cfg, ufhw)
 		local ok_up, phys = pcall(M._sysinfo.uplink_phys_port, sw.arl)
 		if ok_up then uplink_phys = phys end
 	end
+
+	-- On a DSA board there is no switch to ask and no ARL to read, but every
+	-- socket is its own netdev and the bridge they are all enslaved to knows
+	-- which one the gateway is behind. Same measurement, different source --
+	-- and the same reason for measuring it: a modelmap constant is wrong the
+	-- moment someone moves the cable, and a socket wrongly treated as
+	-- downstream reports the whole LAN segment as hosts plugged into it.
+	--
+	-- Only honoured when it names a socket this board actually reports.
+	-- Otherwise no entry would be flagged at all and the uplink would publish
+	-- a mac_table of the entire far side -- worse than the static fallback.
+	local uplink_ifname = nil
+	if not next(sw.ports) then
+		local lan = cfg and cfg.net and cfg.net.lan_cpueth
+		local ok_br, br = pcall(M._sysinfo.bridge_of, lan)
+		if ok_br and br then
+			local ok_up, name = pcall(M._sysinfo.uplink_bridge_port, br)
+			if ok_up and name then
+				for _, p in ipairs(ports) do
+					if p.ifname == name then uplink_ifname = name break end
+				end
+			end
+		end
+	end
 	local mgmt_vlan = (cfg and cfg.net and cfg.net.lan_vlanid) or 1
 	local cpu_iface = iface_by_name[cfg and cfg.net and cfg.net.lan_cpueth]
 
@@ -1301,7 +1325,11 @@ function M.build_json(st, cfg, ufhw)
 				-- claimed a gigabit link on a socket with nothing in it.
 				speed       = (not link_up) and 0 or (M._link_speed(p.ifname) or 1000),
 				full_duplex = link_up and (M._link_duplex(p.ifname) ~= "half") or false,
-				is_uplink   = p.uplink or false,
+				-- Detected where the bridge could answer (DSA), declared
+			-- otherwise. Never both: a board that detects an uplink has
+			-- already agreed the flag is not board truth.
+			is_uplink   = (uplink_ifname ~= nil and p.ifname == uplink_ifname)
+				or (uplink_ifname == nil and p.uplink) or false,
 				speed_caps  = 0,
 				port_poe    = false,
 				poe_caps    = 0,

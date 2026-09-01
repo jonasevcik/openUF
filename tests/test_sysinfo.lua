@@ -475,6 +475,100 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: bridge_fdb_ports() maps learned MACs to their DSA socket",
+		fn = function()
+			-- Real `bridge fdb show br br-lan` off a Xiaomi AX3000T. The
+			-- entry that has to be thrown away is the port's OWN address,
+			-- which arrives as a master line like any other and is separable
+			-- only by the trailing "permanent" -- counting it would put the
+			-- AP's own socket MAC in its own client list.
+			with_fixtures({},
+				{["bridge fdb show br"] = fixture("bridge_fdb_br_dsa.txt")},
+				function()
+					local ports = sysinfo.bridge_fdb_ports("br-lan")
+					assert_eq(ports["5a:d6:1f:40:e2:f6"], "wan", "gateway is on wan")
+					assert_eq(ports["00:04:4b:86:81:77"], "wan", "a host is on wan")
+					-- The board's own port MAC arrives only on "permanent"
+					-- lines, so it is not a host and must not be in the map.
+					assert_true(ports["d4:53:2a:38:80:cf"] == nil,
+						"the port's own permanent address is not a learned host")
+				end)
+			-- No bridge, or a bridge the command knows nothing about.
+			assert_eq(next(sysinfo.bridge_fdb_ports(nil)), nil, "nil bridge -> empty")
+			with_fixtures({}, {}, function()
+				assert_eq(next(sysinfo.bridge_fdb_ports("br-lan")), nil, "no output -> empty")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: uplink_bridge_port() finds the socket the gateway is behind",
+		fn = function()
+			local cmds = {
+				["bridge fdb show br"] = fixture("bridge_fdb_br_dsa.txt"),
+				["ip route"] = "default via 192.168.200.1 dev br-lan \n",
+			}
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")}, cmds,
+				function()
+					assert_eq(sysinfo.uplink_bridge_port("br-lan"), "wan",
+						"uplink socket is wan")
+				end)
+
+			-- Same board, cable moved to another socket: the answer has to
+			-- follow the FDB, not a constant. (Synthetic -- only one socket
+			-- was cabled on the real board at capture time.)
+			local moved = "5a:d6:1f:40:e2:f6 dev lan3 master br-lan \n"
+				.. "00:04:4b:86:81:77 dev lan3 master br-lan \n"
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")},
+				{["bridge fdb show br"] = moved,
+				 ["ip route"] = "default via 192.168.200.1 dev br-lan \n"},
+				function()
+					assert_eq(sysinfo.uplink_bridge_port("br-lan"), "lan3",
+						"uplink socket followed the cable")
+				end)
+		end
+	},
+	{
+		name = "sysinfo: uplink_bridge_port() gives up rather than guessing",
+		fn = function()
+			local fdb = fixture("bridge_fdb_br_dsa.txt")
+			-- No default route.
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")},
+				{["bridge fdb show br"] = fdb}, function()
+					assert_true(sysinfo.uplink_bridge_port("br-lan") == nil,
+						"no default route -> nil")
+				end)
+			-- Default route whose gateway has not been ARP-resolved yet.
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")},
+				{["bridge fdb show br"] = fdb,
+				 ["ip route"] = "default via 192.168.200.254 dev br-lan \n"},
+				function()
+					assert_true(sysinfo.uplink_bridge_port("br-lan") == nil,
+						"gateway not in arp -> nil")
+				end)
+			-- Gateway resolved but the bridge has not learned it.
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")},
+				{["ip route"] = "default via 192.168.200.1 dev br-lan \n"},
+				function()
+					assert_true(sysinfo.uplink_bridge_port("br-lan") == nil,
+						"gateway not in the FDB -> nil")
+				end)
+		end
+	},
+	{
+		name = "sysinfo: bridge_of() names the bridge a socket is enslaved to",
+		fn = function()
+			with_fixtures({}, {["readlink"] =
+				"../../../../../../../../virtual/net/br-lan\n"}, function()
+					assert_eq(sysinfo.bridge_of("lan3"), "br-lan", "lan3 is in br-lan")
+				end)
+			-- A netdev that is not a bridge port: readlink prints nothing.
+			with_fixtures({}, {}, function()
+				assert_true(sysinfo.bridge_of("eth0") == nil, "not enslaved -> nil")
+			end)
+			assert_true(sysinfo.bridge_of(nil) == nil, "nil ifname -> nil")
+		end
+	},
+	{
 		name = "sysinfo: switch_mac_table() returns one socket's hosts, joined with arp",
 		fn = function()
 			sysinfo._mac_first_seen = {}
