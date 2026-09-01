@@ -964,10 +964,27 @@ on the uplink *bridge port* (`wan.10`) takes its VID before the bridge sees it, 
 holding `wan.10` and the IoT VAP, `wan.10` counting 1.9 MB inbound, the gateway's MAC
 learned on it, and untagged wired clients on the other sockets unaffected.
 
-`switchvlan.detect_backend` returns `unknown` here (no `config switch`, no
-`config bridge-vlan`) and refuses per-port VLAN, which is correct — but openUF still reports
-`hasOWRTSwitch`, so the controller offers and accepts a Port VLAN assignment the device then
-declines in its log and nowhere else.
+### Per-port VLAN on DSA is a bridge move, not `bridge-vlan`
+
+Same insight, applied to the wired side: assigning a socket to VLAN 10 puts it in
+`br-openuf10`, the bridge that already holds `wan.10`. `br-lan` keeps the uplink, the
+unassigned sockets and the management address, and nothing runs with `vlan_filtering` — so
+a wrong answer here cannot strand the AP, which `config bridge-vlan` on `br-lan` very much
+could. It would also have fought the tagged-SSID path for the same `vlan_do_receive`
+reason: a `bridge-vlan` for VLAN 10 on `br-lan` would never receive anything, because
+`wan.10` takes those frames first.
+
+Confirmed live: port 2 assigned to the IoT network moved `lan2` into `br-openuf10` next to
+the IoT VAP, left `br-lan` holding `wan`/`lan4`, and the attached device's frames appeared
+on the tagged uplink **byte for byte** — each 342-byte DHCP DISCOVER on `lan2` showed up as
+exactly 342 bytes of `wan.10` tx. That counter identity is the cleanest proof the path is
+real, and the way to verify a move without relying on the client.
+
+What the client does next is its own business: an IKEA Trådfri hub kept the Home LAN lease
+it already held (the link never drops when a port changes bridge), and after a link bounce
+re-sent DISCOVER once a minute for fifteen minutes without ever accepting an offer. Scope
+on DSA is the Native VLAN — a bridge gives a port one untagged home — and a tagged-only
+port is refused out loud rather than half-applied.
 
 ### `radio.<n>.ieee_mode` carries a width, not a PHY generation
 

@@ -556,6 +556,17 @@ Reversibility on DSA is `st.dsa_brlan_ports`: `br-lan`'s port list exactly as th
 shipped it, snapshotted once before the first socket moves. Unticking **Port VLAN** puts it
 back verbatim and returns the sockets from the VLAN bridges.
 
+> **Reassigning a port does not re-address the device plugged into it.** Moving a socket
+> between bridges is invisible to the attached host: its link never drops, so it keeps the
+> lease it already had — now on the wrong subnet — and simply goes quiet. Bounce the port
+> (`ip link set lan2 down; ip link set lan2 up`) to make it re-DHCP, and be aware that some
+> devices still will not: an IKEA Trådfri hub, moved to an IoT VLAN this way, re-sent a
+> DHCP DISCOVER roughly once a minute for fifteen minutes without ever taking the offer,
+> and needed the port put back. Verify the move by watching the counters rather than by
+> waiting for the client to reappear — `cat /proc/net/dev` should show the socket's rx
+> bytes and the tagged uplink's tx bytes climb by *the same amount*, which is the whole
+> path proving itself. Power-cycle the attached device if it does not settle.
+
 Three things must line up or the port is skipped rather than guessed at:
 
 - `dev.conf.vlan` must exist in your modelmap (`cpu_lan` + a `ports` name→number map).
