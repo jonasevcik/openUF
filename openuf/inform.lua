@@ -2588,7 +2588,26 @@ function M.handle_response(json_str, st, cfg)
 						if br then uplink_ifname = M._sysinfo.uplink_bridge_port(br) end
 					end
 					local sw = M._parse_switch_system_cfg(sys_raw)
-					if sw and not sw.enabled then
+					-- Turning Port VLAN off does not always announce itself.
+					-- The gates were once observed staying on the wire at
+					-- =disabled, but a device that has HAD the feature on and
+					-- then has it unticked gets a full system_cfg with no
+					-- switch.* keys at all -- confirmed live on the AX3000T,
+					-- where the teardown therefore never ran and br-lan kept
+					-- openUF's port list forever.
+					--
+					-- So absence counts as off too, but only when openUF holds
+					-- a reversibility ledger: that is proof it applied
+					-- something, which in turn is proof the controller was
+					-- sending switch.* until now. With no ledger there is
+					-- nothing to undo and this is a no-op anyway. Safe on a
+					-- partial push -- the worst case is a restore to stock
+					-- that the next full push re-applies -- and it cannot
+					-- flap, since restore() spends the ledger. Reachable only
+					-- inside `type(sys_raw) == "string"`, never on a noop.
+					local had_applied = st.swvlan_backup ~= nil
+						or st.dsa_brlan_ports ~= nil
+					if (sw and not sw.enabled) or (sw == nil and had_applied) then
 						-- Explicit disable: unticking the device-level "Port
 						-- VLAN" box keeps the switch.* block on the wire with
 						-- both gates at =disabled (confirmed live -- the
@@ -2607,11 +2626,22 @@ function M.handle_response(json_str, st, cfg)
 						-- take the wireless trunk with it and silently kill
 						-- the IoT WLAN's uplink. apply() reconciles both
 						-- concerns in one pass.
-						if #wireless_vlans > 0 then
+						--
+						-- That hazard is SWCONFIG-ONLY, and gating on the
+						-- wireless VLANs alone got it wrong on DSA: there the
+						-- tagged SSID needs no trunk at all and its bridge
+						-- belongs to ucihelper, so restore() cannot harm it --
+						-- it only hands br-lan its original port list back.
+						-- Skipping restore there meant the reversibility
+						-- ledger was never spent and br-lan kept the port
+						-- ORDER openUF had left it in, so unticking Port VLAN
+						-- looked like it had done nothing.
+						if (cfg and cfg.vlan and cfg.vlan.ports)
+							and #wireless_vlans > 0 then
 							M._switchvlan.apply(sw, cfg, st, wireless_vlans,
 								uplink_phys, uplink_ifname)
 						else
-							M._switchvlan.restore(st)
+							M._switchvlan.restore(st, cfg)
 						end
 					else
 						M._switchvlan.apply(sw, cfg, st, wireless_vlans,

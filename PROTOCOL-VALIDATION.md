@@ -980,6 +980,17 @@ on the tagged uplink **byte for byte** — each 342-byte DHCP DISCOVER on `lan2`
 exactly 342 bytes of `wan.10` tx. That counter identity is the cleanest proof the path is
 real, and the way to verify a move without relying on the client.
 
+**Turning the feature off does not always announce itself.** The gates were once observed
+staying on the wire at `switch.status=disabled`, and openUF treated an absent `switch.*`
+block as "say nothing, change nothing" so an older controller or a partial push could not
+trigger a teardown. But a device that has HAD Port VLAN on and then has it unticked gets a
+full `system_cfg` with **no `switch.*` keys at all** — so the affirmative off signal never
+arrived, the teardown never ran, and `br-lan` kept openUF's port list indefinitely. Absence
+now counts as off as well, gated on openUF holding a reversibility ledger: that is proof it
+applied something, which is proof the controller was sending `switch.*` until now. It is
+reachable only inside `type(sys_raw) == "string"`, so a noop response can never trigger it,
+and `restore()` spends the ledger so it cannot flap.
+
 What the client does next is its own business: an IKEA Trådfri hub kept the Home LAN lease
 it already held (the link never drops when a port changes bridge), and after a link bounce
 re-sent DISCOVER once a minute for fifteen minutes without ever accepting an offer. Scope

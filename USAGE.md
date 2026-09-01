@@ -556,6 +556,13 @@ Reversibility on DSA is `st.dsa_brlan_ports`: `br-lan`'s port list exactly as th
 shipped it, snapshotted once before the first socket moves. Unticking **Port VLAN** puts it
 back verbatim and returns the sockets from the VLAN bridges.
 
+> Unticking the box is what triggers that teardown, and it needs a config push to act on —
+> the controller sends one when you hit **Apply Changes**, not merely when the device
+> reconnects. Note the off signal is an *absence*: a device that has had Port VLAN on and
+> then has it unticked receives a `system_cfg` with no `switch.*` keys at all rather than
+> the gates set to `disabled`. openUF treats that as off only while it holds a ledger, so
+> there is something to undo.
+
 > **Reassigning a port does not re-address the device plugged into it.** Moving a socket
 > between bridges is invisible to the attached host: its link never drops, so it keeps the
 > lease it already had — now on the wrong subnet — and simply goes quiet. Bounce the port

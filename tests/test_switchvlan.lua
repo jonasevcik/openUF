@@ -837,11 +837,67 @@ return {
 				switchvlan._uci = u.mock
 				local st = {}
 				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
-				assert_true(switchvlan.restore(st), "restore ran")
+				assert_true(switchvlan.restore(st, DSA_CFG), "restore ran")
 				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan", "original port list, in order")
 				assert_eq(joined(u, "openuf_brdev10"), "wan.10",
 					"the VLAN bridge survives -- a tagged SSID may still need it")
 				assert_nil(st.dsa_brlan_ports, "ledger spent")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: restore names the bridge from the modelmap, not a constant",
+		fn = function()
+			-- dsa_apply moves sockets out of br-<lan_name>; a restore that
+			-- went looking for a hardcoded "br-lan" would put nothing back on
+			-- a board named anything else -- and report success while doing
+			-- it, which is the worst shape a teardown can have.
+			local u = new_mock_uci()
+			u.cursor:set("network", "brhome", "device")
+			u.cursor:set("network", "brhome", "type", "bridge")
+			u.cursor:set("network", "brhome", "name", "br-home")
+			u.cursor:set("network", "brhome", "ports", {"lan2", "lan3", "wan"})
+			u.cursor:set("network", "openuf_brdev10", "device")
+			u.cursor:set("network", "openuf_brdev10", "type", "bridge")
+			u.cursor:set("network", "openuf_brdev10", "name", "br-openuf10")
+			u.cursor:set("network", "openuf_brdev10", "ports", {"wan.10"})
+
+			local cfg = {net = {lan_name = "home", lan_cpueth = "wan", lan_vlanid = 1,
+				ports = {{idx = 1, ifname = "wan"}, {idx = 2, ifname = "lan2"},
+					{idx = 3, ifname = "lan3"}}}}
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), cfg, st, {}, nil, "wan")
+				assert_eq(joined(u, "brhome"), "lan2,wan", "lan3 moved out of br-home")
+				assert_true(switchvlan.restore(st, cfg), "restore ran")
+				assert_eq(joined(u, "brhome"), "lan2,lan3,wan", "and br-home got its list back")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: tearing down per-port VLAN leaves a tagged SSID's bridge alone",
+		fn = function()
+			-- The reason the swconfig path guards restore() behind "is a
+			-- tagged SSID still using a trunk?" does not exist on DSA: the
+			-- VLAN bridge belongs to ucihelper, restore() only hands br-lan
+			-- its port list back, and the tagged uplink sub-device was never
+			-- br-lan's to take. Gating on the wireless VLANs there left the
+			-- ledger unspent and br-lan holding the port order openUF had
+			-- left behind -- unticking Port VLAN looked like a no-op.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {10}, nil, "wan")
+				assert_eq(joined(u, "openuf_brdev10"), "wan.10,lan3", "socket moved in")
+
+				assert_true(switchvlan.restore(st, DSA_CFG), "restore ran")
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan",
+					"br-lan back to the board's own list, in the board's own order")
+				assert_eq(joined(u, "openuf_brdev10"), "wan.10",
+					"the tagged SSID keeps its bridge and its uplink sub-device")
+				assert_nil(st.dsa_brlan_ports, "and the ledger is spent")
 			end)
 		end
 	},

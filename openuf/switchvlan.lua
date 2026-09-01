@@ -792,7 +792,7 @@ end
 -- Undo dsa_apply: put br-lan's original port list back and drop openUF's
 -- socket members from the VLAN bridges. The bridges themselves belong to
 -- ucihelper (a tagged SSID may still need them) and are left standing.
-function M.dsa_restore(st)
+function M.dsa_restore(st, cfg)
 	if not (st and st.dsa_brlan_ports) then return false end
 	local uci = get_uci()
 	local cursor = uci.cursor()
@@ -814,7 +814,11 @@ function M.dsa_restore(st)
 		if diff then cursor:set("network", s[".name"], "ports", out); changed = true end
 	end)
 
-	local lan_name = "br-lan"
+	-- Derived, not hardcoded: dsa_apply names this bridge from the modelmap,
+	-- and a restore that looked for a different one would silently put nothing
+	-- back while reporting success. Falls back to "lan" only when cfg is
+	-- absent, which is what every board here uses anyway.
+	local lan_name = "br-" .. ((cfg and cfg.net and cfg.net.lan_name) or "lan")
 	local lan_sec  = find_lan_bridge(cursor, lan_name)
 	if lan_sec then
 		cursor:set("network", lan_sec, "ports", orig)
@@ -830,13 +834,14 @@ function M.dsa_restore(st)
 end
 
 -- Undo everything apply() wrote: drop openUF's sections and put the stock
--- sections' port strings back.
-function M.restore(st)
+-- sections' port strings back. cfg is needed only on the DSA path, which has
+-- to name the same bridge dsa_apply moved sockets out of.
+function M.restore(st, cfg)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- A DSA board has no switch_vlan sections to drop and a different thing to
 	-- put back; the presence of its ledger is what says so.
-	if st and st.dsa_brlan_ports then return M.dsa_restore(st) end
+	if st and st.dsa_brlan_ports then return M.dsa_restore(st, cfg) end
 	local removed = false
 	local doomed = {}
 	cursor:foreach("network", "switch_vlan", function(s)
