@@ -198,4 +198,73 @@ return {
 			end, "none timer [phy0tpt]\n")
 		end
 	},
+	{
+		name = "led: the snapshot is handed back to the caller to persist",
+		fn = function()
+			-- set-locate and unset-locate are two independent commands with
+			-- nothing bounding the gap, so a restart lands between them
+			-- easily. The process that stops the blink is then not the one
+			-- that started it and has nothing remembered -- only the caller's
+			-- persisted copy knows what the LED was on.
+			with_capture(function(writes)
+				local ok, prev = led.locate_start("/sys/class/leds/mt76-phy0")
+				assert_true(ok, "locate_start still reports success")
+				assert_eq(prev, "phy0tpt", "and hands back what it snapshotted")
+
+				-- A fresh process: no in-memory snapshot at all.
+				led._saved_trigger = {}
+				led.locate_stop("/sys/class/leds/mt76-phy0", prev)
+				assert_eq(writes[#writes].contents, "phy0tpt",
+					"the persisted trigger restores it across the gap")
+			end, "none timer [phy0tpt] phy1tpt\n")
+		end
+	},
+	{
+		name = "led: a snapshot of the blink itself is refused, from either source",
+		fn = function()
+			-- What a second locate_start records when an earlier Locate is
+			-- still running: "timer" is the blink, not a thing to restore.
+			-- Observed on real hardware -- an AX3000T's radio LED stayed on
+			-- the identify blink across three Locate cycles, each one
+			-- faithfully restoring what the last had left behind.
+			with_capture(function(writes)
+				local _, prev = led.locate_start("/sys/class/leds/mt76-phy0")
+				assert_eq(prev, "timer", "it does snapshot what it found")
+				led.locate_stop("/sys/class/leds/mt76-phy0")
+				assert_eq(writes[#writes].contents, "none",
+					"but stopping falls back to none rather than re-blinking")
+			end, "none [timer] phy0tpt\n")
+
+			-- Same refusal for a persisted one, which is where a stale
+			-- snapshot actually survives long enough to do damage.
+			with_capture(function(writes)
+				led.locate_stop("/sys/class/leds/mt76-phy0", "timer")
+				assert_eq(writes[#writes].contents, "none", "persisted 'timer' refused too")
+			end, "none timer [phy0tpt]\n")
+		end
+	},
+	{
+		name = "led: locate_active tells a caller whether there is a blink to undo",
+		fn = function()
+			-- The question a restarting daemon has to answer before touching
+			-- anything: state says "locating", but did the DEVICE reboot (the
+			-- kernel already restored the LED's own trigger) or only the
+			-- daemon (the blink is still running)? Writing none in the first
+			-- case destroys a perfectly good activity light.
+			with_capture(function()
+				assert_true(led.locate_active("/sys/class/leds/mt76-phy0"),
+					"still blinking -> there is something to undo")
+			end, "none [timer] phy0tpt\n")
+			with_capture(function()
+				assert_false(led.locate_active("/sys/class/leds/mt76-phy0"),
+					"back on its own trigger -> leave it alone")
+			end, "none timer [phy0tpt]\n")
+			-- Unreadable, and no LED configured at all.
+			with_capture(function()
+				assert_false(led.locate_active("/sys/class/leds/mt76-phy0"),
+					"unreadable trigger -> do not touch")
+			end)
+			assert_false(led.locate_active(nil), "no LED configured -> false, not a crash")
+		end
+	},
 }

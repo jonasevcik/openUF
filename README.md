@@ -73,8 +73,8 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 
 | Feature | Status |
 |---|---|
-| Locate (LED identify blink) | ✅ Working — requires `dev.conf.led` set per board. The LED need not be a dedicated status light: Locate snapshots whatever trigger it was driving and restores it on stop, so a board with only radio LEDs (a Xiaomi AX3000T has nothing else) can be identified without losing its activity blink |
-| Manage → LED steady on/off toggle | ✅ Working — same `dev.conf.led` requirement |
+| Locate (LED identify blink) | ✅ Working — requires `dev.conf.led` set per board, naming an LED that is **actually wired** (see USAGE § 3). The LED need not be a dedicated status light: Locate snapshots whatever trigger it was driving, persists it, and restores it on stop, so it survives a restart landing between the controller's `set-locate` and `unset-locate` — and an interrupted Locate is torn down at the next start rather than blinking forever |
+| Manage → LED steady on/off toggle | ✅ Working — same `dev.conf.led` requirement. Persisted and re-applied at startup, so it survives a reboot; it is also re-asserted when a Locate ends, since restoring the blink's previous trigger alone would leave a status LED dark |
 | Client block / unblock | ✅ Working — enforced via nftables, persists across restarts |
 | IP Settings (DHCP / static) | ✅ Working — reconfigures the device's own management interface, including the DNS servers (`resolv.nameserver.<k>.ip` → `/etc/resolv.conf`, in the controller's primary/secondary order). DNS is applied on the static path only; on DHCP the lease supplies it |
 | Per-port VLAN assignment | ⚠️ Wire format fully mapped live (`switch.*`: device-level gate, per-VLAN table, per-port `pvid` plus a tagged/untagged/`exclude` matrix joined on `port_table[].port_idx`); requires reporting the `hasOWRTSwitch` capability bit and ticking **Port VLAN** on the device. Applied as swconfig `switch_vlan` sections — **swconfig boards only** (DSA is detected and refused rather than guessed at; the controller still offers and accepts the assignment there, since it has no way to be told a device cannot, so the refusal shows up only in the device log), requires a `dev.conf.vlan` port map plus a `swport` on the port, never touches the socket the uplink cable is in (detected at runtime, and refused outright when it cannot be determined), and is reversible — unticking the device-level **Port VLAN** box tears openUF's sections down and restores the stock port strings. The generated UCI is unit-tested, but that it programs a real switch ASIC is **not verified** (no switch hardware here) |
@@ -112,7 +112,11 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   Two board notes: its four sockets are the netdevs `wan`/`lan2`/`lan3`/`lan4` (there is no
   `lan1` — DSA names ports from the device tree, not the case labels), and it exposes **no
   status LED** (`/sys/class/leds` holds only the two mt76 radio LEDs), so Locate blinks
-  `mt76-phy0` and restores its throughput trigger afterwards
+  `blue:status` — **install `kmod-leds-gpio`** (9 KB) or the board has no drivable LED at
+  all: its case LED is a blue/yellow GPIO pair the stock filogic image ships no driver for,
+  leaving it stuck on whatever the bootloader set (a steady orange). `install.sh` adds the
+  module when it sees that situation. Do not point `dev.conf.led` at `mt76-phy0` instead —
+  it exists and accepts writes, but is wired to nothing on this board
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.

@@ -70,16 +70,34 @@ local function _resolve(led)
 	return led
 end
 
+-- Is this LED currently running the identify blink? Lets a caller undo a
+-- Locate it did not start without clobbering an LED that is already fine: a
+-- device that REBOOTED mid-Locate comes back with state saying "locating" and
+-- an LED the kernel has already put back on its own default trigger, and
+-- "stopping" that would write none over a perfectly good activity light.
+function M.locate_active(led)
+	local led_path = _resolve(led)
+	return led_path ~= nil and active_trigger(led_path) == "timer"
+end
+
 -- Start the "locate" identify blink pattern (fast timer blink), remembering
 -- whatever trigger the LED was already driving so locate_stop can put it back.
+--
+-- Returns that remembered trigger (nil if it could not be read), so a caller
+-- that outlives this process -- inform.lua persists it in state.json -- can
+-- hand it back to locate_stop after a restart. Without that the snapshot is
+-- lost with the process and the LED stays on the blink forever, which on a
+-- board whose only LED belongs to a radio means its activity light is gone
+-- until someone notices.
 function M.locate_start(led)
 	local led_path = _resolve(led)
 	if not led_path then return false end
-	M._saved_trigger[led_path] = active_trigger(led_path)
+	local prev = active_trigger(led_path)
+	M._saved_trigger[led_path] = prev
 	M._write_file(led_path .. "/trigger", "timer")
 	M._write_file(led_path .. "/delay_on", "250")
 	M._write_file(led_path .. "/delay_off", "250")
-	return true
+	return true, prev
 end
 
 -- Stop the "locate" identify blink pattern, restoring the trigger the LED was
@@ -92,10 +110,19 @@ end
 -- transient identify action, that no later Locate undoes. Falls back to
 -- "none" when the trigger could not be read, which is the old behaviour and
 -- the only safe answer when the previous state is unknown.
-function M.locate_stop(led)
+--
+-- `prev` overrides the in-process snapshot and is how a Locate that spanned a
+-- restart is undone: this process never saw the start, so it has nothing
+-- remembered, and only the caller's persisted copy knows what the LED was on.
+-- A snapshot of "timer" is refused from either source -- that is the blink
+-- itself, recorded by a locate_start that ran while an earlier Locate was
+-- still going, and writing it back would restore nothing.
+function M.locate_stop(led, prev)
 	local led_path = _resolve(led)
 	if not led_path then return false end
-	M._write_file(led_path .. "/trigger", M._saved_trigger[led_path] or "none")
+	local restore = prev or M._saved_trigger[led_path]
+	if restore == "timer" then restore = nil end
+	M._write_file(led_path .. "/trigger", restore or "none")
 	M._saved_trigger[led_path] = nil
 	return true
 end

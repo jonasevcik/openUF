@@ -2145,6 +2145,92 @@ return {
 		end
 	},
 	{
+		name = "inform packet: a Locate persists the trigger it took over",
+		fn = function()
+			-- set-locate and unset-locate are two independent commands with
+			-- nothing bounding the gap between them, so a restart lands there
+			-- easily. Holding the snapshot only in memory means the process
+			-- that stops the blink is not the one that started it and has
+			-- nothing to put back -- on a board whose only LED belongs to a
+			-- radio, that costs the activity light until someone notices.
+			local st = sample_state()
+			local writes = {}
+			local orig_w, orig_r = inform._led._write_file, inform._led._read_file
+			inform._led._write_file = function(path, contents)
+				writes[#writes + 1] = {path = path, contents = contents}
+				return true
+			end
+			inform._led._read_file = function(path)
+				if path:find("/trigger", 1, true) then
+					return "none timer [phy0tpt] phy1tpt\n"
+				end
+				return nil
+			end
+			local cfg = {led = "/sys/class/leds/mt76-phy0"}
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				assert_true(st.locating, "locating set")
+				assert_eq(st.locate_prev_trigger, "phy0tpt",
+					"and the trigger it took over is in state, not just in memory")
+
+				-- The restart: a fresh module with no in-memory snapshot.
+				inform._led._saved_trigger = {}
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st, cfg)
+				assert_eq(writes[#writes].contents, "phy0tpt",
+					"the persisted trigger is what gets restored")
+				assert_nil(st.locate_prev_trigger, "and is cleared once spent")
+			end)
+			inform._led._write_file, inform._led._read_file = orig_w, orig_r
+			inform._led._saved_trigger = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: stopping a Locate returns the LED to its chosen idle state",
+		fn = function()
+			-- Restoring the trigger is not the whole idle state. A dedicated
+			-- status LED's normal look is "trigger none, brightness on" --
+			-- exactly what set_enabled leaves behind -- so restoring only the
+			-- trigger brings it back on none/0, i.e. dark. Seen on an
+			-- AX3000T: blue:status came out of Locate on trigger none with
+			-- brightness 0 and the AP went dark.
+			local st = sample_state({led_enabled = true})
+			local writes = {}
+			local orig_w, orig_r = inform._led._write_file, inform._led._read_file
+			inform._led._write_file = function(path, contents)
+				writes[#writes + 1] = {path = path, contents = contents}
+				return true
+			end
+			inform._led._read_file = function(path)
+				if path:find("/trigger", 1, true) then return "[none] timer\n" end
+				return nil
+			end
+			local cfg = {led = "/sys/class/leds/blue:status"}
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st, cfg)
+				local last = writes[#writes]
+				assert_eq(last.path, "/sys/class/leds/blue:status/brightness",
+					"the last write is the brightness, not the trigger")
+				assert_eq(last.contents, "1", "and it puts the LED back on")
+			end)
+			-- Never pushed: the board's own default must be left alone.
+			local st2 = sample_state()
+			local n_before
+			local ok2, err2 = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st2, cfg)
+				n_before = #writes
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st2, cfg)
+				assert_eq(#writes, n_before + 1,
+					"one write -- the trigger restore -- and no brightness assertion")
+			end)
+			inform._led._write_file, inform._led._read_file = orig_w, orig_r
+			inform._led._saved_trigger = {}
+			if not ok then error(err, 0) end
+			if not ok2 then error(err2, 0) end
+		end
+	},
+	{
 		name = "inform packet: build_json passes the modelmap's hwassign to get_radio_table",
 		fn = function()
 			-- The knob is documented in USAGE.md and conf.lua and was read by

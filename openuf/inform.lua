@@ -2639,8 +2639,29 @@ function M.handle_response(json_str, st, cfg)
 
 		if cmd == "set-locate" or cmd == "unset-locate" then
 			local led_path = cfg and cfg.led
-			if cmd == "set-locate" then M._led.locate_start(led_path)
-			else M._led.locate_stop(led_path) end
+			if cmd == "set-locate" then
+				-- The trigger the LED was on is persisted, not just held in
+				-- memory: the controller sends set-locate and unset-locate as
+				-- two independent commands with nothing bounding the gap, so
+				-- a restart can easily land between them, and only this copy
+				-- then knows what to put back. See M.run's startup handling.
+				local _, prev = M._led.locate_start(led_path)
+				st.locate_prev_trigger = prev
+			else
+				M._led.locate_stop(led_path, st.locate_prev_trigger)
+				st.locate_prev_trigger = nil
+				-- Restoring the TRIGGER is not the whole idle state. An LED
+				-- whose normal look is "trigger none, brightness on" -- which
+				-- is exactly what set_enabled leaves behind, and what a
+				-- dedicated status LED like blue:status or green:system sits
+				-- at -- comes back from a Locate on trigger none and
+				-- brightness 0, i.e. dark. So re-assert the steady state the
+				-- operator actually chose, the same way M.run does at
+				-- startup. nil means never pushed: leave the board alone.
+				if st.led_enabled ~= nil then
+					M._led.set_enabled(led_path, st.led_enabled)
+				end
+			end
 			st.locating = (cmd == "set-locate")
 			M._state.save(st)
 		elseif cmd == "block-sta" or cmd == "unblock-sta" then
@@ -2990,6 +3011,38 @@ function M.run(cfg, ufhw)
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
 	-- account reconciliation just above).
 	M._firewall.reconcile(st.blocked_stas)
+	-- A Locate does NOT survive a restart, and must not: it is a transient
+	-- "which box is it" blink, nobody is still standing in front of the AP,
+	-- and unset-locate only ever arrives while someone is watching the
+	-- controller. Left alone the device comes back still blinking with no
+	-- snapshot of what the LED was on, and the next unset-locate -- if one
+	-- ever comes -- restores nothing. Worse, a second set-locate would
+	-- snapshot the blink itself as the thing to restore. Observed exactly
+	-- that on an AX3000T, whose radio LED stayed on the identify blink
+	-- across three Locate cycles.
+	if st.locating then
+		-- Only when the LED is really still blinking: a device that REBOOTED
+		-- mid-Locate comes back with the kernel's own default trigger already
+		-- restored, and "stopping" that would write none over it.
+		if M._led.locate_active(cfg and cfg.led) then
+			M._led.locate_stop(cfg and cfg.led, st.locate_prev_trigger)
+		end
+		st.locating = false
+		st.locate_prev_trigger = nil
+		M._state.save(st)
+	end
+	-- LED brightness is live kernel state too, not UCI -- the same reason the
+	-- blocked-client rules are reapplied above. The controller pushes
+	-- led_enabled once, in mgmt_cfg, and never again, so without this the
+	-- Manage > LED toggle silently forgets itself on every reboot while the
+	-- controller goes on believing it took. Applied AFTER the locate teardown:
+	-- if both have something to say, the steady state the operator chose wins
+	-- over whatever trigger the blink displaced. nil means it was never
+	-- pushed, which must leave the board's own default alone rather than
+	-- deciding for it.
+	if st.led_enabled ~= nil then
+		M._led.set_enabled(cfg and cfg.led, st.led_enabled)
+	end
 	-- Per-port byte counters are a switch-driver setting that some boards ship
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
