@@ -26,7 +26,8 @@ would otherwise be hard to re-verify.
 - **Real hardware, 2026-07-28:** a TP-Link Archer C5 v1 (OpenWrt 25.12.5, ath79/mips_24kc,
   ath9k 2.4GHz + ath10k 5GHz) adopted by a **UniFi Cloud Gateway Ultra running Network
   10.4.57** — the same version as the Docker baseline, so the two are directly comparable.
-  See [the first real-hardware run](#the-first-real-hardware-run) for what only appears
+  See [the first real-hardware run](#the-first-real-hardware-run) and
+  [the first DSA / 802.11ax board](#the-first-dsa--80211ax-board) for what only appears
   once genuine `netifd`/`hostapd`/radios are in the loop.
 
 **Status:** adoption, provisioning, and every UI-surfaced feature listed in the
@@ -939,6 +940,87 @@ a re-enable.
 
 ---
 
+## The first DSA / 802.11ax board
+
+2026-09-01, Xiaomi Mi Router AX3000T (mediatek/filogic MT7981, OpenWrt 25.12.5) + the same
+UCG Ultra. It replaced the TL-WDR3500 in the bedroom. Everything the ath79 boards could not
+show, because they are all swconfig and all 802.11n on 2.4 GHz.
+
+### Verified working on the board
+
+Adoption over L3 (identity MAC `d4:53:2a:38:80:cf`, the board's label MAC, `use_gcm: true`),
+LLDP topology (`cid_interface='wan'` → Parent Device *Cloud Gateway Ultra, Port 2*),
+per-socket `port_table` including a genuine FE/GbE split and wired clients on the right
+sockets, both radios on air, Locate and the LED toggle on the real case LED, and the
+tagged-VLAN SSID path.
+
+### A tagged SSID needs no switch trunk on DSA
+
+The swconfig boards need a `switch_vlan` trunk or the ASIC drops every frame of an unknown
+VID. DSA needs nothing: with bridge VLAN filtering off — the state a `br-lan` with no
+`config bridge-vlan` is in — the switch passes tags straight through, and the 8021q device
+on the uplink *bridge port* (`wan.10`) takes its VID before the bridge sees it, because
+`vlan_do_receive` runs ahead of the bridge's rx_handler. Confirmed live: `br-openuf10`
+holding `wan.10` and the IoT VAP, `wan.10` counting 1.9 MB inbound, the gateway's MAC
+learned on it, and untagged wired clients on the other sockets unaffected.
+
+`switchvlan.detect_backend` returns `unknown` here (no `config switch`, no
+`config bridge-vlan`) and refuses per-port VLAN, which is correct — but openUF still reports
+`hasOWRTSwitch`, so the controller offers and accepts a Port VLAN assignment the device then
+declines in its log and nowhere else.
+
+### `radio.<n>.ieee_mode` carries a width, not a PHY generation
+
+The wire says `11nght20` / `11naht40`. Read literally that pins an 802.11ax radio to
+802.11n, and the AX3000T's 5 GHz radio came up **HT40 on hardware that does HE160**. The
+vocabulary is Atheros-era throughout — the same push names the VAPs `ath0`/`ath1`/`ath2` —
+and a real U6-InWall receives the identical string and runs it as HE40. The controller has
+no field in which to request a PHY generation at all; that is the device's own business.
+
+Invisible from the controller, which renders the width and got it right. `iw dev` is the
+only place it showed. Fixed by taking the width from the wire and the PHY from `iw phy`;
+confirmed on both boards, the AX3000T going HE20/HE40 and the Archer C5's 5 GHz going
+HT40 → **VHT40** while its HT-only 2.4 GHz radio correctly stayed HT20.
+
+### An HE 2.4 GHz radio is the first that can be over-clamped
+
+`phy_caps` derived a band's max width from the PHY generation, so HE implied 80 MHz on
+*both* bands. True while every 2.4 GHz radio here was ath9k; wrong on the first ax board,
+where the band still stops at 40 (`board.json` agrees). `clamp_htmode` narrows to 40 only
+for kind `HT`, so a pushed HE80 would have reached hostapd, which treats an unprogrammable
+width as fatal — the radio simply never starts.
+
+### `/sys/class/leds` lists what drivers registered, not what the case has
+
+The AX3000T's case LED sat a steady orange throughout, and forcing **both** mt76 LEDs to
+full brightness changed nothing on it: `mt76-phy0`/`mt76-phy1` are registered by the driver
+on every board it supports, wired or not. The real LED is the blue/yellow GPIO pair the
+device tree declares, which never registered because the stock filogic image ships no
+`gpio-leds` driver — the platform device is there, nothing claims it, and the GPIOs keep
+whatever the bootloader set. `kmod-leds-gpio` (9 KB) registers `blue:status` and
+`yellow:status`; Locate then blinks the actual box at 4 Hz.
+
+### state.json persisted ten fields it could never read back
+
+`save()` encodes the whole table, `load()` copied back a hardcoded eight. The rest were
+written to disk, visible in the file, and nil on the next start — including the per-port
+VLAN reversibility ledger, the LED toggle, the locate flag, the static-vs-DHCP guard, and
+the identity MAC that `_warn_identity_change` compares against, which made that entire
+diagnostic unreachable. Surfaced here because this is the first board whose LED idles at
+something other than off, so "the toggle forgets itself on reboot" was finally *visible*.
+
+### Channel choice, for a two-AP site in CZ
+
+`iw reg get` after adoption: 5150–5250 at 23 dBm with no DFS, 5250–5350 and 5470–5725 DFS,
+5725–5875 at only 13 dBm. So the non-DFS channels at usable power are exactly **36/40/44/48**
+— one 80 MHz block, or two 40 MHz ones. With the other AP on 36+40, this one belongs on
+44+48: auto had picked DFS ch 52, which costs 3 dB and a 60 s CAC on every radio start.
+
+On 2.4 GHz auto picked ch 13 because it was genuinely empty. It was also carrying the IoT
+SSID, and ch 12–13 are invisible to any client that only scans 1–11 — which most ESP-class
+gear does. Moving to ch 11 took that radio from **0 associated clients to 4**.
+
+
 ## Outbound payload field reference
 
 Everything openUF sends. Names were audited against the controller's own Device model
@@ -1231,6 +1313,23 @@ those describes the *CPU port* — the internal SoC↔switch link, always 1000/f
 why this is the fallback and not the default. Confirmed live: a TL-WDR3500 reported GbE on
 an uplink whose socket had negotiated 100baseT, and the gateway's own Ports view said FE for
 the same cable.
+
+**On a DSA board the netdev path is not a fallback — it is the right source.** There is no
+`swconfig` binary at all, and none is wanted: each socket is its own netdev (`wan`, `lan2`,
+`lan3`, `lan4` on a Xiaomi AX3000T — no `lan1`, since DSA names ports from the device tree
+rather than the case labels), so sysfs already describes that socket's own cable. The one
+thing sysfs cannot say — which socket faces the controller — comes from the bridge instead
+of an ARL table: `bridge fdb show br br-lan` names the port each MAC was learned on, and
+`sysinfo.uplink_bridge_port` looks up the default gateway's there. Same discipline as the
+swconfig path (measured, never declared), different source. Filter on `master` *and*
+`permanent`: the port's own address arrives as `<mac> dev wan master br-lan permanent`, a
+master line like any other, and counting it puts the AP's own socket MAC in its client list.
+
+Verified live on an AX3000T against a real UCG Ultra: four ports rendered, port 1 flagged
+uplink at GbE with no `mac_table`, port 2 at **FE** with its host, port 3 disconnected, port
+4 at GbE with its host and the controller's own IP for it. The FE/GbE split is the thing
+worth noting — the netdev path reported two different negotiated speeds on one board, which
+is exactly what the swconfig CPU-port path could never do.
 
 **Non-uplink ports additionally carry `mac_table[]`** — `{mac, ip, hostname, age, uptime}`,
 joined with `/proc/net/arp` for IPs and `/tmp/dhcp.leases` when present for hostnames
