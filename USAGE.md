@@ -665,9 +665,43 @@ not a useful health check. A successful steer looks like
 
 The **Environment** tab (Insights → AirView) is fed from `iw dev <ifname> scan dump`, the
 kernel's passive BSS cache. That cache is filled from beacons the radio overhears **on the
-channel it is already serving**, so the tab lists near-channel neighbours and nothing else
-— openUF never dwells off-channel behind your clients' backs. Use the controller's RF scan
-(`spectrum-scan`) when you want a full sweep.
+channel it is already serving**, so on its own the tab lists near-channel neighbours and
+nothing else — openUF never dwells off-channel behind your clients' backs. Measured on an
+AX3000T: 6 neighbours on a 2.4 GHz radio on ch 11, and exactly 1 on a 5 GHz radio on ch 44.
+On the Archer C5's 5 GHz radio the passive cache held **nothing at all**.
+
+openUF closes that gap the way Ubiquiti's Channel AI describes — *"neighbor reports and
+automated RRM scans"* — rather than by scanning. Every `rrm_request_interval` seconds
+(default 600) it asks **one** 802.11k-capable client for an active beacon measurement: the
+*client* leaves the channel, sweeps, and reports what it saw, while the AP keeps serving.
+One answer returned 15 BSSes across both bands at once, and a client sitting on 5 GHz
+routinely reports 2.4 GHz too — so a single report enriches both radios. It took that
+empty 5 GHz list from 0 neighbours to 4, one of them an AP the radio cannot hear at all.
+
+| Setting | Meaning |
+|---|---|
+| `rrm_enrichment` | `true` by default. Set `false` to never send a beacon request |
+| `rrm_request_interval` | Seconds between requests, across all radios and clients combined — they are asked one at a time, round-robin |
+
+Only clients advertising **active or passive** beacon measurement are ever asked. Clients
+advertising *beacon-table* only are skipped on purpose: the one real example acknowledged
+every request at the MAC layer and never sent a report, and hostapd refuses a passive
+request for such a client outright. In practice this is a minority of clients — of 13
+surveyed across two APs, 9 had no 802.11k at all — so this supplements the passive cache
+and never replaces it.
+
+Rows sourced this way show a **blank WiFi Name and Security** (the controller renders the
+BSSID instead of a name). That is deliberate: a beacon report carries a BSSID, a channel
+and an RCPI, and nothing else. openUF will not invent a security mode it did not measure —
+an earlier draft defaulted it to `open` and told the operator that four WPA2 neighbours
+were unencrypted.
+
+To see the machinery: `pgrep -f 'ubus subscribe hostapd'` is the collector that receives
+the reports (hostapd delivers them as ubus *notifications*, so `ubus listen` shows nothing
+— only `ubus subscribe` works), `logread | grep BEACON-REQ-TX-STATUS` shows requests going
+out, and `/tmp/openuf-rrm.jsonl` is the spool, drained on every inform.
+
+Use the controller's RF scan (`spectrum-scan`) when you want a real full sweep.
 
 The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
 can suppress group-addressed frames wholesale but has no notion of an allow-list — so

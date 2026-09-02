@@ -1,0 +1,33 @@
+{
+	"freq": 5180,
+	"clients": {
+		"2a:1a:ec:4a:c0:df": {
+			"auth": true,
+			"assoc": true,
+			"rrm": [ 115, 0, 0, 0, 0 ],
+			"extended_capabilities": [ 1, 0, 72, 4, 0, 0, 0, 64 ],
+			"aid": 1
+		},
+		"82:e0:6b:a2:f6:84": {
+			"auth": true,
+			"assoc": true,
+			"rrm": [ 75, 0, 0, 0, 0 ],
+			"extended_capabilities": [ 1, 0, 72, 4, 0, 0, 0, 64 ],
+			"aid": 2
+		},
+		"94:27:70:79:aa:18": {
+			"auth": true,
+			"assoc": true,
+			"rrm": [ 50, 0, 0, 0, 0 ],
+			"extended_capabilities": [ 1, 0, 72, 4, 0, 0, 0, 64 ],
+			"aid": 3
+		},
+		"2a:85:dc:4f:87:e4": {
+			"auth": true,
+			"assoc": true,
+			"rrm": [ 0, 0, 0, 0, 0 ],
+			"extended_capabilities": [ 0, 0, 0, 0, 32, 0, 0, 64 ],
+			"aid": 4
+		}
+	}
+}

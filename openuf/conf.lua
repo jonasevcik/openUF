@@ -46,6 +46,28 @@ config = {
 	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url).
 	state_file = "/etc/openuf/state.json",
 
+	-- Client-assisted RF environment enrichment (802.11k beacon reports), the
+	-- same mechanism Ubiquiti's Channel AI describes as "neighbor reports and
+	-- automated RRM scans".
+	--
+	-- The Environment tab is otherwise built from the kernel's PASSIVE scan
+	-- cache, which only ever holds neighbours on the channel a radio is already
+	-- serving -- 6 BSSes on a 2.4 GHz radio and 1 on a 5 GHz one, measured. With
+	-- this on, openUF periodically asks ONE 802.11k-capable client to sweep and
+	-- report back; the client goes off-channel, the AP never does. A single
+	-- answer returned 15 BSSes across both bands.
+	--
+	-- Costs the AP nothing. Costs a participating client roughly a second
+	-- off-channel, once per rrm_request_interval, and only clients that
+	-- advertise active/passive beacon measurement are ever asked -- which in
+	-- practice is a minority of them. Set false to never send a beacon request.
+	rrm_enrichment = true,
+
+	-- Seconds between beacon requests, across all radios and clients combined
+	-- (they are asked one at a time, round-robin). Deliberately slow: the point
+	-- is to keep the Environment tab honest, not to poll.
+	rrm_request_interval = 600,
+
 	-- L2 discovery broadcasts (announce.lua, UDP port 10001). On by default:
 	-- it is how the device shows up in UniFi Discover without any set-inform.
 	--

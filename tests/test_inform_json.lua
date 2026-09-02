@@ -1297,6 +1297,69 @@ return {
 		end
 	},
 	{
+		name = "inform json: 802.11k beacon reports enrich scan_radio_table",
+		fn = function()
+			-- The whole point of rrmscan.lua: the passive `iw scan dump` cache
+			-- only ever holds neighbours on the channel the radio is already
+			-- serving, so BSSes a CLIENT saw off-channel have to reach the
+			-- payload through here or they reach it not at all.
+			local prev = inform._rrm_neighbours
+			inform._rrm_neighbours = {
+				-- a BSS the passive scan already found -- must NOT be
+				-- duplicated, and must keep the scan's richer record
+				{bssid = "aa:bb:cc:dd:ee:01", channel = 6, band = "ng",
+				 signal = -70, seen_at = os.time()},
+				-- one only the client could see
+				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng",
+				 signal = -73, seen_at = os.time()},
+				-- and one on the other band, which belongs to no radio here
+				{bssid = "54:af:97:55:14:78", channel = 48, band = "na",
+				 signal = -80, seen_at = os.time()},
+			}
+			local ok, d = pcall(build, {with_uci = true, with_scan = true})
+			inform._rrm_neighbours = prev
+			assert_true(ok, "build_json survives the merge")
+
+			local srt = d.scan_radio_table[1]
+			assert_eq(srt.radio, "ng", "the 2.4 GHz radio")
+			local seen = {}
+			for _, e in ipairs(srt.scan_table) do
+				assert_nil(seen[e.bssid], "no BSSID appears twice: " .. tostring(e.bssid))
+				seen[e.bssid] = e
+			end
+			assert_eq(#srt.scan_table, 3, "two scanned + one client-only neighbour")
+			assert_eq(seen["aa:bb:cc:dd:ee:01"].essid, "NeighborNet",
+				"the scanned record wins over the beacon report")
+			assert_eq(seen["aa:bb:cc:dd:ee:01"].signal, -55, "and keeps its own signal")
+			local added = seen["84:78:48:a4:fb:21"]
+			assert_not_nil(added, "the client-only neighbour reached the payload")
+			assert_eq(added.channel, 1, "on the channel the client reported")
+			assert_eq(added.signal, -73, "with the RCPI-derived signal")
+			-- Without `band` the Environment tab filters the row out upstream
+			-- of every visible filter, with no error and no visible cause.
+			assert_eq(added.band, "ng", "band set or the row silently vanishes")
+			assert_nil(seen["54:af:97:55:14:78"],
+				"a 5 GHz sighting is not filed under the 2.4 GHz radio")
+		end
+	},
+	{
+		name = "inform json: stale beacon reports never reach the payload",
+		fn = function()
+			-- The controller drops any entry with age >= 30 before it reaches
+			-- the rogue-AP list, so carrying one is payload nobody reads.
+			local prev = inform._rrm_neighbours
+			inform._rrm_neighbours = {
+				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng",
+				 signal = -73, seen_at = os.time() - 120},
+			}
+			local ok, d = pcall(build, {with_uci = true, with_scan = true})
+			inform._rrm_neighbours = prev
+			assert_true(ok, "build_json survives")
+			assert_eq(#d.scan_radio_table[1].scan_table, 2,
+				"only the two scanned neighbours; the stale sighting is dropped")
+		end
+	},
+	{
 		name = "inform json: scan_radio_table entries have empty scan_table with no neighbors detected",
 		fn = function()
 			local d = build({with_uci = true})

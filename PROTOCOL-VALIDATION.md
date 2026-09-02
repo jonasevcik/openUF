@@ -1458,6 +1458,59 @@ Per `scan_table[]` entry — the consumer DTO `com.ubnt.service.aO.bLwwMKkr` (li
 | **`bw`** | Channel width MHz. The "Ch. Width" cell reads it directly and renders nothing when falsy: `renderCell:({bw:A})=>A?…:null`. Parsed from `iw`'s `BSS operating channel width: N MHz` (only present for HE/VHT-capable neighbours), defaulting to `20` — legacy-safe and valid on both bands. |
 | **`age`** | **Elapsed seconds, not an absolute timestamp.** The ingestion code reads `getInt("age")` and computes `last_seen = report_time − age` itself; it also **silently drops any entry with `age >= 30`** as a staleness guard. Sending an absolute timestamp under either key yields an empty result with no error. Parsed from `iw`'s `last seen: N ms ago`. |
 
+#### Enriching it without scanning — 802.11k beacon reports
+
+`scan dump` reads the kernel's **passive** BSS cache, which fills only from beacons the
+radio overhears on the channel it already serves. Measured 2026-09-02: 6 BSSes on a 2.4 GHz
+radio on ch 11, 1 on a 5 GHz radio on ch 44, and **0** on the Archer C5's 5 GHz radio. An
+active sweep on the same board found 21 BSSes across 8 channels on 2.4 GHz — but cost 12%
+packet loss to an associated client for the ~3 s it ran, against a 0% baseline.
+
+Ubiquiti's own documentation names the way out: Channel AI "scans the surrounding wireless
+environment using **neighbor reports and automated RRM scans**". In an 802.11k beacon
+measurement the *client* leaves the channel and reports back, so the AP never stops serving.
+`openuf/rrmscan.lua` implements exactly that, and nothing else.
+
+Delivery mechanics, all established live:
+
+| | |
+|---|---|
+| Request | `ubus call hostapd.<iface> rrm_beacon_req '{"addr":…,"mode":1,"op_class":115,"channel":255,"duration":50}'`. mode 1 is *active*; mode 2 (beacon table) reports from a cache that may be empty. `channel: 255` means every channel in the operating class |
+| Response | Arrives asynchronously as a ubus **notification** on the per-BSS object. `ubus listen` catches broadcast events and receives **nothing at all** here — a listen across two requests captured 0 notifications while a `ubus subscribe hostapd.<iface>` over the same window captured 22 |
+| Fields used | `bssid`, `channel`, `rcpi`, `rep-mode`. RCPI is the 0.5-dBm scale anchored at −110 dBm (802.11-2020 9.4.2.38), so **dBm = rcpi/2 − 110** — checked against a sighting of the client's own AP at rcpi 124 → −48 dBm |
+| Fields refused | A non-zero `rep-mode` means incapable/refused/late and must not be published; captured examples also carry an all-zero BSSID on channel 0 |
+| Parsing hazard | `start-time` holds a raw 64-bit TSF that real clients emit past what a double represents (`-7160986498777481216` captured), so the payload is matched field-by-field rather than JSON-decoded |
+
+What one request actually returned: **15 BSSes at once**, across 2.4 GHz channels
+1/3/4/6/7/9/10/11 *and* 5 GHz channels 36/44/48 — from a client associated on a 5 GHz
+radio. Clients ignore the requested operating class's band restriction, so one report
+enriches **both** radios; the merge therefore keys on the reported channel's band, never on
+the interface the request left by.
+
+Client support is a lottery and this can only ever supplement the passive cache. Of 13
+clients surveyed across two APs: 9 advertised no 802.11k at all (`rrm=0`), 3 advertised
+beacon-active + beacon-passive and answered in full, and 1 advertised **beacon-table only**,
+acknowledged every request (`BEACON-REQ-TX-STATUS … ack=1`) and never sent a report —
+hostapd itself refuses a passive request for such a client with "does not support passive
+beacon report". Table-only is therefore not treated as capable.
+
+Two fields deserve care on the way into `scan_table`, and they are handled differently:
+
+- **`bw` is set to 20.** Not a guess: every AP occupies at least its 20 MHz primary. It also
+  cannot safely be omitted — the tab's unconditional filter indexes
+  `T.R[band][bw>0 ? bw : <per-band default>]`, and a falsy `bw` falls through to a default
+  this build may not define, which drops the row silently. 20 is confirmed to render.
+- **`security` is left absent.** There is no floor to fall back on, and writing `open` states
+  in the operator's rogue-AP view that a neighbour is unencrypted when nothing measured it.
+  Observed live: four WPA2 neighbours all rendered as "open" before this was removed. With
+  the field absent the cell renders blank, the sidebar's Security filter disappears (no
+  values to offer), and the rows still render — confirmed.
+
+Verified end to end 2026-09-02 on the Archer C5's 5 GHz radio, whose passive cache held
+**zero** BSSes: after one beacon request the controller's Environment tab listed **four**,
+at −53/−69/−81/−81 dBm on ch 36/44/48 — one of them `d4:53:2a:b2:03:3f`, the *other* AP's
+5 GHz BSS, which this radio cannot hear from another room but the client could.
+
 `is_rogue` is much narrower than the tab name suggests: set true only when a neighbouring BSSID
 broadcasts the **same essid as one of the site's own configured networks** (an evil-twin check
 raising `EVT_AP_DetectRogueAP`). Ordinary neighbours correctly have `is_rogue: false` and still
@@ -1737,7 +1790,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port |
 | 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
 | 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). |
-| 20 | Environment / rogue-AP scan | `scan_radio_table[]` | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls), and ✅ **confirmed rendering** in the live Environment tab 2026-09-02 (AX3000T): the 30-minute window listed exactly the BSSes in that AP's own scan cache, with matching signals, and the spectrum chart drew them alongside `This AP`. Note what the `scan dump` source can and cannot see: the cache is filled **passively, from beacons the radio overhears on the channel it is already parked on**, so the list is neighbours on/adjacent to the operating channel and nothing else — 6 entries on a 2.4 GHz radio on ch 11, exactly 1 on a 5 GHz radio on ch 44. That is the deliberate trade for never dwelling off-channel; the full sweep is the `spectrum-scan` cmd's job. The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
+| 20 | Environment / rogue-AP scan | `scan_radio_table[]` (+ 802.11k `rrm_beacon_req`) | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls), and ✅ **confirmed rendering** in the live Environment tab 2026-09-02 (AX3000T): the 30-minute window listed exactly the BSSes in that AP's own scan cache, with matching signals, and the spectrum chart drew them alongside `This AP`. Note what the `scan dump` source can and cannot see: the cache is filled **passively, from beacons the radio overhears on the channel it is already parked on**, so the list is neighbours on/adjacent to the operating channel and nothing else — 6 entries on a 2.4 GHz radio on ch 11, exactly 1 on a 5 GHz radio on ch 44. That is the deliberate trade for never dwelling off-channel. ✅ Closed 2026-09-02 with 802.11k client-assisted enrichment (`openuf/rrmscan.lua`) -- Ubiquiti's own Channel AI mechanism -- which took a 5 GHz radio's list from **0 neighbours to 4** without the AP leaving its channel; see [the section above](#enriching-it-without-scanning--80211k-beacon-reports). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |
 | 22 | Radios tab Avg. Signal / Interference / Airtime / MIMO | `vap_table.avg_client_signal`; `radio_table.athstats`; `radio_table.radio_caps` | ✅ All four confirmed live on a fresh reset (`-64`/`-50 dBm`, `3%`, `7%`, `2x2`), with bidirectional filter behavior verified |
 | 23 | Minimum RSSI | `system_cfg` `stamgr.<n>.*`; outbound `min_rssi`/`min_rssi_enabled` | ✅ Wire format and field names confirmed. Enforcement (`kick_station`) is unit-tested only — no real radios here. |

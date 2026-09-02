@@ -59,6 +59,7 @@ local netconfig = _require_sibling("netconfig")
 local firewall  = _require_sibling("firewall")
 local usteer    = _require_sibling("usteer")
 local switchvlan = _require_sibling("switchvlan")
+local rrmscan   = _require_sibling("rrmscan")
 
 local M = {}
 
@@ -77,6 +78,26 @@ M._netconfig = netconfig
 M._firewall  = firewall
 M._usteer    = usteer
 M._switchvlan = switchvlan
+M._rrmscan    = rrmscan
+
+-- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
+-- flat list build_json merges from. Clients report asynchronously and only
+-- some of them ever answer, so this is a best-effort side-channel that
+-- supplements the passive scan cache -- see rrmscan.lua for the whole story.
+M._rrm_cache        = {}
+M._rrm_neighbours   = {}
+M._rrm_next_request = 0
+M._rrm_rr           = 0
+
+-- How often to ask ONE station for a sweep. An active beacon measurement takes
+-- the client off-channel for roughly duration x channels (~1.3 s for a full
+-- operating class at 50 TU), so this is deliberately slow: the point is to
+-- keep the Environment tab honest, not to poll.
+M.RRM_REQUEST_INTERVAL = 600
+
+-- Matches rrmscan.merge_into's own cutoff, which exists because the
+-- controller's rogue-AP ingestion silently drops any entry with age >= 30.
+local RRM_MAX_AGE = 30
 
 -- In-memory only (not persisted to state.json): per-radio spectrum-scan
 -- results, keyed by radio name. Ephemeral live data, same category as
@@ -869,6 +890,23 @@ function M.build_json(st, cfg, ufhw)
 							security   = net.security,
 							essid      = net.essid,
 						}
+					end
+					-- 802.11k enrichment: BSSes a CLIENT went off-channel
+					-- and saw, which this radio never could from its own
+					-- passive cache. Merged on the reported channel's BAND,
+					-- not on the interface the request went out of, because a
+					-- client sitting on 5 GHz routinely reports 2.4 GHz too --
+					-- so one report fills both radios' lists. Anything the
+					-- passive cache already knows wins, since a beacon report
+					-- carries no SSID, security or width. See rrmscan.lua.
+					if M._rrmscan and #M._rrm_neighbours > 0 then
+						pcall(M._rrmscan.merge_into, scan_table,
+							M._rrm_neighbours, {
+								band       = radio.radio,
+								radio      = radio.radio,
+								radio_name = radio.name,
+								max_age    = RRM_MAX_AGE,
+							})
 					end
 					scan_radio_table[#scan_radio_table + 1] = {
 						radio      = radio.radio,
@@ -3071,6 +3109,68 @@ end
 
 -- Start the inform heartbeat loop (blocks forever).
 -- cfg, ufhw: passed through to build_json()
+-- One cycle of the client-assisted enrichment: keep the notification
+-- collector alive, fold in whatever clients have reported since last time,
+-- expire what the controller would discard anyway, and -- at most every
+-- RRM_REQUEST_INTERVAL -- ask one more station to go and look.
+--
+-- Everything here is pcall-wrapped and best-effort: no hostapd, no ubus, no
+-- capable client and no answer are all ordinary outcomes, and none of them may
+-- interrupt an inform.
+function M._rrm_tick(cfg)
+	local rrm = M._rrmscan
+	if not rrm then return false end
+	if not (cfg and cfg.config and cfg.config.rrm_enrichment) then return false end
+
+	pcall(rrm.collector_ensure)
+
+	local ok, fresh = pcall(rrm.harvest)
+	if ok then
+		for _, n in ipairs(fresh or {}) do
+			-- Keyed by BSSID so a neighbour two clients both saw is carried
+			-- once, at whichever sighting is freshest.
+			local prev = M._rrm_cache[n.bssid]
+			if not prev or n.seen_at >= prev.seen_at then
+				M._rrm_cache[n.bssid] = n
+			end
+		end
+	end
+
+	local now  = os.time()
+	local live = {}
+	for bssid, n in pairs(M._rrm_cache) do
+		if now - n.seen_at < RRM_MAX_AGE then
+			live[#live + 1] = n
+		else
+			M._rrm_cache[bssid] = nil
+		end
+	end
+	table.sort(live, function(a, b) return a.bssid < b.bssid end)
+	M._rrm_neighbours = live
+
+	if now < M._rrm_next_request then return true end
+	M._rrm_next_request = now +
+		(tonumber(cfg.config.rrm_request_interval) or M.RRM_REQUEST_INTERVAL)
+
+	-- Round-robin across every capable station on every BSS, one per
+	-- interval. Asking them all at once would take every 802.11k-capable
+	-- client in the house off-channel simultaneously.
+	local cands = {}
+	local ok_o, objs = pcall(rrm.hostapd_objects)
+	for _, obj in ipairs(ok_o and objs or {}) do
+		local ifname = obj:match("^hostapd%.(.+)$")
+		local ok_s, stas = pcall(rrm.capable_stations, ifname)
+		for _, sta in ipairs(ok_s and stas or {}) do
+			cands[#cands + 1] = {ifname = ifname, sta = sta}
+		end
+	end
+	if #cands == 0 then return true end
+	M._rrm_rr = (M._rrm_rr % #cands) + 1
+	local c = cands[M._rrm_rr]
+	pcall(rrm.request, c.ifname, c.sta)
+	return true
+end
+
 function M.run(cfg, ufhw)
 	local st = state.load()
 	-- The MAC persisted by the previous run, before _populate_net_info
@@ -3126,6 +3226,9 @@ function M.run(cfg, ufhw)
 
 	while true do
 		last_mtime = M._reload_if_changed(st, cfg, last_mtime)
+		-- Before build_json, so anything a client reported since the last
+		-- cycle rides out on THIS inform rather than waiting for the next.
+		pcall(M._rrm_tick, cfg)
 		local json_str = M.build_json(st, cfg, ufhw)
 		local pkt      = M.build_packet(json_str, st)  -- use_gcm read from st.use_gcm
 		local body, err = M.http_post(st.inform_url, pkt)
