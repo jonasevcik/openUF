@@ -152,6 +152,14 @@ case "$1" in
 		try_optional usteer        "Band Steering"
 		try_optional ip-bridge     "wired clients behind the AP (bridge fdb)"
 		try_optional nftables      "client Block/Unblock + Multicast/Broadcast Blocker"
+		# ...and the Blocker half additionally needs the bridge family's `meta`
+		# expression, which lives in nft_meta_bridge and is NOT pulled in by
+		# nftables. Missing on a stock filogic AND ath79 image alike. Without
+		# it the table, chain and allow-list set all build fine and only the
+		# drop rule is rejected, so the control reports success everywhere and
+		# blocks nothing. firewall.lua's block-sta uses `ether saddr` only,
+		# needs no module, and is unaffected -- which is what hid this.
+		try_optional kmod-nft-bridge "Multicast/Broadcast Blocker (bridge meta)"
 		# shaper.lua shells out to `tc` for the WiFi Speed Limit, and nothing
 		# installed it -- busybox has no tc. tc-tiny is enough (htb + fq_codel).
 		try_optional tc-tiny       "WiFi Speed Limit (tc)"

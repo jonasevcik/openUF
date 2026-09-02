@@ -8,7 +8,7 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 ```
 
 | Package | Purpose |
@@ -22,6 +22,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-u
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
+| `kmod-nft-bridge` | The Multicast/Broadcast Blocker only. `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
 | `coreutils-stat` | `stat` — only if your build has no `stat` applet (some do not). `inform.lua` uses `stat -c %Y` to notice an out-of-process `state.json` write, i.e. an SSH `set-adopt` or a manual `reset-inform`; without it those are ignored until restart. Enabling busybox's own `stat` applet is smaller |
@@ -658,6 +659,15 @@ openUF enforces it with nftables, in its own `bridge openuf_bcfilt` table (separ
 from the client-blocking `bridge openuf` table, which is rebuilt wholesale on every
 block/unblock and would otherwise wipe these rules). Frames leaving a filtered SSID are
 dropped unless the *sender's* MAC is allow-listed.
+
+This needs **`kmod-nft-bridge`**, and it is the only feature that does. The drop rule is
+openUF's one bridge-family `meta` match, and `nft_meta_bridge` is a separate module that
+`nftables` does not depend on — absent from a stock filogic *and* ath79 image alike. The
+failure is quiet in the worst way: the table, the chain and the per-VAP allow-list set
+are all created and populated, and only the drop rule is rejected, so the control reads
+as enabled in the controller and `nft list table bridge openuf_bcfilt` shows a table that
+filters nothing. openUF now logs `nft rejected the drop rule for <ifname> -- install
+kmod-nft-bridge` when this happens.
 
 > **This deliberately breaks DHCP for wireless clients unless you add the DHCP server's
 > MAC to the excepted-devices list.** That is Ubiquiti's own documented behavior for

@@ -8,14 +8,39 @@
 
 local bcfilter = dofile("openuf/bcfilter.lua")
 
--- Capture nft invocations instead of running them.
-local function with_bcfilter(fn)
+-- Capture nft invocations instead of running them. `status` (optional) is a
+-- function(cmd) returning what os.execute would return for that command, so a
+-- test can make one specific nft call fail the way a real one does.
+local function with_bcfilter(fn, status)
 	local orig = bcfilter._exec
 	local cmds = {}
-	bcfilter._exec = function(cmd) cmds[#cmds + 1] = cmd; return true end
+	bcfilter._exec = function(cmd)
+		cmds[#cmds + 1] = cmd
+		if status then return status(cmd) end
+		return true
+	end
 	local ok, err = pcall(fn, cmds)
 	bcfilter._exec = orig
 	if not ok then error(err, 0) end
+end
+
+-- Capture what the module writes to stderr while fn runs.
+local function with_stderr(fn)
+	local orig, buf = io.stderr, {}
+	io.stderr = {write = function(_, ...)
+		for _, v in ipairs({...}) do buf[#buf + 1] = tostring(v) end
+	end}
+	local ok, err = pcall(fn)
+	io.stderr = orig
+	if not ok then error(err, 0) end
+	return table.concat(buf)
+end
+
+-- os.execute on the target (Lua 5.1) returns the raw exit status: 0 is
+-- success, non-zero is failure, and BOTH are truthy.
+local function lua51_fail(cmd)
+	if cmd:find("add rule", 1, true) then return 1 end
+	return 0
 end
 
 local function joined(cmds) return table.concat(cmds, "\n") end
@@ -112,6 +137,42 @@ return {
 				bcfilter.reconcile(nil)
 				assert_false(contains(cmds, "add rule"), "no drop rules emitted")
 			end)
+		end
+	},
+	{
+		name = "bcfilter: a rejected drop rule is reported, not swallowed",
+		fn = function()
+			-- Real failure mode on a stock image with no kmod-nft-bridge: the
+			-- table, chain and allow set all build, only `meta` in the bridge
+			-- family is missing, so ONLY the drop rule is rejected. Everything
+			-- looked fine on the device and in the controller while the WLAN
+			-- filtered nothing.
+			local out = with_stderr(function()
+				with_bcfilter(function()
+					local ok = bcfilter.reconcile({{ifname = "wlan0", macs = {}}})
+					assert_false(ok, "reconcile reports failure to its caller")
+				end, lua51_fail)
+			end)
+			assert_true(out:find("kmod%-nft%-bridge") ~= nil,
+				"names the package that fixes it")
+			assert_true(out:find("wlan0", 1, true) ~= nil,
+				"names the interface that is not being filtered")
+		end
+	},
+	{
+		name = "bcfilter: a Lua 5.1 exit status of 0 counts as success",
+		fn = function()
+			-- The trap this whole path exists for: on 5.1 a FAILED os.execute
+			-- returns a non-zero number, which is truthy, so a bare truth test
+			-- passes for both outcomes. Guard the success side too, or the fix
+			-- degrades into warning on every healthy reconcile.
+			local out = with_stderr(function()
+				with_bcfilter(function()
+					local ok = bcfilter.reconcile({{ifname = "wlan0", macs = {}}})
+					assert_true(ok, "exit status 0 is success")
+				end, function() return 0 end)
+			end)
+			assert_eq(out, "", "no warning on a healthy reconcile")
 		end
 	},
 	{
