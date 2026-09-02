@@ -653,6 +653,22 @@ that restore automatically (the wire keeps the `switch.*` block with both gates 
 > that these sections actually program the switch ASIC, and that
 > `/etc/init.d/network reload` behaves on real ath79, are unconfirmed.
 
+**Band Steering** is `usteer`'s decision, not openUF's: openUF configures the daemon
+(`usteer.local.band_steering_threshold`) and forces 802.11k neighbour reports plus
+`bss_transition=1` onto every VAP, since usteer cannot work without them. If a client is
+not being steered, check `ubus call usteer get_clients` for a 5 GHz sighting of it and
+`ubus call hostapd.<iface> get_clients` for its `rrm` bits and the BSS-Transition bit in
+`extended_capabilities` — a client with neither cannot be steered by any AP, and usteer's
+per-BSS `roam_events` counters do not increment for BTM-driven band steers, so they are
+not a useful health check. A successful steer looks like
+`BSS-TM-RESP <sta> status_code=0 target_bssid=<the 5 GHz BSSID>` in `logread`.
+
+The **Environment** tab (Insights → AirView) is fed from `iw dev <ifname> scan dump`, the
+kernel's passive BSS cache. That cache is filled from beacons the radio overhears **on the
+channel it is already serving**, so the tab lists near-channel neighbours and nothing else
+— openUF never dwells off-channel behind your clients' backs. Use the controller's RF scan
+(`spectrum-scan`) when you want a full sweep.
+
 The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
 can suppress group-addressed frames wholesale but has no notion of an allow-list — so
 openUF enforces it with nftables, in its own `bridge openuf_bcfilt` table (separate
