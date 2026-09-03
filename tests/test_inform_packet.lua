@@ -2531,6 +2531,71 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response restarts the dump once it passes the cap",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_cap.log"
+			os.remove(path)
+			local pre = io.open(path, "w")
+			pre:write(string.rep("x", 5000) .. "\nOLDMARKER\n")
+			pre:close()
+			inform.handle_response('{"_type":"noop"}', st,
+				{ config = { debug_dump_file = path, debug_dump_max_bytes = 1024 } })
+			local f = io.open(path, "r")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find("OLDMARKER", 1, true) == nil,
+				"the oversized previous contents are gone")
+			assert_true(contents:find("restarted", 1, true) ~= nil,
+				"a restart marker records why the history vanished")
+			assert_true(contents:find('{"_type":"noop"}', 1, true) ~= nil,
+				"the response that triggered the restart is still recorded")
+			assert_true(#contents < 1024,
+				"the file is back under the cap, not merely appended to")
+		end
+	},
+	{
+		name = "inform packet: handle_response appends while the dump is under the cap",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_under.log"
+			os.remove(path)
+			local pre = io.open(path, "w")
+			pre:write("OLDMARKER\n")
+			pre:close()
+			inform.handle_response('{"_type":"noop"}', st,
+				{ config = { debug_dump_file = path, debug_dump_max_bytes = 1024 } })
+			local f = io.open(path, "r")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find("OLDMARKER", 1, true) ~= nil,
+				"history below the cap is preserved -- the cap is not an unconditional truncate")
+			assert_true(contents:find('{"_type":"noop"}', 1, true) ~= nil,
+				"the new response was appended after it")
+		end
+	},
+	{
+		name = "inform packet: debug_dump_max_bytes = 0 disables the cap",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_nocap.log"
+			os.remove(path)
+			local pre = io.open(path, "w")
+			pre:write(string.rep("x", 5000) .. "\nOLDMARKER\n")
+			pre:close()
+			inform.handle_response('{"_type":"noop"}', st,
+				{ config = { debug_dump_file = path, debug_dump_max_bytes = 0 } })
+			local f = io.open(path, "r")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find("OLDMARKER", 1, true) ~= nil,
+				"an explicit 0 keeps the unbounded behaviour")
+		end
+	},
+	{
 		name = "inform packet: parse_packet inflates a zlib-compressed response",
 		fn = function()
 			-- OpenWrt 25.12 has no Lua zlib binding, so this exercises the in-tree

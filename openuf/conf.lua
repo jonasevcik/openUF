@@ -88,6 +88,13 @@ config = {
 	-- against a real UniFi controller -- see PROTOCOL-VALIDATION.md.
 	debug_dump_file = nil,
 
+	-- Ceiling for that dump, in bytes (default 4 MiB). The inform loop appends
+	-- to it every few seconds, and its usual home is /tmp -- a RAM disk on
+	-- these boards -- so an unbounded dump eventually starves state.json
+	-- writes and apk. Past the cap the file restarts, with a marker line
+	-- saying so; a capture is read from its tail anyway. 0 = no cap.
+	debug_dump_max_bytes = 4 * 1024 * 1024,
+
 	-- Set (by install.sh's --bootstrap-adopt, not by hand) to the name of a
 	-- temporary, non-root SSH bootstrap account matching real Ubiquiti
 	-- hardware's factory-default "ubnt" login -- lets first adoption succeed

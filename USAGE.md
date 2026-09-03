@@ -219,6 +219,7 @@ config = {
     state_file  = "/etc/openuf/state.json",
     l2_announce = true,          -- see below
     debug_dump_file = nil,       -- see below
+    debug_dump_max_bytes = 4194304,
     bootstrap_adopt_user = nil,  -- see below
 }
 ```
@@ -237,6 +238,15 @@ appended verbatim, with a UTC timestamp, before it's dispatched. Used to capture
 ground-truth payload shapes when validating field assumptions (`system_cfg`,
 `cmd` dispatch, etc.) against a real UniFi controller — see
 [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
+
+`debug_dump_max_bytes` — ceiling for that dump, default 4 MiB, `0` for none.
+The dump is append-only and the inform loop writes to it every few seconds, so
+left unattended it grows without bound — and its usual home is `/tmp`, which on
+these boards is a RAM disk. One left on for five weeks reached 31.7 MB, 55% of a
+59 MB tmpfs, on course to starve `state.json` writes and `apk` alike. Past the
+cap the file **restarts** rather than rotating, leaving a marker line saying so:
+a second generation would double the peak footprint on exactly the boards least
+able to afford it, and a capture is read from its tail anyway.
 
 The same flag also turns on a **dropped-key report** on stderr: one line per
 config blob listing the keys no parser consumed, collapsed to key shapes with

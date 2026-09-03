@@ -2351,6 +2351,16 @@ local RECOGNIZED_MGMT_CFG = {
 -- than adding a second knob.
 M._debug_dropped_keys = false
 
+-- Ceiling for that dump. It is append-only and the inform loop writes to it
+-- every few seconds, so left on it grows without bound -- and its usual home
+-- is /tmp, which on these boards is a RAM disk. Measured on an Archer C5 after
+-- five weeks: 31.7 MB, 55% of a 59 MB tmpfs, on course to starve state.json
+-- writes and apk alike. Past the cap the file RESTARTS rather than rotating:
+-- keeping a second generation would double the peak footprint on exactly the
+-- boards least able to afford it, and a capture is read from its tail anyway.
+-- Override per device with config.debug_dump_max_bytes; 0 disables the cap.
+M.DEBUG_DUMP_MAX_BYTES = 4 * 1024 * 1024
+
 -- Summarize the keys in a config blob that no pass recognized.
 --
 -- Emits key PREFIXES and counts only, never values: these blobs carry
@@ -2403,10 +2413,27 @@ function M.handle_response(json_str, st, cfg)
 	M._debug_dropped_keys = not not (cfg and cfg.config and cfg.config.debug_dump_file)
 
 	if cfg and cfg.config and cfg.config.debug_dump_file then
-		local f = io.open(cfg.config.debug_dump_file, "a")
+		local path = cfg.config.debug_dump_file
+		local cap = cfg.config.debug_dump_max_bytes
+		if cap == nil then cap = M.DEBUG_DUMP_MAX_BYTES end
+		local f = io.open(path, "a")
 		if f then
-			f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. " " .. json_str .. "\n")
-			f:close()
+			-- Append mode already positions at the end, so seek reports the
+			-- current size -- no stat binding needed, and busybox's stat
+			-- applet is missing on some builds anyway.
+			local size = f:seek("end") or 0
+			if cap and cap > 0 and size >= cap then
+				f:close()
+				f = io.open(path, "w")
+				if f then
+					f:write(("%s # openuf: dump passed %d bytes, restarted\n")
+						:format(os.date("!%Y-%m-%dT%H:%M:%SZ"), cap))
+				end
+			end
+			if f then
+				f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. " " .. json_str .. "\n")
+				f:close()
+			end
 		end
 	end
 
