@@ -100,6 +100,25 @@ case "$1" in
 		# Create state directory
 		mkdir -p "$STATE_DIR"
 
+		# Keep the device's identity across a firmware upgrade.
+		# sysupgrade preserves /etc/config and a short built-in list; it knows
+		# nothing about $STATE_DIR or conf.lua, so a stock `sysupgrade` drops
+		# state.json -- mac, authkey, cfgversion, swvlan_backup -- and the
+		# board's modelmap selection along with it. The device comes back up
+		# unadopted, as a generic dualband AP, and the controller no longer
+		# recognises it. Verified on a live Archer C5: `sysupgrade -b` produced
+		# 29 entries and neither file was among them.
+		# The Lua itself is deliberately NOT preserved -- it is reinstalled
+		# from this script, and carrying an old tree onto a new OpenWrt is how
+		# you get a silent version mismatch.
+		SYSUPGRADE_CONF=/etc/sysupgrade.conf
+		for keep in "$STATE_DIR/" "$INSTALL_DIR/conf.lua"; do
+			if ! grep -qxF "$keep" "$SYSUPGRADE_CONF" 2>/dev/null; then
+				echo "$keep" >> "$SYSUPGRADE_CONF"
+				echo "Registered $keep with sysupgrade (survives a firmware upgrade)."
+			fi
+		done
+
 		# Symlink syswrapper.sh into PATH
 		ln -sf "$INSTALL_DIR/hook/syswrapper.sh" "$BIN_LINK"
 		chmod +x "$BIN_LINK"
@@ -334,6 +353,24 @@ case "$1" in
 		fi
 		if grep -q "^openuf:" /etc/group 2>/dev/null; then
 			sed -i '/^openuf:/d' /etc/group
+		fi
+
+		# Drop the sysupgrade keep-list entries this script added. The state
+		# dir itself stays (below), but a line pointing at a conf.lua that no
+		# longer exists is just litter in a file the user may also hand-edit.
+		# Fixed-string, whole-line matching -- the mirror of the grep -qxF
+		# the install branch adds them with. Not sed: the entries contain the
+		# delimiter, and busybox sed's -i is not the same animal as GNU's.
+		if [ -f /etc/sysupgrade.conf ]; then
+			SU_TMP=$(mktemp) && {
+				grep -vxF -e "$STATE_DIR/" -e "$INSTALL_DIR/conf.lua" \
+					/etc/sysupgrade.conf > "$SU_TMP"
+				# grep exits 1 on an empty result, which is a legitimate
+				# outcome here (the file held nothing else), so the copy is
+				# not conditional on its status.
+				cat "$SU_TMP" > /etc/sysupgrade.conf
+				rm -f "$SU_TMP"
+			}
 		fi
 
 		# Remove installed files (leave state dir so authkey is preserved)
