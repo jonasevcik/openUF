@@ -834,6 +834,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | SSID not appearing after adoption | Check `uci show wireless`, check `loglevel` in `/var/log/openuf.log` |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
+| Wired clients reach LAN peers but not the gateway or internet, while WiFi clients on the same AP are fine (DSA boards) | The VLAN-SSID bridge shares the physical uplink with `br-lan`, so the switch's single hardware FDB learns the router's MAC against the tagged port. openUF sets `learning '0'` on that port to prevent it — check `bridge fdb show` for the router's MAC carrying `offload` on `<uplink>.<vid>` instead of the bare uplink, and confirm `network.openuf_brport<vid>` exists |
 | Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `/var/log/openuf.log`. |
 
 Log file: `/var/log/openuf.log`

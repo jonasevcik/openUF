@@ -564,6 +564,7 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 	local ifname = cpueth .. "." .. tostring(vlan_id)
 	local br_section = OPENUF_PREFIX .. "brdev" .. tostring(vlan_id)
 	local br_name = "br-" .. OPENUF_PREFIX:gsub("_$", "") .. tostring(vlan_id)
+	local port_section = OPENUF_PREFIX .. "brport" .. tostring(vlan_id)
 
 	local changed = false
 	if netifd_uses_device_sections(cursor) then
@@ -588,6 +589,32 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 				cursor:set("network", br_section, "ports", ports)
 				changed = true
 			end
+		end
+		-- Turn MAC learning OFF on the tagged uplink port. On a DSA board
+		-- `wan` (untagged, in br-lan) and `wan.10` are the SAME physical
+		-- port on the SAME hardware switch, and that switch has ONE FDB.
+		-- With learning on, it learns the upstream router's MAC against
+		-- wan.10 and files it in the VLAN bridge's domain:
+		--     5a:d6:..:f6 dev wan.10 offload master br-openuf10
+		-- Wired clients sit in that hardware FDB too (`dev lan4 self`), so
+		-- their frames to the router get hardware-forwarded into the VLAN
+		-- domain and blackholed -- LAN peers reachable, gateway and internet
+		-- dead. WiFi clients ride the CPU/software path, hit the correct
+		-- `dev wan master br-lan` entry, and work: the giveaway signature is
+		-- WiFi fine, wired broken, on the same AP. Confirmed live on an
+		-- AX3000T (2026-09-03) and fixed by exactly this, after which the
+		-- hardware entry binds correctly as `dev wan self`.
+		--
+		-- Cost is nil in practice: the VLAN bridge is the uplink plus the
+		-- VAP(s), so unlearned unicast floods to the one other port it would
+		-- have been forwarded to anyway. Only the uplink port is set -- every
+		-- other member still learns normally.
+		if cursor:get("network", port_section, "name") ~= ifname
+			or tostring(cursor:get("network", port_section, "learning") or "") ~= "0" then
+			cursor:set("network", port_section, "device")
+			cursor:set("network", port_section, "name", ifname)
+			cursor:set("network", port_section, "learning", "0")
+			changed = true
 		end
 		if cursor:get("network", section_name, "device") ~= br_name then
 			cursor:set("network", section_name, "interface")
@@ -642,6 +669,9 @@ function M.prune_vlan_networks(wanted)
 	end
 	sweep("interface", "^" .. OPENUF_PREFIX .. "vlan(%d+)$")
 	sweep("device",    "^" .. OPENUF_PREFIX .. "brdev(%d+)$")
+	-- The uplink port's learning override goes with the bridge it qualified;
+	-- left behind it would keep learning off on a port no openUF bridge owns.
+	sweep("device",    "^" .. OPENUF_PREFIX .. "brport(%d+)$")
 
 	if #doomed == 0 then return false end
 	for _, name in ipairs(doomed) do

@@ -332,6 +332,70 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: ensure_vlan_network turns learning off on the tagged uplink port",
+		fn = function()
+			-- On a DSA board the untagged uplink and its VLAN sub-device are
+			-- ONE physical port on ONE hardware switch with ONE FDB. Left
+			-- learning, that switch files the upstream router's MAC under the
+			-- VLAN bridge -- `dev wan.10 offload master br-openuf10` -- and
+			-- every WIRED client's traffic to the gateway is hardware-
+			-- forwarded into the VLAN domain and dropped, while WiFi clients
+			-- take the software path and stay fine. Confirmed live on an
+			-- AX3000T (2026-09-03): LAN peers reachable, gateway and internet
+			-- dead, controller config completely clean.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+
+				local port = db.network.openuf_brport10
+				assert_true(port ~= nil, "the uplink port gets its own device section")
+				assert_eq(port[".type"], "device", "as a `config device` section")
+				assert_eq(port.name, "wan.10", "naming the tagged uplink sub-device")
+				assert_eq(port.learning, "0", "with MAC learning off")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the learning override does not re-dirty a steady-state push",
+		fn = function()
+			-- A rewrite every inform would reload the network every inform,
+			-- bouncing the uplink and the inform connection with it.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+				ucihelper._network_dirty = false
+				ucihelper.ensure_vlan_network("wan", 10)
+				assert_eq(ucihelper._network_dirty, false,
+					"an unchanged push leaves the learning override alone")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: prune_vlan_networks takes the uplink port override with it",
+		fn = function()
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+				assert_true(db.network.openuf_brport10 ~= nil, "precondition")
+
+				ucihelper.prune_vlan_networks({})
+				assert_eq(db.network.openuf_brport10, nil,
+					"learning off must not outlive the bridge that needed it")
+				assert_eq(db.network.openuf_brdev10, nil, "bridge gone")
+				assert_eq(db.network.openuf_vlan10, nil, "interface gone")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: ensure_vlan_network uses pre-21.02 bridge syntax when that is what the box speaks",
 		fn = function()
 			-- No `config device` section and no interface carrying `device`
