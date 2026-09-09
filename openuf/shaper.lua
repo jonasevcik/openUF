@@ -50,6 +50,17 @@ local M = {}
 -- Injectable: shell command runner, for real `tc` invocations.
 M._exec = function(cmd) return os.execute(cmd) end
 
+-- os.execute returns the raw exit status on Lua 5.1 (0 = success, non-zero =
+-- failure, and BOTH are truthy) and ok/"exit"/code on 5.4+. Same normalisation
+-- as bcfilter.lua, for the same reason: a bare truth test passes for a failed
+-- tc call on the interpreter the APs actually run.
+local function exec_ok(status)
+	if status == nil or status == false then return false end
+	if type(status) == "number" then return status == 0 end
+	return true
+end
+M._exec_ok = exec_ok
+
 -- Deleting a qdisc that is not there exits non-zero and prints to stderr, so
 -- teardown is always silenced and its status ignored -- reconcile has to be
 -- safe to call on an unshaped interface.
@@ -71,6 +82,7 @@ end
 --
 -- Safe with an empty/nil list and safe to call repeatedly.
 function M.reconcile(rules)
+	local ok = true
 	for _, rule in ipairs(rules or {}) do
 		if rule.ifname then
 			clear(rule.ifname)
@@ -98,14 +110,30 @@ function M.reconcile(rules)
 				-- rule of thumb; too small a burst throttles well under
 				-- the nominal rate.
 				local burst = math.max(math.floor(rule.up_kbps / 10), 32)
-				M._exec("tc filter add dev " .. rule.ifname ..
+				-- The police ACTION is its own kernel module (act_police, in
+				-- kmod-sched-act-police), separate from the ingress qdisc and
+				-- not in every image: a stock filogic build has sch_htb,
+				-- sch_ingress, act_gact and act_mirred but no act_police, so
+				-- this one call fails with "Failed to load TC action module"
+				-- while the download cap above applies -- half a feature
+				-- reporting success. install.sh installs the module; this says
+				-- so when it is still missing, the way bcfilter.lua does for
+				-- kmod-nft-bridge.
+				if not exec_ok(M._exec("tc filter add dev " .. rule.ifname ..
 					" parent ffff: protocol all prio 1 u32 match u32 0 0" ..
 					" police rate " .. rule.up_kbps .. "kbit burst " ..
-					burst .. "k drop flowid :1")
+					burst .. "k drop flowid :1")) then
+					ok = false
+					io.stderr:write(string.format(
+						"openuf: WiFi Speed Limit: tc rejected the upload police filter " ..
+						"for %s -- install kmod-sched-act-police (act_police); the " ..
+						"download cap applies, the upload cap does not.\n",
+						tostring(rule.ifname)))
+				end
 			end
 		end
 	end
-	return true
+	return ok
 end
 
 return M

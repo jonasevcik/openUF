@@ -144,4 +144,47 @@ return {
 			end)
 		end
 	},
+	{
+		name = "shaper: a rejected police filter is reported, not counted as success",
+		fn = function()
+			-- The police ACTION is act_police (kmod-sched-act-police), a
+			-- separate module from the ingress qdisc and absent from a stock
+			-- filogic image: the download cap applies and this one call fails
+			-- with "Failed to load TC action module", so the controller was
+			-- told the whole limit took while only half of it did.
+			local orig_exec, orig_stderr = shaper._exec, io.stderr
+			local logged = {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+			-- Lua 5.1's os.execute returns the raw exit status, so a FAILED
+			-- call returns a non-zero number -- which is truthy. That is why a
+			-- bare truth test would have passed here.
+			shaper._exec = function(cmd)
+				if cmd:find("police", 1, true) then return 2 end
+				return 0
+			end
+			local ok = shaper.reconcile({{ifname = "wlan0", down_kbps = 33000, up_kbps = 17000}})
+			shaper._exec, io.stderr = orig_exec, orig_stderr
+
+			assert_false(ok, "reconcile reports the failure")
+			local out = table.concat(logged)
+			assert_true(out:find("kmod%-sched%-act%-police") ~= nil,
+				"and names the package that fixes it")
+			assert_true(out:find("wlan0", 1, true) ~= nil, "and the interface it happened on")
+		end
+	},
+	{
+		name = "shaper: an all-successful reconcile still reports success",
+		fn = function()
+			local orig = shaper._exec
+			shaper._exec = function() return 0 end     -- Lua 5.1 shape: 0 = success
+			assert_true(shaper.reconcile({{ifname = "wlan0", down_kbps = 1000, up_kbps = 500}}),
+				"nothing failed, so nothing is reported")
+			shaper._exec = function() return true end  -- Lua 5.4 shape
+			assert_true(shaper.reconcile({{ifname = "wlan0", up_kbps = 500}}),
+				"and the 5.4 return shape is understood too")
+			shaper._exec = orig
+		end
+	},
 }
