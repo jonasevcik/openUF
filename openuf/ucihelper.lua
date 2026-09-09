@@ -1480,8 +1480,15 @@ function M.get_vap_table()
 		-- disabled rather than vanishing.
 		if s.disabled == "1" and not s.openuf_wlanconf_id then return end
 		local radio = radio_by_name[s.device]
+		-- THIS VAP's netdev, not the radio's first one. Two SSIDs on a radio
+		-- have two BSSIDs -- netifd derives the second from the first with the
+		-- locally-administered bit set -- so resolving the radio here reported
+		-- both VAPs on one BSSID, and the controller saw two BSSes claiming the
+		-- same address. The per-VAP lookup already existed for sta_table; this
+		-- field was left on the per-radio one. Unresolvable stays "", never a
+		-- neighbour's address.
 		local bssid = ""
-		local ok_if, ifname = pcall(M.get_ifname_for_radio, s.device)
+		local ok_if, ifname = pcall(M.get_ifname_for_vap, s.device, s.ssid)
 		if ok_if and ifname then
 			local mac_raw = M._read_file("/sys/class/net/" .. ifname .. "/address")
 			if mac_raw then bssid = mac_raw:match("^([%x:]+)") or "" end

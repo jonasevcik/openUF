@@ -1748,6 +1748,38 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_vap_table gives each VAP on a radio its OWN bssid",
+		fn = function()
+			-- Regression test: the bssid was resolved with
+			-- get_ifname_for_radio, i.e. the radio's FIRST netdev, so two
+			-- SSIDs on one radio both reported wlan0's address. netifd derives
+			-- the second VAP's BSSID from the first with the
+			-- locally-administered bit set, so the controller saw two BSSes
+			-- claiming one address. The per-VAP lookup already existed (it was
+			-- added for sta_table) and this field was simply left behind on it.
+			with_ucihelper(function()
+				seed_radios({"radio0"})
+				ucihelper._popen = function()
+					return '{"radio0":{"interfaces":['
+						.. '{"ifname":"wlan0","config":{"ssid":"corp"}},'
+						.. '{"ifname":"wlan0-1","config":{"ssid":"guest"}}]}}'
+				end
+				ucihelper._read_file = function(path)
+					if path == "/sys/class/net/wlan0/address"   then return "aa:bb:cc:dd:ee:00\n" end
+					if path == "/sys/class/net/wlan0-1/address" then return "ae:bb:cc:dd:ee:00\n" end
+					return nil
+				end
+				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil, nil, "wlan-1")
+				ucihelper.wlan_add("radio0", "guest", "wpa2", "hunter22", nil, nil, "wlan-2")
+				local vaps = ucihelper.get_vap_table()
+				table.sort(vaps, function(a, b) return a.essid < b.essid end)
+				assert_eq(#vaps, 2, "both vaps reported")
+				assert_eq(vaps[1].bssid, "aa:bb:cc:dd:ee:00", "corp reports wlan0's address")
+				assert_eq(vaps[2].bssid, "ae:bb:cc:dd:ee:00", "guest reports its OWN, wlan0-1's")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_vap_table echoes the wlanconf id as both id and wlanconf_id",
 		fn = function()
 			-- Regression test: the controller's vapInformProcessor silently
