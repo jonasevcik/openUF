@@ -13,7 +13,51 @@ STATE_DIR=/etc/openuf
 BIN_LINK=/usr/bin/syswrapper.sh
 INIT_SCRIPT=/etc/init.d/openuf
 
-case "$1" in
+# ── Package manager ─────────────────────────────────────────────────────────
+# OpenWrt 25.12 replaced opkg with apk. Both are supported: every package
+# openUF needs is named identically in either feed, only the CLI differs.
+# Hardcoding `apk` made every dependency check fail on a 24.10 device -- not
+# loudly, but by reporting the whole list as missing and then failing to
+# install it, which reads as "openUF needs nothing" right up until the daemon
+# dies on a missing lua-cjson.
+#
+# Neither present (a stripped image, or `sh install.sh` on something that is
+# not OpenWrt at all) degrades to "nothing is installed and nothing can be":
+# openUF's own files still land and the warnings say exactly what to add by
+# hand. pkg_add deliberately does NOT redirect output -- callers decide, and
+# the REQUIRED install below wants the package manager's own error text on
+# screen.
+if command -v apk >/dev/null 2>&1; then
+	PKG_CMD="apk add"
+	pkg_installed() { apk info -e "$1" >/dev/null 2>&1; }
+	pkg_add()       { apk add "$@"; }
+elif command -v opkg >/dev/null 2>&1; then
+	PKG_CMD="opkg install"
+	pkg_installed() { opkg list-installed "$1" 2>/dev/null | grep -q "^$1 "; }
+	pkg_add()       { opkg install "$@"; }
+else
+	PKG_CMD="<no package manager found>"
+	pkg_installed() { return 1; }
+	pkg_add()       { return 1; }
+fi
+
+# ── Options ─────────────────────────────────────────────────────────────────
+# The action comes first, flags after it. An unknown flag is an error rather
+# than ignored: a mistyped --bootstrap-adopt used to install silently, without
+# the account it was asked for and with no hint that it had been dropped.
+ACTION=${1:-}
+[ $# -gt 0 ] && shift
+BOOTSTRAP_ADOPT=0
+for _opt in "$@"; do
+	case "$_opt" in
+		--bootstrap-adopt) BOOTSTRAP_ADOPT=1 ;;
+		*) echo "ERROR: unknown option: $_opt" >&2
+		   echo "Usage: $0 <install|uninstall> [--bootstrap-adopt]" >&2
+		   exit 1 ;;
+	esac
+done
+
+case "$ACTION" in
 
 	# ────────────────────────────────────────────────────────────────────────
 	install)
@@ -35,7 +79,7 @@ case "$1" in
 		OPTIONAL_MIN_FREE_KB=400
 		try_optional() {
 			pkg=$1; feature=$2
-			if apk info -e "$pkg" >/dev/null 2>&1; then return 0; fi
+			if pkg_installed "$pkg"; then return 0; fi
 			free=$(overlay_free_kb "$INSTALL_DIR")
 			if [ -n "$free" ] && [ "$free" -lt "$OPTIONAL_MIN_FREE_KB" ]; then
 				echo "SKIP $pkg (${free}KB free, need ${OPTIONAL_MIN_FREE_KB}KB): $feature"
@@ -43,7 +87,7 @@ case "$1" in
 				return 0
 			fi
 			echo "Installing $pkg ($feature) ..."
-			apk add "$pkg" >/dev/null 2>&1 \
+			pkg_add "$pkg" >/dev/null 2>&1 \
 				|| echo "WARNING: failed to install $pkg -- $feature will not function."
 		}
 
@@ -74,6 +118,12 @@ case "$1" in
 			echo "ERROR: failed to copy openUF into $INSTALL_DIR"
 			echo "  Free space: $(overlay_free_kb "$INSTALL_DIR")KB. openUF needs ~130KB"
 			echo "  (comment-stripped) plus room for state and logs."
+			# Put the device's own conf.lua back before giving up. A partial
+			# copy on a full overlay could have overwritten it already, and
+			# bailing out with only the shipped default in place would reset
+			# the board's modelmap -- the identity MAC with it.
+			[ -n "$KEEP_CONF" ] && cp "$KEEP_CONF" "$INSTALL_DIR/conf.lua" 2>/dev/null
+			[ -n "$KEEP_CONF" ] && rm -f "$KEEP_CONF"
 			exit 1
 		}
 		rm -rf "$INSTALL_DIR/etc"
@@ -148,17 +198,26 @@ case "$1" in
 		# provisioning a device that has never sent a genuine GCM inform. There
 		# is no Lua zlib binding in 25.12, so inform-response decompression is
 		# handled in-tree by openuf/inflate.lua and needs no package.
+		#
+		# libuci-lua provides require("uci"), which every wireless read and
+		# write goes through (ucihelper.lua, switchvlan.lua, usteer.lua). It is
+		# NOT pulled in by `lua`, and its absence is the most invisible failure
+		# openUF has: every ucihelper call is pcall-wrapped -- correctly, since
+		# a UCI error must not take the inform loop down -- so the device
+		# adopts, reports its ports and its statistics and looks perfectly
+		# healthy, while radio_table goes out EMPTY and the controller has no
+		# radio to push a WLAN onto. Nothing logs and nothing errors.
 		MISSING=""
-		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw; do
-			if ! apk info -e "$pkg" >/dev/null 2>&1; then
+		for pkg in lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw; do
+			if ! pkg_installed "$pkg"; then
 				MISSING="$MISSING $pkg"
 			fi
 		done
 		if [ -n "$MISSING" ]; then
-			echo "Installing required apk packages:$MISSING"
-			apk add $MISSING || {
+			echo "Installing required packages:$MISSING"
+			pkg_add $MISSING || {
 				echo "WARNING: failed to install:$MISSING"
-				echo "  Install them by hand with: apk update && apk add$MISSING"
+				echo "  Install them by hand with: $PKG_CMD$MISSING"
 				echo "  Without lua-openssl in particular, adoption cannot complete"
 				echo "  (the controller requires a genuine AES-128-GCM inform)."
 			}
@@ -235,16 +294,16 @@ case "$1" in
 		# SSID on the device for no gain.
 		HAVE_WPAD=0
 		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
-			if apk info -e "$pkg" >/dev/null 2>&1; then
+			if pkg_installed "$pkg"; then
 				HAVE_WPAD=1
 				break
 			fi
 		done
 		if [ "$HAVE_WPAD" = "0" ]; then
 			echo "Installing a full wpad build (BSS Transition / Band Steering) ..."
-			apk add wpad-wolfssl \
-				|| apk add wpad-openssl \
-				|| apk add wpad-mbedtls \
+			pkg_add wpad-wolfssl \
+				|| pkg_add wpad-openssl \
+				|| pkg_add wpad-mbedtls \
 				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
 		fi
 
@@ -269,7 +328,7 @@ case "$1" in
 		# able to write $STATE_DIR -- no other privilege. Self-locks once the
 		# device is adopted and re-enables on factory reset (see
 		# inform.lua's M._sync_bootstrap_account). See USAGE.md.
-		if [ "$2" = "--bootstrap-adopt" ]; then
+		if [ "$BOOTSTRAP_ADOPT" = 1 ]; then
 			echo "Setting up SSH bootstrap adoption account (ubnt/ubnt) ..."
 
 			ALREADY_ADOPTED=0

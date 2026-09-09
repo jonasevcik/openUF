@@ -2938,4 +2938,41 @@ return {
 				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm
 		end
 	},
+	{
+		name = "inform: a missing UCI binding is announced, not silently survived",
+		fn = function()
+			-- libuci-lua is what require("uci") comes from; `lua` does not
+			-- pull it in and install.sh did not list it. Every ucihelper call
+			-- is pcall-wrapped (correctly), so without it the device adopts,
+			-- reports ports and statistics and looks healthy while
+			-- radio_table goes out EMPTY and no pushed WLAN is ever created.
+			local orig_loaded, orig_require, orig_stderr =
+				package.loaded["uci"], require, io.stderr
+			local logged = {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+
+			package.loaded["uci"] = nil
+			require = function(name)
+				if name == "uci" then error("module 'uci' not found") end
+				return orig_require(name)
+			end
+			local warned = inform._warn_missing_uci()
+			assert_true(warned, "an unresolvable uci binding warns")
+			local out = table.concat(logged)
+			assert_true(out:find("libuci%-lua") ~= nil, "and names the package to install")
+			assert_true(out:find("ZERO") ~= nil, "and says what actually breaks")
+
+			-- Present: silent, whichever way it is present.
+			logged = {}
+			package.loaded["uci"] = {}
+			assert_false(inform._warn_missing_uci(), "an already-loaded binding is fine")
+			assert_eq(table.concat(logged), "", "and says nothing")
+
+			require = orig_require
+			package.loaded["uci"] = orig_loaded
+			io.stderr = orig_stderr
+		end
+	},
 }

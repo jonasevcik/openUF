@@ -3133,6 +3133,33 @@ end
 -- 400s. Observed for real when a board-specific modelmap moved lan_cpueth
 -- from the (unused) WAN socket to the LAN trunk, which have different MACs.
 -- Returns true when it warned, so this is testable without running the loop.
+-- require("uci") comes from libuci-lua, which `lua` does not pull in and which
+-- nothing installed until recently. Every ucihelper call is pcall-wrapped --
+-- correctly, since a UCI error off-target must not take the inform loop down
+-- -- so without the binding the daemon starts, adopts, reports its ethernet
+-- ports and its statistics and looks completely healthy, while
+-- get_radio_table() returns nothing and radio_table goes out EMPTY. The
+-- controller then has no radio to provision a WLAN onto: the push arrives, is
+-- accepted, and not one SSID is ever created. Nothing logs, nothing errors,
+-- and the controller UI shows the device Connected.
+--
+-- Startup-only, and deliberately not fatal: a device with no UCI binding still
+-- reports statistics usefully, and killing the daemon would lose that too.
+-- Returns true when it warned, so this is testable without running the loop.
+function M._warn_missing_uci()
+	if package.loaded["uci"] then return false end
+	if pcall(require, "uci") then return false end
+	io.stderr:write(
+		"openuf: the Lua UCI binding is MISSING (require(\"uci\") failed).\n" ..
+		"openuf: WiFi provisioning cannot work at all: every radio and WLAN\n" ..
+		"openuf: read/write fails silently, the inform payload reports ZERO\n" ..
+		"openuf: radios, and the controller has nothing to push a WLAN onto --\n" ..
+		"openuf: adoption and statistics still work, so nothing else looks wrong.\n" ..
+		"openuf: Fix it with:  apk add libuci-lua      (25.12+)\n" ..
+		"openuf:               opkg install libuci-lua (24.10 and earlier)\n")
+	return true
+end
+
 function M._warn_identity_change(prev_mac, st, cfg)
 	if not (st and st.adopted and prev_mac and st.mac) then return false end
 	if prev_mac == st.mac then return false end
@@ -3275,6 +3302,7 @@ function M.run(cfg, ufhw)
 	local prev_mac = st.mac
 	M._populate_net_info(st, cfg)
 	M._warn_identity_change(prev_mac, st, cfg)
+	M._warn_missing_uci()
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	-- Blocked-client nft rules are live kernel state, not persisted UCI --
 	-- reapply from state.json on every fresh start (mirrors the bootstrap

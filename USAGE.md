@@ -8,8 +8,12 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 ```
+
+On OpenWrt 24.10 and earlier the package manager is `opkg install` rather than
+`apk add`; the package names are the same, and `install.sh` picks whichever one
+the device has.
 
 | Package | Purpose |
 |---|---|
@@ -18,6 +22,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables kmod-nft-
 | `luasocket` | TCP client for HTTP POST to controller |
 | `lua-openssl` | AES-128-CBC **and AES-128-GCM** (replaces `luacrypto`, which was dropped from the 25.12 feeds). Effectively mandatory — see the GCM note below |
 | `luabitop` | bit operations for Lua 5.1 |
+| `libuci-lua` | `require("uci")` — every radio and WLAN read and write goes through it. Not pulled in by `lua`. Without it the device adopts, reports its ports and statistics and looks perfectly healthy, while `radio_table` goes out **empty** and the controller has no radio to push a WLAN onto: pushes are accepted and no SSID is ever created. openUF says so at startup rather than leaving you to find it |
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |

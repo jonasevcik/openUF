@@ -144,9 +144,10 @@ The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi ident
 ## Quick start
 
 ```sh
-# 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
+# 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk;
+#    on 24.10 and earlier the same names go through `opkg install`)
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 
 # 2. Download and install the latest release (no git client or scp needed)
 mkdir openuf-install && cd openuf-install
