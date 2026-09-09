@@ -1308,6 +1308,9 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
+	-- netifd may hand the interfaces new netdev names on the way back up, so
+	-- the lookups below must not reuse anything read before the reload.
+	M._ws_cache = nil
 
 	-- "Multicast and Broadcast Blocker" enforcement. Deliberately after the
 	-- reload: the rules key off each VAP's live netdev name, which only exists
@@ -1437,14 +1440,40 @@ end
 -- (e.g. "wlan0"), as assigned at runtime by netifd. Needed because sta_table()/
 -- radio_stats() operate on the live `iw`-visible interface, not the UCI config
 -- name. Returns nil if unresolvable (e.g. off-target, radio disabled).
+-- The decoded `ubus call network.wireless status`, shared by the two lookups
+-- below. Cached only INSIDE a pass opened by begin_pass() -- inform.lua's
+-- build_json opens one per payload and closes it on return -- and dropped by
+-- end_pass() and after every `wifi reload`, so a netdev name read before
+-- netifd rebuilt the interfaces is never reused after. Outside a pass every
+-- call forks ubus exactly as before, which is also what keeps the test suite's
+-- per-test _popen stubs independent of one another. Inside one, what used to
+-- be ten identical forks per heartbeat on a two-radio, four-SSID box is one.
+M._ws_cache = nil      -- {status = <decoded table> | false} while a pass is open
+M._ws_pass  = false
+function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil end
+function M.end_pass()   M._ws_pass = false; M._ws_cache = nil end
+
+local function wireless_status()
+	if M._ws_pass and M._ws_cache then
+		return M._ws_cache.status or nil
+	end
+	local status = nil
+	local output = M._popen("ubus call network.wireless status")
+	if output ~= "" then
+		local cjson = get_cjson()
+		if cjson then
+			local ok_d, decoded = pcall(cjson.decode, output)
+			if ok_d and type(decoded) == "table" then status = decoded end
+		end
+	end
+	if M._ws_pass then M._ws_cache = {status = status or false} end
+	return status
+end
+
 function M.get_ifname_for_radio(radio)
 	if not radio then return nil end
-	local output = M._popen("ubus call network.wireless status")
-	if output == "" then return nil end
-	local cjson = get_cjson()
-	if not cjson then return nil end
-	local ok_d, status = pcall(cjson.decode, output)
-	if not ok_d or type(status) ~= "table" then return nil end
+	local status = wireless_status()
+	if not status then return nil end
 	local dev = status[radio]
 	if type(dev) == "table" and type(dev.interfaces) == "table" then
 		for _, iface in ipairs(dev.interfaces) do
@@ -1464,12 +1493,8 @@ end
 -- silently apply one SSID's filter to another. Returns nil if unresolvable.
 function M.get_ifname_for_vap(radio, ssid)
 	if not radio or not ssid then return nil end
-	local output = M._popen("ubus call network.wireless status")
-	if output == "" then return nil end
-	local cjson = get_cjson()
-	if not cjson then return nil end
-	local ok_d, status = pcall(cjson.decode, output)
-	if not ok_d or type(status) ~= "table" then return nil end
+	local status = wireless_status()
+	if not status then return nil end
 	local dev = status[radio]
 	if type(dev) ~= "table" or type(dev.interfaces) ~= "table" then return nil end
 	for _, iface in ipairs(dev.interfaces) do

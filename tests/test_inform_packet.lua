@@ -3113,4 +3113,37 @@ return {
 			inform._rrm_asked = {}
 		end
 	},
+	{
+		name = "inform: a build_json that throws still closes the ucihelper lookup pass",
+		fn = function()
+			-- build_json opens a pass and closes it on its normal return. An
+			-- error skips that close, and a stale pass would then hand
+			-- handle_response's own lookups the interface names read before
+			-- `wifi reload` rebuilt them.
+			local orig = {
+				build_json = inform.build_json, uci = inform._ucihelper,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			io.stderr = {write = function() end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			local open_passes = 0
+			inform._ucihelper = {
+				begin_pass = function() open_passes = open_passes + 1 end,
+				end_pass   = function() open_passes = open_passes - 1 end,
+			}
+			inform.build_json = function()
+				inform._ucihelper.begin_pass()
+				error("boom halfway through the payload")
+			end
+			inform._tick({inform_url = "http://unifi:8080/inform"}, nil, nil,
+				{interval = 10, backoff = 10})
+
+			inform.build_json, inform._ucihelper, inform._reload_if_changed,
+				inform._rrm_tick, io.stderr =
+				orig.build_json, orig.uci, orig.reload, orig.rrm, orig.stderr
+			assert_eq(open_passes, 0, "the pass is closed even on the error path")
+		end
+	},
 }

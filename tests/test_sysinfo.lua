@@ -15,6 +15,11 @@ end
 local function with_fixtures(file_map, cmd_map, fn)
 	local orig_rf  = sysinfo._read_file
 	local orig_cmd = sysinfo._run_cmd
+	-- `iw phy` output is cached per phy with a TTL (it describes hardware).
+	-- Swapping the fixtures underneath it is exactly the thing that cache is
+	-- not built for, so drop it on the way in AND on the way out: a test
+	-- feeding a canned phy dump must not leak those caps into a later one.
+	sysinfo._phy_info_cache = {}
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -30,6 +35,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	local ok, err = pcall(fn)
 	sysinfo._read_file = orig_rf
 	sysinfo._run_cmd   = orig_cmd
+	sysinfo._phy_info_cache = {}
 	if not ok then error(err, 2) end
 end
 
@@ -985,6 +991,43 @@ return {
 				local caps = sysinfo.radio_caps("wlan0")
 				assert_eq(next(caps), nil, "empty table -- no 'wiphy N' line to resolve")
 			end)
+		end
+	},
+	{
+		name = "sysinfo: `iw phy` is cached per phy, `iw dev` is not",
+		fn = function()
+			-- `iw phy phyN info` is tens of kilobytes and was fetched and
+			-- parsed for every radio on every 10-second heartbeat, though it
+			-- describes the hardware plus the regulatory domain and changes
+			-- only with the latter. `iw dev <if> info` stays uncached: it
+			-- carries the LIVE channel and TX power, which is the point of
+			-- reading it every time.
+			local orig_cmd, orig_time = sysinfo._run_cmd, sysinfo._time
+			local phy_reads, dev_reads, clock = 0, 0, 1000
+			sysinfo._time = function() return clock end
+			sysinfo._phy_info_cache = {}
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("iw phy") then
+					phy_reads = phy_reads + 1
+					return "\tBand 2:\n\t\tVHT Capabilities (0x00000000):\n"
+				end
+				dev_reads = dev_reads + 1
+				return "\twiphy 0\n\tchannel 36 (5180 MHz)\n\ttxpower 23.00 dBm\n"
+			end
+
+			sysinfo.radio_caps("wlan0")
+			sysinfo.radio_caps("wlan0")
+			sysinfo.radio_caps("wlan0")
+			assert_eq(phy_reads, 1, "the hardware description is read once")
+			assert_eq(dev_reads, 3, "the live channel and TX power are read every time")
+
+			-- Past the TTL, so a regdomain change is picked up within minutes.
+			clock = clock + sysinfo.PHY_INFO_TTL + 1
+			sysinfo.radio_caps("wlan0")
+			assert_eq(phy_reads, 2, "and re-read once the TTL is up")
+
+			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
+			sysinfo._phy_info_cache = {}
 		end
 	},
 }

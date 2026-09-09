@@ -2756,4 +2756,61 @@ return {
 			ucihelper._phy_caps_unstable_until = nil
 		end
 	},
+	{
+		name = "ucihelper: one ubus status call serves a whole payload, and none crosses a reload",
+		fn = function()
+			-- get_ifname_for_radio/get_ifname_for_vap each forked
+			-- `ubus call network.wireless status` afresh: once per VAP in
+			-- get_vap_table, once per radio, once per VAP again -- ten
+			-- identical forks per heartbeat on a two-radio, four-SSID box.
+			local orig = ucihelper._popen
+			local calls = 0
+			ucihelper._popen = function()
+				calls = calls + 1
+				return '{"radio0":{"interfaces":['
+					.. '{"ifname":"wlan0","config":{"ssid":"corp"}},'
+					.. '{"ifname":"wlan0-1","config":{"ssid":"guest"}}]}}'
+			end
+
+			-- Outside a pass: unchanged, one fork per call. That is what keeps
+			-- the suite's per-test _popen stubs independent of one another.
+			ucihelper.get_ifname_for_vap("radio0", "corp")
+			ucihelper.get_ifname_for_vap("radio0", "guest")
+			assert_eq(calls, 2, "no pass open -- every call forks, as before")
+
+			calls = 0
+			ucihelper.begin_pass()
+			assert_eq(ucihelper.get_ifname_for_vap("radio0", "corp"), "wlan0", "first lookup")
+			assert_eq(ucihelper.get_ifname_for_vap("radio0", "guest"), "wlan0-1", "second lookup")
+			assert_eq(ucihelper.get_ifname_for_radio("radio0"), "wlan0", "and a radio lookup")
+			assert_eq(calls, 1, "one fork for the whole pass")
+
+			-- A `wifi reload` drops it: netifd may hand the interfaces new
+			-- netdev names on the way back up, and reusing a name read before
+			-- the reload would point the blocker and the shaper at the old one.
+			ucihelper._ws_cache = nil
+			ucihelper.get_ifname_for_vap("radio0", "corp")
+			assert_eq(calls, 2, "a dropped cache is re-read even inside the pass")
+
+			ucihelper.end_pass()
+			calls = 0
+			ucihelper.get_ifname_for_vap("radio0", "corp")
+			ucihelper.get_ifname_for_vap("radio0", "corp")
+			assert_eq(calls, 2, "and the pass really is closed")
+			ucihelper._popen = orig
+		end
+	},
+	{
+		name = "ucihelper: apply_config drops the ifname cache after wifi reload",
+		fn = function()
+			with_ucihelper(function(db, cmds)
+				ucihelper.begin_pass()
+				ucihelper._ws_cache = {status = {radio0 = {interfaces = {}}}}
+				ucihelper.apply_config({radio_table = {}, vap_table = {}}, {config = {}})
+				assert_nil(ucihelper._ws_cache,
+					"a name read before the reload is never reused after it")
+				ucihelper.end_pass()
+			end)
+		end
+	},
 }

@@ -471,12 +471,33 @@ function M.sae_supported()
 	return found
 end
 
+-- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for every
+-- radio on every heartbeat, although it describes the HARDWARE plus the
+-- regulatory domain and changes only with the latter. Cached per phy with a
+-- TTL: long enough to take the parse off the 10-second path, short enough that
+-- a regdomain change is reflected within minutes. (ucihelper keeps its own,
+-- separately invalidated cache of `iw phy` for its clamping decisions.)
+-- `iw dev <if> info` is NOT cached -- it carries the live channel and TX
+-- power, which is the point of reading it every time.
+M.PHY_INFO_TTL = 300
+M._phy_info_cache = {}
+function M._phy_info(phy)
+	local now = M._time()
+	local c = M._phy_info_cache[phy]
+	if c and (now - c.at) < M.PHY_INFO_TTL then return c.text end
+	local text = M._run_cmd("iw phy phy" .. phy .. " info")
+	if text and text ~= "" then
+		M._phy_info_cache[phy] = {text = text, at = now}
+	end
+	return text
+end
+
 function M.radio_caps(ifname)
 	if not ifname then return {} end
 	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
 	local phy = dev_info:match("wiphy%s+(%d+)")
 	if not phy then return {} end
-	local phy_info = M._run_cmd("iw phy phy" .. phy .. " info")
+	local phy_info = M._phy_info(phy)
 	if not phy_info or phy_info == "" then return {} end
 
 	local has_dfs = phy_info:find("radar detection") ~= nil

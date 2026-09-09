@@ -603,6 +603,13 @@ function M.build_json(st, cfg, ufhw)
 	-- fail off-target, so individual calls are still pcall-wrapped below)
 	local ufuci = M._ucihelper
 	if ufuci and ufuci.get_vap_table then
+		-- One `ubus call network.wireless status` for the whole payload: every
+		-- get_ifname_for_radio/vap below (one per VAP in get_vap_table, one
+		-- per radio, one per VAP again) otherwise re-runs it for the same
+		-- answer -- ten identical forks per heartbeat on a two-radio,
+		-- four-SSID box. Feature-detected: test doubles inject a ucihelper
+		-- without it. _tick() ends the pass even when this function throws.
+		if ufuci.begin_pass then ufuci.begin_pass() end
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
 		-- The modelmap's hwassign restricts which radios are reported; absent,
@@ -1571,6 +1578,7 @@ function M.build_json(st, cfg, ufhw)
 		lldp_table       = arr(lldp_table),
 	}
 
+	if ufuci and ufuci.end_pass then ufuci.end_pass() end
 	return M._fix_empty_arrays(cjson.encode(payload))
 end
 
@@ -3354,6 +3362,10 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._rrm_tick, cfg)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
+	-- build_json opens a ucihelper lookup pass and closes it on its normal
+	-- return; an error skips that close, and a stale pass would then feed
+	-- handle_response's own lookups pre-reload interface names.
+	if M._ucihelper and M._ucihelper.end_pass then pcall(M._ucihelper.end_pass) end
 	if not ok_b then
 		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")
 		return ctx.interval
