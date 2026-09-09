@@ -734,6 +734,17 @@ request for such a client outright. In practice this is a minority of clients �
 surveyed across two APs, 9 had no 802.11k at all — so this supplements the passive cache
 and never replaces it.
 
+The request names the operating class the *client* can measure: 81 (2.4 GHz) for a station
+on a 2.4 GHz BSS, 115 (5 GHz U-NII-1) for one on 5 GHz. A dual-band client answers 115 for
+both bands, which is where the cross-band bonus above comes from — but a 2.4 GHz-only
+client answers it with report mode `0x02`, *incapable*, and nothing else.
+
+Capability bits are not a promise, either: a client can advertise every measurement mode
+and still refuse them all. hostapd only notifies openUF when a report body arrives, so
+such a station is indistinguishable from one that never answers — after two unanswered
+requests it is left alone for six hours, then tried once more. Any report at all puts it
+straight back into the rotation.
+
 Rows sourced this way show a **blank WiFi Name and Security** (the controller renders the
 BSSID instead of a name). That is deliberate: a beacon report carries a BSSID, a channel
 and an RCPI, and nothing else. openUF will not invent a security mode it did not measure —

@@ -293,4 +293,32 @@ return {
 			end)
 		end
 	},
+	{
+		name = "rrmscan: harvest names the stations that actually answered",
+		fn = function()
+			-- A station's RRM capability bits are not a promise: one can
+			-- advertise passive, active AND table measurement and answer every
+			-- variant with report mode 0x02, "incapable". hostapd notifies
+			-- over ubus only when a report BODY arrived, so a bodiless refusal
+			-- never reaches this file and its ABSENCE is the only signal the
+			-- caller has. Returned alongside the neighbours so the caller can
+			-- stop asking a station that never reports.
+			with_events(read_fixture("ubus_beacon_report.txt"), function()
+				local _, reporters = rrmscan.harvest()
+				assert_true(reporters["2a:1a:ec:4a:c0:df"] == true,
+					"the station whose reports carried bodies is a reporter")
+				assert_true(reporters["94:27:70:79:aa:18"] == true, "and so is the second one")
+			end)
+
+			-- A bodied refusal is a station declining too, and must not count
+			-- as an answer.
+			with_events('{ "beacon-report": {"address":"aa:bb:cc:dd:ee:ff","op-class":115,'
+				.. '"channel":0,"rcpi":0,"bssid":"00:00:00:00:00:00","rep-mode":4} }\n',
+				function()
+					local out, reporters = rrmscan.harvest()
+					assert_eq(#out, 0, "and reports no neighbour")
+					assert_nil(reporters["aa:bb:cc:dd:ee:ff"], "a refusal is not an answer")
+				end)
+		end
+	},
 }

@@ -137,9 +137,12 @@ end
 -- Ask one station for a full sweep. mode 1 is ACTIVE measurement: the client
 -- probes rather than only listening, which is what makes it report BSSes on
 -- channels it is not sitting on. channel 255 means "every channel in this
--- operating class"; op_class 115 is the 5 GHz U-NII-1 class, and clients
--- observed here ignore its band restriction and answer for 2.4 GHz too, which
--- is a bonus rather than something to rely on.
+-- operating class". op_class defaults to 115 (5 GHz U-NII-1); dual-band clients
+-- observed here ignore its band restriction and answer for 2.4 GHz too, but a
+-- 2.4 GHz-only client answers a 5 GHz class with report mode 0x02
+-- ("incapable") and an all-zero BSSID -- nothing usable at all. So the caller
+-- (inform._rrm_tick) passes 81, the 2.4 GHz class, for a station on a 2.4 GHz
+-- BSS, and the dual-band bonus stays a bonus rather than the mechanism.
 --
 -- Fire-and-forget by design: the report comes back asynchronously as a ubus
 -- notification minutes-to-never later, and is picked up by harvest().
@@ -205,14 +208,23 @@ end
 -- request re-reports the same neighbourhood anyway.
 function M.harvest()
 	local f = io.open(M.EVENT_FILE, "r")
-	if not f then return {} end
+	if not f then return {}, {} end
 	local blob = f:read("*a") or ""
 	f:close()
 	local t = io.open(M.EVENT_FILE, "w")
 	if t then t:close() end
 
 	local now, seen, out = M._now(), {}, {}
+	-- Every station that produced an ANSWER, alongside the neighbours it
+	-- reported. The caller uses it to tell a station that answers from one
+	-- that only ever acknowledges: hostapd notifies over ubus only when a
+	-- report BODY arrived, so a bodiless refusal never reaches this file at
+	-- all and its ABSENCE is the only signal there is. A bodied refusal
+	-- (rep-mode non-zero) is a station declining too, so it does not count
+	-- here either.
+	local reporters = {}
 	for body in blob:gmatch('"beacon%-report":%s*(%b{})') do
+		local address  = body:match('"address":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
 		local bssid    = body:match('"bssid":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
 		local channel  = tonumber(body:match('"channel":(%-?%d+)'))
 		local rcpi     = tonumber(body:match('"rcpi":(%-?%d+)'))
@@ -221,6 +233,7 @@ function M.harvest()
 		-- unavailable, and those arrive with an all-zero BSSID. Reporting one
 		-- would put 00:00:00:00:00:00 on ch 0 in the Environment tab.
 		local repmode  = tonumber(body:match('"rep%-mode":(%-?%d+)')) or 0
+		if address and repmode == 0 then reporters[address:lower()] = true end
 		local band     = M.band_of_channel(channel)
 		if bssid and band and repmode == 0
 		   and bssid ~= "00:00:00:00:00:00" and not seen[bssid] then
@@ -234,7 +247,7 @@ function M.harvest()
 			}
 		end
 	end
-	return out
+	return out, reporters
 end
 
 -- Merge harvested neighbours into one radio's scan_table.

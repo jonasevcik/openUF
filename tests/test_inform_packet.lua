@@ -3031,4 +3031,86 @@ return {
 			assert_eq(vap.mac_filter_list[1], "02:11:22:33:44:55", "and it is the right one")
 		end
 	},
+	{
+		name = "inform: a 2.4 GHz-only station is asked for its own operating class",
+		fn = function()
+			-- Every station used to be asked for class 115 (5 GHz U-NII-1).
+			-- Dual-band clients ignore the band restriction and answer for
+			-- 2.4 GHz too, but a 2.4 GHz-only station answers a 5 GHz class
+			-- with report mode 0x02, "incapable", and an all-zero BSSID --
+			-- nothing usable. Class 81 is 2.4 GHz, channels 1-13.
+			local orig_rrm, orig_sysinfo = inform._rrmscan, inform._sysinfo
+			local asked = {}
+			inform._rrmscan = {
+				collector_ensure = function() end,
+				harvest          = function() return {}, {} end,
+				hostapd_objects  = function() return {"hostapd.wlan0", "hostapd.wlan1"} end,
+				capable_stations = function(ifname)
+					return {ifname == "wlan0" and "aa:bb:cc:dd:ee:01" or "aa:bb:cc:dd:ee:02"}
+				end,
+				request = function(ifname, sta, opts)
+					asked[#asked + 1] = {ifname = ifname, sta = sta, op = opts and opts.op_class}
+				end,
+			}
+			inform._sysinfo = setmetatable({
+				radio_caps = function(ifname)
+					return {channel = (ifname == "wlan0") and 6 or 36}
+				end,
+			}, {__index = orig_sysinfo})
+
+			local cfg = {config = {rrm_enrichment = true, rrm_request_interval = 0}}
+			inform._rrm_asked = {}
+			inform._rrm_next_request = 0
+			inform._rrm_rr = 0
+			inform._rrm_tick(cfg)
+			inform._rrm_tick(cfg)
+
+			inform._rrmscan, inform._sysinfo = orig_rrm, orig_sysinfo
+			inform._rrm_asked = {}
+
+			assert_eq(#asked, 2, "one station asked per tick, round-robin")
+			local by_if = {}
+			for _, a in ipairs(asked) do by_if[a.ifname] = a.op end
+			assert_eq(by_if["wlan0"], 81, "the station on a 2.4 GHz BSS gets class 81")
+			assert_eq(by_if["wlan1"], 115, "the one on 5 GHz still gets 115")
+		end
+	},
+	{
+		name = "inform: a station that never answers is benched, and un-benched by a report",
+		fn = function()
+			-- Asking a station that only ever acknowledges costs it an ack
+			-- every interval, forever, and yields nothing.
+			local orig_rrm, orig_sysinfo, orig_stderr =
+				inform._rrmscan, inform._sysinfo, io.stderr
+			io.stderr = {write = function() end}
+			local asked, reporters = 0, {}
+			inform._rrmscan = {
+				collector_ensure = function() end,
+				harvest          = function() return {}, reporters end,
+				hostapd_objects  = function() return {"hostapd.wlan0"} end,
+				capable_stations = function() return {"aa:bb:cc:dd:ee:01"} end,
+				request          = function() asked = asked + 1 end,
+			}
+			inform._sysinfo = setmetatable({
+				radio_caps = function() return {channel = 36} end,
+			}, {__index = orig_sysinfo})
+
+			local cfg = {config = {rrm_enrichment = true, rrm_request_interval = 0}}
+			inform._rrm_asked = {}
+			inform._rrm_next_request = 0
+			inform._rrm_rr = 0
+
+			for _ = 1, 5 do inform._rrm_tick(cfg) end
+			assert_eq(asked, inform.RRM_MAX_UNANSWERED,
+				"asked twice, then left alone however many ticks go by")
+
+			-- An answer -- any answer -- puts it straight back in rotation.
+			reporters = {["aa:bb:cc:dd:ee:01"] = true}
+			inform._rrm_tick(cfg)
+			assert_eq(asked, inform.RRM_MAX_UNANSWERED + 1, "a report clears the count")
+
+			inform._rrmscan, inform._sysinfo, io.stderr = orig_rrm, orig_sysinfo, orig_stderr
+			inform._rrm_asked = {}
+		end
+	},
 }

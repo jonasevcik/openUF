@@ -89,6 +89,19 @@ M._rrm_neighbours   = {}
 M._rrm_next_request = 0
 M._rrm_rr           = 0
 
+-- Stations asked for a beacon report that have not answered, keyed by MAC:
+-- {n = unanswered requests so far, at = when the last one went out}. A
+-- station's RRM capability bits are not a promise -- a client can advertise
+-- passive, active AND table measurement and still answer every variant with
+-- report mode 0x02, "incapable". hostapd does not notify a bodiless refusal
+-- over ubus, so from here such a station is simply one that never reports,
+-- and asking it again every interval forever would only ever cost it an ack.
+-- After RRM_MAX_UNANSWERED asks with nothing back it is left alone for
+-- RRM_BENCH_SECONDS, then tried once more. Any report from it clears the count.
+M._rrm_asked         = {}
+M.RRM_MAX_UNANSWERED = 2
+M.RRM_BENCH_SECONDS  = 6 * 3600
+
 -- How often to ask ONE station for a sweep. An active beacon measurement takes
 -- the client off-channel for roughly duration x channels (~1.3 s for a full
 -- operating class at 50 TU), so this is deliberately slow: the point is to
@@ -3238,8 +3251,10 @@ function M._rrm_tick(cfg)
 
 	pcall(rrm.collector_ensure)
 
-	local ok, fresh = pcall(rrm.harvest)
+	local ok, fresh, reporters = pcall(rrm.harvest)
 	if ok then
+		-- A station that answered is off the bench, whatever it reported.
+		for mac in pairs(reporters or {}) do M._rrm_asked[mac] = nil end
 		for _, n in ipairs(fresh or {}) do
 			-- Keyed by BSSID so a neighbour two clients both saw is carried
 			-- once, at whichever sighting is freshest.
@@ -3275,13 +3290,44 @@ function M._rrm_tick(cfg)
 		local ifname = obj:match("^hostapd%.(.+)$")
 		local ok_s, stas = pcall(rrm.capable_stations, ifname)
 		for _, sta in ipairs(ok_s and stas or {}) do
-			cands[#cands + 1] = {ifname = ifname, sta = sta}
+			local key   = tostring(sta):lower()
+			local asked = M._rrm_asked[key]
+			local spent = asked and asked.n >= M.RRM_MAX_UNANSWERED
+			if spent and (now - asked.at) >= M.RRM_BENCH_SECONDS then
+				M._rrm_asked[key] = nil   -- bench over: one more try, clean count
+				spent = false
+			end
+			if not spent then
+				cands[#cands + 1] = {ifname = ifname, sta = sta}
+			end
 		end
 	end
 	if #cands == 0 then return true end
 	M._rrm_rr = (M._rrm_rr % #cands) + 1
 	local c = cands[M._rrm_rr]
-	pcall(rrm.request, c.ifname, c.sta)
+	local key = tostring(c.sta):lower()
+	local asked = M._rrm_asked[key] or {n = 0}
+	asked.n, asked.at = asked.n + 1, now
+	M._rrm_asked[key] = asked
+	if asked.n == M.RRM_MAX_UNANSWERED then
+		io.stderr:write(string.format(
+			"openuf: rrm: %s on %s advertises beacon measurement but has answered none "
+			.. "of %d requests -- not asking again for %d h\n",
+			c.sta, c.ifname, asked.n - 1, math.floor(M.RRM_BENCH_SECONDS / 3600)))
+	end
+	-- The operating class has to be one the CLIENT can measure. Asking every
+	-- station for class 115 (5 GHz U-NII-1) works for a dual-band client --
+	-- they ignore the band restriction and answer for 2.4 GHz too -- but a
+	-- 2.4 GHz-only station answers it with report mode 0x02, "incapable", and
+	-- an all-zero BSSID, which is nothing at all. So a station on a 2.4 GHz
+	-- BSS is asked for class 81 (2.4 GHz, channels 1-13) instead; the band
+	-- comes from that BSS's live channel.
+	local op_class = 115
+	local ok_c, caps = pcall(M._sysinfo.radio_caps, c.ifname)
+	if ok_c and type(caps) == "table" and caps.channel and caps.channel <= 14 then
+		op_class = 81
+	end
+	pcall(rrm.request, c.ifname, c.sta, {op_class = op_class})
 	return true
 end
 
