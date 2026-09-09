@@ -109,6 +109,8 @@ M._spectrum_cache = {}
 -- cpu_percent() delta-samples /proc/stat between calls (first sample for a
 -- given MAC has no prior delta, so throughput is reported as 0 that time).
 M._sta_stats_cache = {}
+-- ...and how long an unseen station stays in it. See the sweep in build_json.
+M.STA_STATS_FORGET_AFTER = 600
 
 -- Injectable: override in tests to control elapsed time deterministically
 -- (used by the sta_table throughput delta-sample below).
@@ -1232,6 +1234,17 @@ function M.build_json(st, cfg, ufhw)
 				vap.cu_self_rx = cu.cu_self_rx
 				vap.cu_self_tx = cu.cu_self_tx
 				vap.cu_interf  = cu.cu_interf
+			end
+		end
+		-- Forget stations not seen for ten minutes. Each entry is tiny, but
+		-- the table is keyed by CLIENT MAC and was never emptied, so on a
+		-- daemon that runs for months in a place with transient clients it
+		-- only ever grew. A station back after that long is a fresh
+		-- association, and the 0-throughput first sample is the honest figure
+		-- for it anyway. Assigning nil during pairs() is defined behaviour.
+		for mac, prev in pairs(M._sta_stats_cache) do
+			if now - prev.time > M.STA_STATS_FORGET_AFTER then
+				M._sta_stats_cache[mac] = nil
 			end
 		end
 	end

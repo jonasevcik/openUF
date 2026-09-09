@@ -335,6 +335,40 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: a host not seen for an hour is forgotten, so the cache is bounded",
+		fn = function()
+			-- _mac_first_seen is keyed by "<source> mac" and was never emptied
+			-- -- on a daemon that runs for months in a place with transient
+			-- clients it only ever grew. A host back after the forget window
+			-- gets a fresh uptime, which is what a real switch reports for it
+			-- as well.
+			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+			local orig_time = sysinfo._time
+
+			sysinfo._time = function() return 1000 end
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 1000), 1000, "first sighting")
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:02", 1000), 1000, "and a second host")
+
+			-- Still inside the window: both remembered, and the first-seen
+			-- stamp of the one that is still around is unchanged.
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 1000 + 3599), 1000,
+				"a host seen again keeps its original first-seen stamp")
+
+			-- Past it: the host that stopped being seen is dropped, and comes
+			-- back as new if it ever returns.
+			local later = 1000 + 3601 + 3601
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", later), later,
+				"a host back after the window is a fresh sighting")
+			assert_nil(sysinfo._mac_first_seen["eth1 aa:bb:cc:dd:ee:02"],
+				"and the one that never came back is gone from the cache")
+			assert_nil(sysinfo._mac_last_seen["eth1 aa:bb:cc:dd:ee:02"],
+				"from both halves of it")
+
+			sysinfo._time = orig_time
+			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+		end
+	},
+	{
 		-- Both swconfig fixtures are verbatim captures from the two real APs
 		-- (MACs anonymized): an AR9344 that exposes per-port MIB counters and
 		-- an AR8327 that answers "mib: ???" because its poll interval is 0.

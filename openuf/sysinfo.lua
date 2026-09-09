@@ -488,7 +488,37 @@ end
 -- for a learned MAC).
 -- Injectable/resettable by tests, same pattern as M._prev_cpu above.
 M._mac_first_seen = {}
+M._mac_last_seen  = {}
 M._time = os.time
+
+-- How long a host stays remembered after it was last seen. See M._note_seen.
+M.MAC_FORGET_AFTER = 3600
+
+-- Record that key was seen now; returns when it was FIRST seen. Also the only
+-- place the two tables ever shrink: a host not seen for an hour is forgotten,
+-- so a daemon that runs for months does not keep every MAC that ever crossed
+-- the bridge.
+--
+-- The sweep runs BEFORE this sighting is recorded, so it applies to `key`
+-- itself as well: a host back after an hour away starts a fresh uptime instead
+-- of reporting the wall-clock time since it was first seen, which for a host
+-- that was gone for most of it is not an uptime at all. That is also what a
+-- real switch reports for a re-learned MAC.
+function M._note_seen(key, now)
+	for k, last in pairs(M._mac_last_seen) do
+		if now - last > M.MAC_FORGET_AFTER then
+			M._mac_last_seen[k]  = nil
+			M._mac_first_seen[k] = nil
+		end
+	end
+	local first = M._mac_first_seen[key]
+	if not first then
+		first = now
+		M._mac_first_seen[key] = now
+	end
+	M._mac_last_seen[key] = now
+	return first
+end
 
 -- MAC -> IP from /proc/net/arp (the header line has no MAC and is skipped by
 -- the pattern itself). Shared by both wired-host sources below.
@@ -559,12 +589,7 @@ function M.mac_table(ifname)
 	local now = M._time()
 	local hosts = {}
 	for _, mac in ipairs(macs) do
-		local key = ifname .. " " .. mac
-		local first_seen = M._mac_first_seen[key]
-		if not first_seen then
-			first_seen = now
-			M._mac_first_seen[key] = now
-		end
+		local first_seen = M._note_seen(ifname .. " " .. mac, now)
 		hosts[#hosts + 1] = {
 			mac      = mac,
 			ip       = ip_by_mac[mac:lower()],
@@ -769,12 +794,7 @@ function M.switch_mac_table(phys, arl)
 	local now = M._time()
 	local hosts = {}
 	for _, mac in ipairs(macs) do
-		local key = "swport" .. tostring(phys) .. " " .. mac
-		local first_seen = M._mac_first_seen[key]
-		if not first_seen then
-			first_seen = now
-			M._mac_first_seen[key] = now
-		end
+		local first_seen = M._note_seen("swport" .. tostring(phys) .. " " .. mac, now)
 		hosts[#hosts + 1] = {
 			mac      = mac,
 			ip       = ip_by_mac[mac],

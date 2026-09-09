@@ -779,6 +779,32 @@ return {
 		end
 	},
 	{
+		name = "inform json: the throughput cache forgets a station that left",
+		fn = function()
+			-- _sta_stats_cache is keyed by CLIENT MAC and was never emptied,
+			-- so on a daemon that runs for months in a place with transient
+			-- clients it only ever grew. A station back after the window is a
+			-- fresh association, and its 0-throughput first sample is honest.
+			inform._sta_stats_cache = {}
+			local orig_time = inform._time
+			inform._time = function() return 1000 end
+			build({with_uci = true, with_clients = true})   -- seeds one station
+			local seeded = 0
+			for _ in pairs(inform._sta_stats_cache) do seeded = seeded + 1 end
+			assert_eq(seeded, 2, "both connected stations are cached")
+
+			-- A later payload on which that station no longer appears.
+			inform._time = function() return 1000 + inform.STA_STATS_FORGET_AFTER + 1 end
+			build({with_uci = true})                        -- no clients this time
+			local left = 0
+			for _ in pairs(inform._sta_stats_cache) do left = left + 1 end
+			assert_eq(left, 0, "and dropped once it has been gone for the whole window")
+
+			inform._time = orig_time
+			inform._sta_stats_cache = {}
+		end
+	},
+	{
 		name = "inform json: radio_table_stats derived from survey dump",
 		fn = function()
 			local d = build({with_uci = true, with_clients = true})
