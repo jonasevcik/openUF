@@ -157,6 +157,12 @@ left in place. `wpad-basic-*` builds lack 802.11v support entirely and will erro
 with "unknown configuration item 'bss_transition'"; if you've manually installed
 a basic build, replace it with `apk add wpad-wolfssl` first.
 
+`install.sh install` also registers `/etc/openuf/` and `/opt/openuf/conf.lua` with
+`sysupgrade`, so an adopted AP stays adopted across a firmware upgrade — stock
+`sysupgrade` backs up neither, and would take the authkey and the modelmap selection with
+it. Existing entries in `/etc/sysupgrade.conf` are left alone; see
+[USAGE.md](USAGE.md) for what uninstall does to them.
+
 Installing from a git checkout instead (for contributors/dev builds) still works — `scp -r
 openuf/ install.sh root@<device>:/tmp/openuf/` and run `install.sh` from there.
 

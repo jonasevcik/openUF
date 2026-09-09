@@ -93,6 +93,15 @@ What `install.sh install` does:
   preserved, **re-running the installer is safe** — which is how you top up a dependency
   added by a later version
 - Creates `/etc/openuf/` (state directory)
+- Adds `/etc/openuf/` and `/opt/openuf/conf.lua` to `/etc/sysupgrade.conf`, so that a
+  firmware upgrade keeps them. `sysupgrade` preserves `/etc/config` and a short built-in
+  list and knows nothing about either path; without this a stock upgrade takes
+  `state.json` — mac, authkey, cfgversion, `swvlan_backup` — and the modelmap selection
+  with it, and the AP comes back unadopted, posing as a generic dualband AP the
+  controller no longer recognises. Each line is appended only if it is not already there
+  and nothing else in the file is touched, so a keep list you maintain yourself is safe.
+  The Lua tree is deliberately *not* preserved: the installer reinstalls it, and carrying
+  an old copy onto a new OpenWrt is a silent version mismatch
 - Symlinks `/opt/openuf/hook/syswrapper.sh` → `/usr/bin/syswrapper.sh`
 - Creates `/etc/init.d/openuf` with two procd service instances (announce + inform)
 - Enables and starts the service
@@ -102,6 +111,12 @@ To uninstall:
 ```sh
 sh install.sh uninstall
 ```
+
+Uninstall removes the `/opt/openuf/conf.lua` line from `/etc/sysupgrade.conf` — the file
+is gone with `/opt/openuf/` — but **keeps the `/etc/openuf/` line**. The state directory
+itself is left intact so that the authkey survives, and un-registering it would let the
+next firmware upgrade delete exactly what it is being kept for. Remove that line by hand
+if you also delete `/etc/openuf/`; leaving it costs nothing either way.
 
 ---
 
