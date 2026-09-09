@@ -2214,6 +2214,75 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: use_only_unifi_wlan never switches off a mesh or station link",
+		fn = function()
+			-- The option is about SSIDs COMPETING with the controller's on the
+			-- air. A mesh point or a station interface is a link, not a
+			-- competing SSID -- and it may be this AP's own uplink, in which
+			-- case disabling it takes the device off the network with no way
+			-- back short of a serial console.
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "mesh0", "wifi-iface")
+				cursor:set("wireless", "mesh0", "mode", "mesh")
+				cursor:set("wireless", "backhaul", "wifi-iface")
+				cursor:set("wireless", "backhaul", "mode", "sta")
+				-- An ordinary foreign SSID, and one that says so explicitly:
+				-- both are still fair game.
+				cursor:set("wireless", "theirs", "wifi-iface")
+				cursor:set("wireless", "explicit_ap", "wifi-iface")
+				cursor:set("wireless", "explicit_ap", "mode", "ap")
+
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(db.wireless.mesh0.disabled, nil, "the mesh point is left alone")
+				assert_eq(db.wireless.backhaul.disabled, nil, "and so is the station link")
+				assert_eq(db.wireless.theirs.disabled, "1", "a foreign SSID is still disabled")
+				assert_eq(db.wireless.explicit_ap.disabled, "1",
+					"including one that names mode=ap explicitly")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a mesh link openUF had already disabled is switched back on",
+		fn = function()
+			-- The other half of the exemption: a device that ran an older
+			-- openUF has the stamp on its backhaul already. Exempting it has
+			-- to repair that, not freeze it -- and it has to happen while
+			-- use_only_unifi_wlan is still ON, since that is the state the
+			-- device is in.
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "mesh0", "wifi-iface")
+				cursor:set("wireless", "mesh0", "mode", "mesh")
+				cursor:set("wireless", "mesh0", "disabled", "1")
+				cursor:set("wireless", "mesh0", "openuf_autodisabled", "1")
+
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(db.wireless.mesh0.disabled, "0", "switched back on")
+				assert_eq(db.wireless.mesh0.openuf_autodisabled, "0", "and the stamp cleared")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_vap_table does not report a mesh link as a phantom VAP",
+		fn = function()
+			-- A non-AP iface has no SSID to report and is not a BSS the
+			-- controller can provision; it went out as a nameless VAP with no
+			-- clients.
+			with_ucihelper(function()
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "mesh0", "wifi-iface")
+				cursor:set("wireless", "mesh0", "device", "radio0")
+				cursor:set("wireless", "mesh0", "mode", "mesh")
+				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil, nil, "wlan-1")
+				local vaps = ucihelper.get_vap_table()
+				assert_eq(#vaps, 1, "only the real access point is reported")
+				assert_eq(vaps[1].essid, "corp", "and it is the right one")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: a missing cfg is treated as use_only_unifi_wlan=false",
 		fn = function()
 			with_ucihelper(function(db)

@@ -446,6 +446,8 @@ When the controller pushes a config, `ucihelper.lua` applies it via OpenWrt UCI.
 
 `use_only_unifi_wlan` (default `true`) additionally sets `disabled=1` on every *other* `wifi-iface`, so the radios carry only what the controller provisioned.  openUF stamps each SSID it turns off with `openuf_autodisabled=1`; setting the option back to `false` re-enables exactly those and leaves everything else as-is, so an SSID you had disabled yourself is never switched back on.  Set it to `false` from the start to keep hand-configured SSIDs broadcasting alongside the controller's.
 
+A `wifi-iface` whose `mode` is not `ap` — an 802.11s mesh point, or a station interface — is exempt regardless. Those are *links*, not SSIDs competing on the air, and one of them may be the AP's own uplink: switching it off would take the device off the network entirely. If an earlier openUF had already stamped one, it is switched back on.
+
 Settings carried through from the controller:
 
 | Controller setting | Applied as |

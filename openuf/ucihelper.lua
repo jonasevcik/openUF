@@ -355,6 +355,15 @@ local AUTODISABLED = OPENUF_PREFIX .. "autodisabled"
 -- documented (README/USAGE) and shipped as true in conf.lua, but a missing
 -- config is treated as false: openUF should not start disabling a stranger's
 -- SSIDs just because a caller failed to thread cfg through.
+--
+-- A wifi-iface whose mode is not "ap" is EXEMPT, in both directions. This
+-- option is about SSIDs competing with the controller's on the air; a mesh
+-- point or a station interface is a LINK, not a competing SSID -- and it may
+-- well be this AP's own uplink, in which case disabling it takes the device
+-- off the network with no way back short of a serial console. An absent mode
+-- is OpenWrt's own default of "ap". An exempt section openUF had already
+-- switched off on an earlier pass (it carries the stamp) is switched back on
+-- once, so the exemption repairs the damage rather than freezing it.
 function M.set_wlan_exclusive(enabled)
 	local uci = get_uci()
 	local cursor = uci.cursor()
@@ -362,12 +371,22 @@ function M.set_wlan_exclusive(enabled)
 	cursor:foreach("wireless", "wifi-iface", function(s)
 		local name = s[".name"]
 		if name and name:sub(1, #OPENUF_PREFIX) ~= OPENUF_PREFIX then
-			targets[#targets + 1] = {name = name, disabled = s.disabled,
-				stamped = (s[AUTODISABLED] == "1")}
+			local stamped = (s[AUTODISABLED] == "1")
+			if s.mode ~= nil and s.mode ~= "ap" then
+				if stamped then
+					targets[#targets + 1] = {name = name, release = true}
+				end
+			else
+				targets[#targets + 1] = {name = name, disabled = s.disabled,
+					stamped = stamped}
+			end
 		end
 	end)
 	for _, t in ipairs(targets) do
-		if enabled then
+		if t.release then
+			cursor:set("wireless", t.name, "disabled", "0")
+			cursor:set("wireless", t.name, AUTODISABLED, "0")
+		elseif enabled then
 			if t.disabled ~= "1" then
 				cursor:set("wireless", t.name, "disabled", "1")
 				cursor:set("wireless", t.name, AUTODISABLED, "1")
@@ -1479,6 +1498,11 @@ function M.get_vap_table()
 		-- how a WLAN the controller itself disabled keeps showing up as
 		-- disabled rather than vanishing.
 		if s.disabled == "1" and not s.openuf_wlanconf_id then return end
+		-- Only access points are VAPs. A mesh point or a station interface has
+		-- no SSID to report and is not a BSS the controller can provision; it
+		-- went out as a nameless phantom VAP with no clients. An absent mode
+		-- is OpenWrt's default of "ap".
+		if s.mode ~= nil and s.mode ~= "ap" then return end
 		local radio = radio_by_name[s.device]
 		-- THIS VAP's netdev, not the radio's first one. Two SSIDs on a radio
 		-- have two BSSIDs -- netifd derives the second from the first with the
