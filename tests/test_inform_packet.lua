@@ -2841,4 +2841,101 @@ return {
 				"locked since reloaded state is adopted")
 		end
 	},
+	{
+		name = "inform: a heartbeat that raises costs one cycle, not the daemon",
+		fn = function()
+			-- Regression test: the loop body called build_json, build_packet
+			-- and handle_response unprotected. build_json shells out to a
+			-- dozen tools and does arithmetic on their output -- one nil field
+			-- once took the whole daemon down (`nil + noise`, from a radio
+			-- with the minrssi flag set and no threshold) -- and procd turned
+			-- that into a respawn every five seconds, reporting no statistics
+			-- and logging nothing but a traceback.
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			local logged = {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_packet = function() return "pkt" end
+			inform.http_post = function() return "body" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.handle_response = function() return false end
+
+			local ctx = {interval = 10, backoff = 10}
+			local st = {inform_url = "http://unifi:8080/inform"}
+
+			inform.build_json = function() error("boom: a nil crept into a stat") end
+			local wait = inform._tick(st, nil, nil, ctx)
+			assert_eq(wait, 10, "a failed build_json waits one interval and comes back")
+
+			inform.build_json = function() return "{}" end
+			inform.handle_response = function() error("boom in dispatch") end
+			assert_eq(inform._tick(st, nil, nil, ctx), 10,
+				"a failed handle_response is survivable too")
+
+			io.stderr = orig.stderr
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm
+
+			local out = table.concat(logged)
+			assert_true(out:find("build_json failed", 1, true) ~= nil,
+				"and the log names the stage that failed")
+			assert_true(out:find("handle_response failed", 1, true) ~= nil,
+				"for each stage")
+		end
+	},
+	{
+		name = "inform: a POST failure backs off, and a config push re-informs at once",
+		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			io.stderr = {write = function() end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.parse_packet = function() return '{"_type":"setparam"}' end
+
+			local ctx = {interval = 10, backoff = 10}
+			local st = {inform_url = "http://unifi:8080/inform"}
+
+			inform.http_post = function() return nil, "connection refused" end
+			assert_eq(inform._tick(st, nil, nil, ctx), 20, "backoff doubles")
+			assert_eq(inform._tick(st, nil, nil, ctx), 40, "and doubles again")
+			assert_eq(inform._tick(st, nil, nil, ctx), 60, "capped at 60s")
+			assert_eq(inform._tick(st, nil, nil, ctx), 60, "and stays there")
+
+			inform.http_post = function() return "body" end
+			inform.handle_response = function() return false end
+			assert_eq(inform._tick(st, nil, nil, ctx), 10, "a success resets the backoff")
+
+			-- A real AP re-informs immediately after applying a config push,
+			-- rather than sitting out the rest of the interval.
+			inform.handle_response = function() return true end
+			assert_eq(inform._tick(st, nil, nil, ctx), 0, "an applied config informs again at once")
+
+			io.stderr = orig.stderr
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm
+		end
+	},
 }

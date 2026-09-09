@@ -3198,6 +3198,63 @@ function M._rrm_tick(cfg)
 	return true
 end
 
+-- One heartbeat: build, send, dispatch. Returns the number of seconds the
+-- caller should wait before the next one -- 0 means "again, now", the
+-- config-applied case, where a real AP re-informs immediately. ctx carries the
+-- loop's own state (interval, backoff, last_mtime) so run() is nothing but
+-- `while true do wait(_tick()) end`, and the error boundaries and the backoff
+-- can be exercised without a socket.
+--
+-- Every stage is pcall-wrapped, and that is the point of the split. build_json
+-- shells out to a dozen tools and does arithmetic on their output; one nil in
+-- one field takes the whole daemon down, and procd's respawn turns that into a
+-- crash loop every five seconds that reports no statistics and logs nothing
+-- beyond a traceback. A bad cycle now costs one heartbeat and one log line,
+-- and the next cycle gets another go.
+function M._tick(st, cfg, ufhw, ctx)
+	ctx.interval = ctx.interval or 10
+	ctx.backoff  = ctx.backoff  or ctx.interval
+
+	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
+	-- Before build_json, so anything a client reported since the last cycle
+	-- rides out on THIS inform rather than waiting for the next.
+	pcall(M._rrm_tick, cfg)
+
+	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
+	if not ok_b then
+		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")
+		return ctx.interval
+	end
+
+	local ok_p, pkt = pcall(M.build_packet, json_str, st)  -- use_gcm read from st.use_gcm
+	if not ok_p then
+		io.stderr:write("inform: build_packet failed: " .. tostring(pkt) .. "\n")
+		return ctx.interval
+	end
+
+	local body, err = M.http_post(st.inform_url, pkt)
+	if not body then
+		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
+		ctx.backoff = math.min(ctx.backoff * 2, 60)
+		return ctx.backoff
+	end
+	ctx.backoff = ctx.interval
+
+	local parse_ok, json_body = pcall(M.parse_packet, body, st)
+	if not parse_ok then
+		io.stderr:write("inform: parse error: " .. tostring(json_body) .. "\n")
+		return ctx.interval
+	end
+
+	local ok_h, applied = pcall(M.handle_response, json_body, st, cfg)
+	if not ok_h then
+		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
+		return ctx.interval
+	end
+	if applied then return 0 end
+	return ctx.interval
+end
+
 function M.run(cfg, ufhw)
 	local st = state.load()
 	-- The MAC persisted by the previous run, before _populate_net_info
@@ -3246,37 +3303,15 @@ function M.run(cfg, ufhw)
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
 
-	local socket   = require("socket")
-	local interval = 10
-	local backoff  = interval
-	local last_mtime = M._state_mtime(M._state._state_file)
-
+	local socket = require("socket")
+	local ctx = {
+		interval   = 10,
+		backoff    = 10,
+		last_mtime = M._state_mtime(M._state._state_file),
+	}
 	while true do
-		last_mtime = M._reload_if_changed(st, cfg, last_mtime)
-		-- Before build_json, so anything a client reported since the last
-		-- cycle rides out on THIS inform rather than waiting for the next.
-		pcall(M._rrm_tick, cfg)
-		local json_str = M.build_json(st, cfg, ufhw)
-		local pkt      = M.build_packet(json_str, st)  -- use_gcm read from st.use_gcm
-		local body, err = M.http_post(st.inform_url, pkt)
-
-		if not body then
-			io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
-			backoff = math.min(backoff * 2, 60)
-			socket.select(nil, nil, backoff)
-		else
-			backoff = interval
-			local parse_ok, json_body, resp_flags = pcall(M.parse_packet, body, st)
-			if parse_ok then
-				local config_applied = M.handle_response(json_body, st, cfg)
-				if not config_applied then
-					socket.select(nil, nil, interval)
-				end
-			else
-				io.stderr:write("inform: parse error: " .. tostring(json_body) .. "\n")
-				socket.select(nil, nil, interval)
-			end
-		end
+		local wait = M._tick(st, cfg, ufhw, ctx)
+		if wait > 0 then socket.select(nil, nil, wait) end
 	end
 end
 
