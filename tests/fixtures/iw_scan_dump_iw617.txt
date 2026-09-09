@@ -1,0 +1,73 @@
+BSS aa:bb:cc:dd:ee:01(on phy1-ap0)
+	last seen: 662785.042s [boottime]
+	freq: 5180.0
+	beacon interval: 100 TUs
+	capability: ESS (0x1011)
+	signal: -75.00 dBm
+	last seen: 3290 ms ago
+	Information elements from Probe Response frame:
+	SSID: NeighborNet
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+	HT operation:
+		 * primary channel: 36
+		 * secondary channel offset: above
+		 * STA channel width: any
+	VHT operation:
+		 * channel width: 1 (80 MHz)
+		 * center freq segment 1: 42
+		 * center freq segment 2: 0
+		 * VHT basic MCS set: 0xfffc
+BSS aa:bb:cc:dd:ee:02(on phy1-ap0)
+	last seen: 662754.792s [boottime]
+	freq: 2412.0
+	beacon interval: 100 TUs
+	capability: ESS Privacy (0x0411)
+	signal: -68.00 dBm
+	Information elements from Probe Response frame:
+	SSID: LegacyNet
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+	HT operation:
+		 * primary channel: 1
+		 * secondary channel offset: no secondary
+		 * STA channel width: 20 MHz
+	VHT operation:
+		 * channel width: 0 (20 or 40 MHz)
+		 * center freq segment 1: 1
+		 * center freq segment 2: 0
+BSS aa:bb:cc:dd:ee:03(on phy1-ap0)
+	last seen: 662784.100s [boottime]
+	freq: 2437.0
+	beacon interval: 100 TUs
+	capability: ESS Privacy (0x0411)
+	signal: -59.00 dBm
+	last seen: 940 ms ago
+	Information elements from Probe Response frame:
+	SSID: WideLegacy
+	WPA:	 * Version: 1
+	HT operation:
+		 * primary channel: 6
+		 * secondary channel offset: below
+		 * STA channel width: any
+BSS aa:bb:cc:dd:ee:04(on phy1-ap0)
+	last seen: 662784.900s [boottime]
+	freq: 5500.0
+	beacon interval: 100 TUs
+	capability: ESS (0x1011)
+	signal: -71.00 dBm
+	last seen: 140 ms ago
+	Information elements from Probe Response frame:
+	SSID: WideNet
+	RSN:	 * Version: 1
+	HT operation:
+		 * primary channel: 100
+		 * secondary channel offset: above
+		 * STA channel width: any
+	VHT operation:
+		 * channel width: 1 (80 MHz)
+		 * center freq segment 1: 114
+		 * center freq segment 2: 106
+		 * VHT basic MCS set: 0xfffc

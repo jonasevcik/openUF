@@ -670,6 +670,57 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: scan_table() derives width from the operation elements on iw 6.17",
+		fn = function()
+			-- The fixture is trimmed from real `iw dev ... scan` output taken
+			-- off our own AX3000T and Archer C5 (2026-09-09, MACs and SSIDs
+			-- anonymized). Both boards run iw 6.17, which prints NO
+			-- "BSS operating channel width:" summary line at all -- so every
+			-- neighbour went out at the 20 MHz default, including two real
+			-- 80 MHz APs next door.
+			with_fixtures({["/proc/uptime"] = "662790.00 1000000.00\n"},
+				{["scan dump"] = fixture("iw_scan_dump_iw617.txt")}, function()
+				local nets = {}
+				for _, n in ipairs(sysinfo.scan_table("wlan0")) do nets[n.essid] = n end
+
+				assert_eq(nets["NeighborNet"].bw, 80,
+					"VHT width field 1 with segment 2 zero is 80 MHz")
+				-- The trap this is anchored against: two lines below the VHT
+				-- element sits the HT capability line "* STA channel width:
+				-- 20 MHz". An unanchored pattern reads that 20 as a VHT width
+				-- field -- which is >= 1, so the BSS comes out as 80 MHz.
+				assert_eq(nets["LegacyNet"].bw, 20,
+					"VHT width field 0 with no secondary channel is 20 MHz")
+				assert_eq(nets["WideLegacy"].bw, 40,
+					"no VHT element at all, but a secondary channel offset, is HT40")
+				assert_eq(nets["WideNet"].bw, 160,
+					"segments 8 channels apart is the modern 160 MHz encoding")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() reads the [boottime] form of 'last seen'",
+		fn = function()
+			-- Newer iw prints the driver's CLOCK_BOOTTIME stamp, and some
+			-- entries carry ONLY that form -- seen on our own AX3000T. The
+			-- "ms ago" pattern never matched those, so their age stayed at the
+			-- 0 default and every stale neighbour was reported as seen this
+			-- instant. The controller drops anything with age >= 30 as stale,
+			-- so a wrong 0 keeps a long-gone AP in the Environment view.
+			with_fixtures({["/proc/uptime"] = "662790.00 1000000.00\n"},
+				{["scan dump"] = fixture("iw_scan_dump_iw617.txt")}, function()
+				local nets = {}
+				for _, n in ipairs(sysinfo.scan_table("wlan0")) do nets[n.essid] = n end
+				-- Only the boottime line: 662790.00 - 662754.792 = 35s.
+				assert_eq(nets["LegacyNet"].age, 35, "age comes from the boottime stamp")
+				-- Both printed: "ms ago" wins, being what the controller's own
+				-- staleness rule is written against.
+				assert_eq(nets["NeighborNet"].age, 3, "'3290 ms ago' beats the boottime stamp")
+				assert_eq(nets["WideNet"].age, 0, "'140 ms ago' floors to 0")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: scan_table() classifies Privacy-only (no RSN/WPA IE) as wep",
 		fn = function()
 			local dump = "BSS cc:cc:cc:cc:cc:cc(on wlan0)\n"

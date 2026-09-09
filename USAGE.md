@@ -714,6 +714,16 @@ nothing else — openUF never dwells off-channel behind your clients' backs. Mea
 AX3000T: 6 neighbours on a 2.4 GHz radio on ch 11, and exactly 1 on a 5 GHz radio on ch 44.
 On the Archer C5's 5 GHz radio the passive cache held **nothing at all**.
 
+Two fields in that view are read out of the beacon rather than out of a summary line,
+because `iw` 6.17 — what both boards run — prints no summary line for either:
+
+* **Ch. Width** comes from the neighbour's own HT and VHT operation elements. There is no
+  `BSS operating channel width:` line on this `iw`, so before this every neighbour was
+  reported at the 20 MHz default, two real 80 MHz APs included.
+* **Age** also accepts `last seen: <n>s [boottime]`, which some entries carry *instead of*
+  `n ms ago`. Those used to fall back to 0 — "seen this instant" — which keeps a long-gone
+  AP in the view, since the controller drops anything with age ≥ 30 as stale.
+
 openUF closes that gap the way Ubiquiti's Channel AI describes — *"neighbor reports and
 automated RRM scans"* — rather than by scanning. Every `rrm_request_interval` seconds
 (default 600) it asks **one** 802.11k-capable client for an active beacon measurement: the

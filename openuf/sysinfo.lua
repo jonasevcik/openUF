@@ -297,13 +297,14 @@ end
 -- cache here is cheap and non-disruptive enough to do on every inform,
 -- unlike a real scan).
 -- Each entry: {bssid, essid, freq, channel, signal, security, age, bw}
--- `bw` is channel width in MHz, from iw's own "BSS operating channel width:
--- N MHz" line (only present for HE/VHT-capable neighbors; confirmed via
--- `strings /usr/sbin/iw`). The controller's Environment tab's "Ch. Width"
+-- `bw` is channel width in MHz. The controller's Environment tab's "Ch. Width"
 -- column reads this field directly and renders nothing at all when it's
 -- missing (confirmed live 2026-07-14) -- default to 20 (legacy-safe, valid
--- for both bands) when a neighbor doesn't advertise it, rather than leaving
--- the column blank.
+-- for both bands) when a neighbor advertises nothing, rather than leaving the
+-- column blank. Where it comes from is described at flush() below: iw's
+-- "BSS operating channel width:" summary line where one is printed, and the
+-- operation elements themselves otherwise, because iw 6.17 -- what both our
+-- boards run -- prints no such summary line at all.
 -- `age` is seconds elapsed since last seen, from iw's own "last seen: N ms
 -- ago" line -- NOT a substitute for an absolute last_seen timestamp. The
 -- controller's rogue-AP ingestion (com.ubnt.service.aO.hhFgUVZPT, confirmed
@@ -314,14 +315,52 @@ end
 function M.scan_table(ifname)
 	if not ifname then return {} end
 	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
+	-- For the [boottime] form of "last seen" below: /proc/uptime and the
+	-- driver's stamp are both on the CLOCK_BOOTTIME axis.
+	local now_up = M.uptime()
 	local nets = {}
 	local cur = nil
 	local seen_rsn, seen_wpa, seen_privacy = false, false, false
+	-- Width evidence from the operation elements, per BSS. See flush().
+	local vht_w, vht_seg1, vht_seg2, ht_sec = nil, nil, nil, nil
 
 	local function flush()
 		if not cur then return end
 		if not cur.age then cur.age = 0 end
-		if not cur.bw then cur.bw = 20 end
+		-- Channel width. The "BSS operating channel width: N MHz" summary line
+		-- is printed by only some iw builds -- iw 6.17 prints no such line at
+		-- all, and that is what BOTH our boards run (Archer C5 on ath79 and
+		-- AX3000T on filogic, checked 2026-09-09), so every neighbour went out
+		-- as 20 MHz. Two real 80 MHz APs next door were reported as 20.
+		--
+		-- What that iw does print is the operation elements themselves:
+		--   VHT operation:  * channel width: 1 (80 MHz)
+		--                   * center freq segment 1: 42
+		--                   * center freq segment 2: 0
+		--   HT operation:   * secondary channel offset: above|below|no secondary
+		--
+		-- VHT width field 1 with a NON-ZERO segment 2 is either 160 MHz (the
+		-- two segments 8 channels apart, the modern encoding) or a
+		-- non-contiguous 80+80 (further apart, reported as its 80 MHz primary
+		-- segment, since the controller's vocabulary is 20/40/80/160). Fields
+		-- 2 and 3 are the deprecated direct encodings of the same two. Width
+		-- field 0 means "20 or 40", which the HT secondary channel offset
+		-- resolves; nothing at all means 20.
+		if not cur.bw then
+			if vht_w and vht_w >= 1 then
+				local seg2 = vht_seg2 or 0
+				if vht_w == 2 or (vht_w == 1 and seg2 > 0
+						and math.abs(seg2 - (vht_seg1 or 0)) == 8) then
+					cur.bw = 160
+				else
+					cur.bw = 80
+				end
+			elseif ht_sec == "above" or ht_sec == "below" then
+				cur.bw = 40
+			else
+				cur.bw = 20
+			end
+		end
 		if seen_rsn then cur.security = "wpa2"
 		elseif seen_wpa then cur.security = "wpa"
 		elseif seen_privacy then cur.security = "wep"
@@ -335,13 +374,37 @@ function M.scan_table(ifname)
 			flush()
 			cur = {bssid = bssid}
 			seen_rsn, seen_wpa, seen_privacy = false, false, false
+			vht_w, vht_seg1, vht_seg2, ht_sec = nil, nil, nil, nil
 		elseif cur then
+			-- Operation-element width evidence, consumed by flush(). The VHT
+			-- line is anchored on "* channel width:" so that the HT capability
+			-- line sitting two lines below it cannot match: that one reads
+			-- "* STA channel width: 20 MHz" on a 20 MHz neighbour, and an
+			-- unanchored pattern would read the 20 as a VHT width field and
+			-- report the BSS as 80 MHz.
+			local w = line:match("^%s*%*%s+channel width:%s+(%d+)")
+			if w then vht_w = tonumber(w) end
+			local s1 = line:match("center freq segment 1:%s+(%d+)")
+			if s1 then vht_seg1 = tonumber(s1) end
+			local s2 = line:match("center freq segment 2:%s+(%d+)")
+			if s2 then vht_seg2 = tonumber(s2) end
+			local sec = line:match("secondary channel offset:%s+(%a+)")
+			if sec then ht_sec = sec end
 			local freq     = line:match("freq:%s+(%d+)")
 			-- Anchored for the same reason as the station-dump copy above,
 			-- defensively: scan output carries no ack-signal lines today.
 			local signal   = line:match("^%s*signal:%s+(-?%d+)")
 			local ssid     = line:match("^\tSSID:%s?(.*)$")
 			local last_ms  = line:match("last seen:%s+(%d+) ms ago")
+			-- iw also prints the driver's BOOTTIME stamp: "last seen:
+			-- 662754.792s [boottime]". Some entries carry ONLY that form --
+			-- seen on our own AX3000T -- which the pattern above never
+			-- matched, so their age stayed at the 0 default and every such
+			-- neighbour was reported as seen this instant, however stale. The
+			-- "ms ago" line wins when both are printed for one BSS (it is what
+			-- the controller's own staleness rule is written against, and it
+			-- is printed second); this fills in when it is the only one.
+			local last_bt  = line:match("last seen:%s+([%d%.]+)s %[boottime%]")
 			local bw       = line:match("BSS operating channel width:%s+(%d+) MHz")
 			if freq then
 				cur.freq    = tonumber(freq)
@@ -349,7 +412,11 @@ function M.scan_table(ifname)
 			end
 			if signal then cur.signal = tonumber(signal) end
 			if ssid and not cur.essid then cur.essid = ssid end
-			if last_ms then cur.age = math.floor(tonumber(last_ms) / 1000) end
+			if last_ms then
+				cur.age = math.floor(tonumber(last_ms) / 1000)
+			elseif last_bt and cur.age == nil and now_up > 0 then
+				cur.age = math.max(0, math.floor(now_up - tonumber(last_bt)))
+			end
 			if bw then cur.bw = tonumber(bw) end
 			if line:find("capability:.*Privacy") then seen_privacy = true end
 			if line:find("^\tRSN:") then seen_rsn = true end
