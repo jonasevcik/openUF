@@ -897,6 +897,8 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
+| Adopted device goes Offline and the log fills with `HTTP 400` | The identity MAC changed underneath the adoption — usually `dev.conf.net.lan_cpueth` now naming a different interface. openUF says so once per streak, naming the MAC it informs as. Forget the device in the controller and re-adopt, or point `lan_cpueth` back at the interface it was adopted under |
+| Device adopts, reports ports and statistics, but no pushed WLAN is ever created | `libuci-lua` missing — every radio and WLAN read fails silently and `radio_table` goes out empty, so the controller has no radio to push onto. openUF says so at startup; `apk add libuci-lua` (or `opkg install`) and restart |
 | SSID not appearing after adoption | Check `uci show wireless`, check `loglevel` in `/var/log/openuf.log` |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
 | Wired clients reach LAN peers but not the gateway or internet, while WiFi clients on the same AP are fine (DSA boards) | The VLAN-SSID bridge shares the physical uplink with `br-lan`, so the switch's single hardware FDB learns the router's MAC against the tagged port. openUF sets `learning '0'` on that port to prevent it — check `bridge fdb show` for the router's MAC carrying `offload` on `<uplink>.<vid>` instead of the bare uplink, and confirm `network.openuf_brport<vid>` exists |

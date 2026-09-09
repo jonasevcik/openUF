@@ -3146,4 +3146,40 @@ return {
 			assert_eq(open_passes, 0, "the pass is closed even on the error path")
 		end
 	},
+	{
+		name = "inform: a streak of HTTP 400s names its likely cause once",
+		fn = function()
+			-- When lan_cpueth changes under an adopted device, every inform
+			-- afterwards arrives under a MAC the controller has no adoption
+			-- for -- rejected 400 while the old record goes Offline. Nothing
+			-- about that is visible from the device: the daemon is healthy,
+			-- the radios are up, and the log fills with anonymous 400s.
+			local orig_stderr = io.stderr
+			local logged = {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+			local st = {adopted = true, mac = "aa:bb:cc:dd:ee:ff"}
+			local cfg = {net = {lan_cpueth = "wan"}}
+			inform._warned_400 = false
+
+			assert_true(inform._warn_http_400("HTTP 400", st, cfg), "the first 400 warns")
+			assert_false(inform._warn_http_400("HTTP 400", st, cfg), "the rest of the streak is quiet")
+			local out = table.concat(logged)
+			assert_true(out:find("lan_cpueth", 1, true) ~= nil, "and it names the likely cause")
+			assert_true(out:find("aa:bb:cc:dd:ee:ff", 1, true) ~= nil, "and the MAC it informs as")
+
+			-- Not every failure, and not on an unadopted device: before
+			-- adoption a 400 means something else entirely.
+			inform._warned_400 = false
+			assert_false(inform._warn_http_400("connection refused", st, cfg),
+				"a transport failure is not this")
+			assert_false(inform._warn_http_400("HTTP 500", st, cfg), "nor is any other status")
+			assert_false(inform._warn_http_400("HTTP 400", {adopted = false}, cfg),
+				"and an unadopted device has other reasons to be refused")
+
+			io.stderr = orig_stderr
+			inform._warned_400 = false
+		end
+	},
 }

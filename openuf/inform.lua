@@ -3214,6 +3214,31 @@ end
 -- Startup-only, and deliberately not fatal: a device with no UCI binding still
 -- reports statistics usefully, and killing the daemon would lose that too.
 -- Returns true when it warned, so this is testable without running the loop.
+-- The symptom _warn_identity_change predicts, caught where it actually shows.
+-- When dev.conf.net.lan_cpueth changes under an adopted device, every inform
+-- afterwards arrives under a MAC the controller has no adoption for, so it
+-- rejects them with HTTP 400 while the old record sits there going Offline.
+-- That is invisible from the device -- the daemon is healthy, the config is
+-- right, the radios are up -- and the log just fills with anonymous 400s.
+-- _warn_identity_change needs the PREVIOUS MAC to compare against and fires at
+-- startup; this one fires on the symptom itself, once per streak, so the log
+-- names the likely cause. Returns true when it warned.
+M._warned_400 = false
+function M._warn_http_400(err, st, cfg)
+	if M._warned_400 or not (st and st.adopted) then return false end
+	if not (type(err) == "string" and err:match("^HTTP 400")) then return false end
+	M._warned_400 = true
+	io.stderr:write(string.format(
+		"openuf: the controller rejects every inform with HTTP 400 although this\n" ..
+		"openuf: device is adopted. That is what happens when the identity MAC\n" ..
+		"openuf: changed underneath an adoption: this run informs as %s off\n" ..
+		"openuf: dev.conf.net.lan_cpueth = %s. If the controller adopted a\n" ..
+		"openuf: different MAC, Forget the device there and re-adopt, or point\n" ..
+		"openuf: lan_cpueth back at the interface it was adopted under.\n",
+		tostring(st.mac), tostring(cfg and cfg.net and cfg.net.lan_cpueth)))
+	return true
+end
+
 function M._warn_missing_uci()
 	if package.loaded["uci"] then return false end
 	if pcall(require, "uci") then return false end
@@ -3380,10 +3405,12 @@ function M._tick(st, cfg, ufhw, ctx)
 	local body, err = M.http_post(st.inform_url, pkt)
 	if not body then
 		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
+		M._warn_http_400(err, st, cfg)
 		ctx.backoff = math.min(ctx.backoff * 2, 60)
 		return ctx.backoff
 	end
 	ctx.backoff = ctx.interval
+	M._warned_400 = false
 
 	local parse_ok, json_body = pcall(M.parse_packet, body, st)
 	if not parse_ok then
