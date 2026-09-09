@@ -7,8 +7,10 @@
 openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi U6-InWall** (or other UniFi AP models) to a UniFi Network Application controller.  The controller can then adopt the device, push SSID and network configuration, and display live client and radio statistics — all without genuine Ubiquiti hardware.
 
 <p align="center">
-  <img src="docs/img/unifi-topology.jpg" alt="UniFi topology view: a real Cloud Gateway Ultra with two openUF access points below it" width="620">
+  <img src="docs/img/unifi-topology.jpg" alt="UniFi topology view: a real Cloud Gateway Ultra with two openUF access points below it, carrying the network's 20 wired and wireless clients">
 </p>
+
+<p align="center"><em>The controller's topology view: two openUF access points under a real UniFi Cloud Gateway Ultra, and all 20 clients on the network, 18 of them behind the openUF APs. Click for full resolution.</em></p>
 
 <table>
 <tr>
