@@ -135,4 +135,43 @@ return {
 			assert_eq(st.authkey, state.DEFAULT_KEY,        "authkey reset to default")
 		end
 	},
+	{
+		name = "syswrapper: conf.lua's state_file is honoured, so all three processes agree",
+		fn = function()
+			-- The option was documented for years and read by nothing: every
+			-- entry point used state.lua's hardcoded default, so a device that
+			-- set it had inform.lua writing one file and syswrapper's
+			-- SSH set-adopt writing another. conf.lua cannot be dofile()d from
+			-- this hook (it dofile()s its modelmap by a path relative to
+			-- /opt/openuf, and the controller's SSH session lands anywhere),
+			-- so the one assignment line is read as text.
+			local dir = "/tmp/openuf_test_conf_" .. tostring(os.time()) .. "/"
+			os.execute("mkdir -p '" .. dir .. "'")
+			local f = io.open(dir .. "conf.lua", "w")
+			f:write("config = {\n")
+			f:write("\t-- state_file = \"/decoy/commented-out.json\"\n")
+			f:write("\tinform_url = \"http://unifi:8080/inform\",\n")
+			f:write("\tstate_file = \"/srv/openuf/state.json\",\n")
+			f:write("}\n")
+			f:close()
+			local got = sw._conf_state_file(dir)
+			os.execute("rm -rf '" .. dir .. "'")
+			assert_eq(got, "/srv/openuf/state.json", "the live assignment is read")
+		end
+	},
+	{
+		name = "syswrapper: a conf.lua without state_file leaves the default alone",
+		fn = function()
+			local dir = "/tmp/openuf_test_conf2_" .. tostring(os.time()) .. "/"
+			os.execute("mkdir -p '" .. dir .. "'")
+			local f = io.open(dir .. "conf.lua", "w")
+			f:write('config = {\n\tinform_url = "http://unifi:8080/inform",\n}\n')
+			f:close()
+			local got = sw._conf_state_file(dir)
+			os.execute("rm -rf '" .. dir .. "'")
+			assert_nil(got, "no option, no override")
+			assert_nil(sw._conf_state_file("/nonexistent-dir-openuf/"),
+				"no conf.lua at all is not an error either")
+		end
+	},
 }

@@ -17,6 +17,26 @@
 
 local state
 
+-- conf.lua's state_file option, read as TEXT from the conf.lua next to the
+-- state.lua that was found. conf.lua cannot simply be dofile()d from here: it
+-- dofile()s its modelmap by a path relative to /opt/openuf, and this hook runs
+-- from wherever the controller's SSH session happens to land. One uncommented
+-- assignment line is all that is needed -- the same approach install.sh takes
+-- for inform_url. inform.lua and announce.lua honour the option too, so the
+-- three processes that touch state.json agree on where it is; before this none
+-- of them did and the option was documentation only.
+local function conf_state_file(dir)
+	local f = io.open(dir .. "conf.lua", "r")
+	if not f then return nil end
+	local src = f:read("*a")
+	f:close()
+	for line in src:gmatch("[^\n]+") do
+		local v = line:match('^%s*state_file%s*=%s*"([^"]+)"')
+		if v then return v end
+	end
+	return nil
+end
+
 -- Allow the state module path to be injected for testing
 local function load_state()
 	if state then return state end
@@ -24,7 +44,13 @@ local function load_state()
 	local paths = {"state.lua", "openuf/state.lua", "/opt/openuf/state.lua"}
 	for _, p in ipairs(paths) do
 		local f = io.open(p, "r")
-		if f then f:close(); state = dofile(p); return state end
+		if f then
+			f:close()
+			state = dofile(p)
+			local sf = conf_state_file(p:match("^(.*/)") or "")
+			if sf then state._state_file = sf end
+			return state
+		end
 	end
 	error("syswrapper: cannot find state.lua")
 end
@@ -132,4 +158,5 @@ return {
 	is_hex32 = is_hex32,
 	is_url   = is_url,
 	_set_state = function(s) state = s end,
+	_conf_state_file = conf_state_file,
 }

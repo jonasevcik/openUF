@@ -389,7 +389,18 @@ whether `--bootstrap-adopt` is passed to it.
 
 ## 5. State file
 
-Persistent state is stored at `/etc/openuf/state.json`:
+Persistent state is stored at `/etc/openuf/state.json` — or wherever
+`conf.lua`'s `state_file` points, which the inform daemon, the L2 broadcaster
+and `syswrapper.sh` all read, so all three agree on one file. Change it before
+adoption: moving it afterwards leaves the authkey behind and the controller
+stops recognising the device.
+
+It is written through a sibling `.tmp` and renamed into place, so an
+interrupted write can never leave a half-file behind. That matters because a
+`state.json` that will not parse is read as "start from defaults" — the device
+comes back up unadopted, with the well-known key. If that ever happens it is
+announced on stderr rather than passed off as a fresh install.
+
 
 ```json
 {

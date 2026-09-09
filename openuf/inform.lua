@@ -3289,6 +3289,14 @@ if not OPENUF_TEST_MODE then
 			if not ok2 then dofile("openuf/lib/lib.lua") end
 		end
 		dofile("conf.lua")
+		-- conf.lua's state_file was documented as THE state path and read by
+		-- nothing: every entry point used state.lua's hardcoded default, so
+		-- setting it moved no file and only made the three processes that
+		-- touch state.json disagree about where it is. announce.lua and
+		-- hook/syswrapper.lua honour it the same way.
+		if config and type(config.state_file) == "string" and config.state_file ~= "" then
+			M._state._state_file = config.state_file
+		end
 		local ufhw = {uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
 		-- config (debug_dump_file, state_file, ...) is a separate global set by
 		-- conf.lua, not a field of dev.conf -- merge it in under .config so
