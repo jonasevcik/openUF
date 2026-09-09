@@ -520,12 +520,22 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	-- into vap_table, and simply never provisioned. Hyphens are common in
 	-- SSIDs, so this was a wide hole.
 	--
-	-- Two SSIDs differing only in punctuation ("a-b" and "a_b") now collapse
-	-- to one section, which is the pre-existing behaviour for every other
-	-- punctuation character (a space already did it) and is preferable to a
-	-- name the config layer throws away.
+	-- Sanitizing is lossy, and that loss used to collapse WLANs: "Guest WiFi",
+	-- "Guest-WiFi" and "Guest_WiFi" all became openuf_radio0_Guest_WiFi, so
+	-- two of them on one radio shared a section and the second silently
+	-- overwrote the first -- the same failure the per-radio keying above
+	-- exists to prevent, one level down. When the name had to be ALTERED at
+	-- all, a short hash of the original keeps them apart; a name that needed
+	-- no alteration keeps the section name it has always had, so nothing
+	-- already deployed is renamed. (apply_config wlan_clear()s every openuf_
+	-- section before rebuilding them, so a name that does change leaves
+	-- nothing stale behind either.)
+	local safe_ssid = ssid:gsub("[^%w_]", "_")
+	if safe_ssid ~= ssid then
+		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
+	end
 	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_")
-		.. "_" .. ssid:gsub("[^%w_]", "_")
+		.. "_" .. safe_ssid
 	local enc = SECURITY_MAP[security] or "psk2"
 	cursor:set("wireless", section_name, "wifi-iface")
 	cursor:set("wireless", section_name, "device", radio)

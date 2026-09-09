@@ -2813,4 +2813,43 @@ return {
 			end)
 		end
 	},
+	{
+		name = "ucihelper: two SSIDs differing only in punctuation get two sections",
+		fn = function()
+			-- A UCI section name may contain only [A-Za-z0-9_], so the SSID is
+			-- sanitized into one -- and that is lossy: "Guest WiFi",
+			-- "Guest-WiFi" and "Guest_WiFi" all became
+			-- openuf_radio0_Guest_WiFi. Two of them on one radio shared a
+			-- section and the second silently overwrote the first, which is
+			-- the same collapse the per-radio keying exists to prevent, one
+			-- level down.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.wlan_add("radio0", "Guest WiFi", "wpa2", "hunter22", nil, nil, "wlan-1")
+				ucihelper.wlan_add("radio0", "Guest-WiFi", "wpa2", "hunter22", nil, nil, "wlan-2")
+
+				local found = {}
+				for name, sec in pairs(db.wireless or {}) do
+					if type(sec) == "table" and sec.ssid then found[sec.ssid] = name end
+				end
+				assert_eq(found["Guest WiFi"] ~= nil, true, "the first SSID survives")
+				assert_eq(found["Guest-WiFi"] ~= nil, true, "and so does the second")
+				assert_true(found["Guest WiFi"] ~= found["Guest-WiFi"],
+					"in two DIFFERENT sections")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an SSID needing no sanitizing keeps the section name it always had",
+		fn = function()
+			-- The suffix is added only when the name was ALTERED, so nothing
+			-- already deployed is renamed by this.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil, nil, "wlan-1")
+				assert_true(db.wireless.openuf_radio0_corp ~= nil,
+					"a clean SSID is still openuf_<radio>_<ssid>")
+			end)
+		end
+	},
 }

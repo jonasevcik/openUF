@@ -1804,8 +1804,13 @@ return {
 
 			-- The hyphen is sanitized to "_": a UCI section name may only
 			-- contain [A-Za-z0-9_], and libuci discards anything else without
-			-- reporting an error. Bracket syntax, not a dotted key.
-			local s = db.wireless and db.wireless["openuf_radio0_openuf_test"]
+			-- reporting an error. Because the name had to be altered, a short
+			-- hash of the ORIGINAL SSID is appended, so two SSIDs differing
+			-- only in punctuation cannot collapse onto one section.
+			-- Bracket syntax, not a dotted key.
+			local section = "openuf_radio0_openuf_test_"
+				.. ucihelper.derive_mobility_domain("openuf-test")
+			local s = db.wireless and db.wireless[section]
 			assert_true(s ~= nil, "vap section created from a real system_cfg blob")
 			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
 			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")

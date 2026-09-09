@@ -511,12 +511,16 @@ shows the width, which was right) and visible only in `iw dev`. An explicit
 
 > **SSID punctuation is sanitized into the UCI section name.** A UCI section name may
 > contain only `[A-Za-z0-9_]`, so an SSID of `Guest-WiFi` becomes the section
-> `openuf_radio0_Guest_WiFi` — the SSID *itself* is stored and broadcast unchanged. This
-> matters because libuci enforces the rule **silently**: `set()` returns true, `commit()`
-> returns true, and a section whose name contains anything else is discarded before it
-> reaches `/etc/config`. An unsanitized character therefore costs the entire WLAN with
-> nothing logged anywhere. Two SSIDs differing only in punctuation (`a-b` and `a_b`) share
-> one section, which has always been true of spaces.
+> `openuf_radio0_Guest_WiFi_<hash>` — the SSID *itself* is stored and broadcast unchanged.
+> This matters because libuci enforces the rule **silently**: `set()` returns true,
+> `commit()` returns true, and a section whose name contains anything else is discarded
+> before it reaches `/etc/config`. An unsanitized character therefore costs the entire WLAN
+> with nothing logged anywhere.
+>
+> The `<hash>` is four hex digits derived from the *original* SSID, and is appended only
+> when the name had to be altered at all — `corp` stays `openuf_radio0_corp`. Without it,
+> two SSIDs differing only in punctuation (`Guest WiFi` and `Guest-WiFi`) sanitized onto
+> one section and the second silently overwrote the first.
 
 **Fast Roaming (802.11r) and the `ft_psk_generate_local` trap.** openUF sets
 `ieee80211r`, a `mobility_domain` derived from the SSID (so every AP computes the same one
