@@ -114,6 +114,17 @@ case "$1" in
 		SYSUPGRADE_CONF=/etc/sysupgrade.conf
 		for keep in "$STATE_DIR/" "$INSTALL_DIR/conf.lua"; do
 			if ! grep -qxF "$keep" "$SYSUPGRADE_CONF" 2>/dev/null; then
+				# A hand-edited file need not end in a newline, and
+				# appending straight onto one that does not splices our
+				# path onto the user's last line: their entry is
+				# destroyed and ours is never registered.  `tail -c1` is
+				# empty exactly when the file already ends in a newline
+				# (command substitution strips it), so this terminates
+				# the last line only when it needs it.
+				if [ -s "$SYSUPGRADE_CONF" ] \
+					&& [ -n "$(tail -c1 "$SYSUPGRADE_CONF" 2>/dev/null)" ]; then
+					echo >> "$SYSUPGRADE_CONF"
+				fi
 				echo "$keep" >> "$SYSUPGRADE_CONF"
 				echo "Registered $keep with sysupgrade (survives a firmware upgrade)."
 			fi
