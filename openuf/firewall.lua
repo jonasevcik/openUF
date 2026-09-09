@@ -32,6 +32,14 @@ M._exec = function(cmd) return os.execute(cmd) end
 
 local NFT_TABLE = "bridge openuf"
 
+-- Exactly "aa:bb:cc:dd:ee:ff". Every MAC below is spliced into a shell command
+-- line; the list comes from the controller (block-sta) by way of state.json,
+-- which is also hand-editable, so this module refuses anything else itself
+-- rather than trusting the caller to have.
+local function is_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+
 -- Rebuild the nftables blocklist to exactly match blocked_macs (a list of
 -- MAC address strings). Safe to call with an empty list (leaves an empty,
 -- harmless table+set+chain in place) and safe to call repeatedly (each call
@@ -41,7 +49,11 @@ function M.reconcile(blocked_macs)
 	M._exec("nft add table " .. NFT_TABLE)
 	M._exec("nft add set " .. NFT_TABLE .. " blocked_macs '{ type ether_addr; }'")
 	for _, mac in ipairs(blocked_macs or {}) do
-		M._exec("nft add element " .. NFT_TABLE .. " blocked_macs '{ " .. mac .. " }' 2>/dev/null")
+		if is_mac(mac) then
+			M._exec("nft add element " .. NFT_TABLE .. " blocked_macs '{ " .. mac .. " }' 2>/dev/null")
+		else
+			io.stderr:write(("firewall: ignoring malformed blocked MAC %q\n"):format(tostring(mac)))
+		end
 	end
 	M._exec("nft add chain " .. NFT_TABLE .. " block '{ type filter hook forward priority 0; }'")
 	M._exec("nft add rule " .. NFT_TABLE .. " block ether saddr @blocked_macs drop")
@@ -57,6 +69,7 @@ end
 -- ever associated to one radio at a time, so every other call here is
 -- expected to (harmlessly) fail to find it.
 function M.deauth(mac, ifnames)
+	if not is_mac(mac) then return false end
 	for _, ifname in ipairs(ifnames or {}) do
 		M._exec("hostapd_cli -i " .. ifname .. " deauthenticate " .. mac .. " 2>/dev/null")
 	end

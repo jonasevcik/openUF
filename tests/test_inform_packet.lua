@@ -2975,4 +2975,60 @@ return {
 			io.stderr = orig_stderr
 		end
 	},
+	{
+		name = "inform packet: a malformed IP Settings push is refused before it is recorded",
+		fn = function()
+			-- The order matters as much as the check. With the state record
+			-- written first, a refused apply still left ip_mode=static and a
+			-- bogus static_ip behind -- which the DHCP-revert logic then acts
+			-- on, flushing the interface on the next "still DHCP" push.
+			local st = sample_state()
+			local cmds = {}
+			local orig_exec, orig_stderr = inform._netconfig._exec, io.stderr
+			inform._netconfig._exec = function(cmd) cmds[#cmds + 1] = cmd; return true end
+			io.stderr = {write = function() end}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50; reboot\\n'
+				.. 'netconf.1.netmask=255.255.255.0\\nroute.1.gateway=172.19.0.1\\n"}'
+			inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}})
+			inform._netconfig._exec, io.stderr = orig_exec, orig_stderr
+
+			assert_eq(#cmds, 0, "nothing is run")
+			assert_nil(st.ip_mode, "and nothing is recorded either")
+			assert_nil(st.static_ip, "no static address is left behind")
+		end
+	},
+	{
+		name = "inform packet: malformed MACs are dropped from the ACL and blocker lists",
+		fn = function()
+			-- Both lists end up inside a command line or a hostapd-parsed UCI
+			-- list. The controller's UI cannot produce a malformed entry, but
+			-- before adoption the inform channel is plain HTTP under the
+			-- well-known key, so the parser is the boundary that has to hold.
+			local orig_stderr = io.stderr
+			io.stderr = {write = function() end}
+			local _, vap_table = inform._parse_wifi_system_cfg(table.concat({
+				"aaa.1.ssid=corp", "aaa.1.wpa=2",
+				"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"wireless.1.bcfilt.status=enabled",
+				"wireless.1.bcfilt.1.mac=02:11:22:33:44:55",
+				"wireless.1.bcfilt.1.status=enabled",
+				"wireless.1.bcfilt.2.mac=02:11:22:33:44:66 }; touch /tmp/pwned; echo '{ 1",
+				"wireless.1.bcfilt.2.status=enabled",
+				"macacl.status=enabled",
+				"macacl.1.devname=ath0", "macacl.1.status=enabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
+				"macacl.1.acl.1.mac=02:11:22:33:44:55", "macacl.1.acl.1.status=enabled",
+				"macacl.1.acl.2.mac=not-a-mac", "macacl.1.acl.2.status=enabled",
+			}, "\n") .. "\n")
+			io.stderr = orig_stderr
+
+			local vap = vap_table[1]
+			assert_eq(#vap.bcfilt_macs, 1, "only the well-formed blocker MAC survives")
+			assert_eq(vap.bcfilt_macs[1], "02:11:22:33:44:55", "and it is the right one")
+			assert_eq(vap.mac_filter_policy, "allow", "the ACL is still parsed")
+			assert_eq(#vap.mac_filter_list, 1, "with only the well-formed entry")
+			assert_eq(vap.mac_filter_list[1], "02:11:22:33:44:55", "and it is the right one")
+		end
+	},
 }

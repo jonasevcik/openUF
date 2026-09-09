@@ -36,6 +36,10 @@ local function is_ipv4(s)
 	end
 	return true
 end
+-- Exported so inform.lua can refuse a malformed push before RECORDING it in
+-- state.json, not only before running it.
+M.is_ipv4 = is_ipv4
+
 
 -- Convert a dotted-quad netmask ("255.255.255.0") to a CIDR prefix length.
 -- Returns 24 (a common default) if netmask is nil/unparseable.
@@ -81,6 +85,15 @@ end
 -- dns: optional array of nameserver IPs, applied via apply_dns().
 function M.apply_static(iface, ip, netmask, gateway, dns)
 	if not iface or not ip or ip == "0.0.0.0" then return false end
+	-- Same rule as apply_dns, for the same reason: ip and gateway come off the
+	-- wire and go into a command line, and before adoption that wire is plain
+	-- HTTP under the well-known key. Refused whole rather than half-applied --
+	-- an address with no route is not what was asked for. (The netmask only
+	-- ever reaches the command as a digit count.)
+	if not is_ipv4(ip) then return false end
+	if gateway and gateway ~= "" and gateway ~= "0.0.0.0" and not is_ipv4(gateway) then
+		return false
+	end
 	local prefix = M.netmask_to_prefix(netmask)
 	M._exec(string.format("ip addr flush dev %s 2>/dev/null", iface))
 	M._exec(string.format("ip addr add %s/%d dev %s 2>/dev/null", ip, prefix, iface))

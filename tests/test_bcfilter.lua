@@ -186,4 +186,23 @@ return {
 			end)
 		end
 	},
+	{
+		name = "bcfilter: a malformed allow-list MAC never reaches the nft command line",
+		fn = function()
+			local all = ""
+			local logged = with_stderr(function()
+				with_bcfilter(function(cmds)
+					bcfilter.reconcile({{ifname = "wlan0", macs = {
+						"aa:bb:cc:dd:ee:ff",
+						"aa:bb:cc:dd:ee:ff }; touch /tmp/pwned; nft add element x y '{ 1",
+						"",
+					}}})
+					all = table.concat(cmds, "\n")
+				end)
+			end)
+			assert_true(all:find("aa:bb:cc:dd:ee:ff", 1, true) ~= nil, "the real MAC is added")
+			assert_true(all:find("touch", 1, true) == nil, "the injected command never runs")
+			assert_true(logged:find("malformed") ~= nil, "and the drop is logged")
+		end
+	},
 }

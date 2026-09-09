@@ -70,6 +70,12 @@ end
 
 local NFT_TABLE = "bridge openuf_bcfilt"
 
+-- Exactly "aa:bb:cc:dd:ee:ff": every allow-list entry is spliced into an nft
+-- command line, so the shape is enforced here as well as at the parser.
+local function is_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+
 -- Rebuild the filter to exactly match rules, a list of
 -- {ifname = "wlan0", macs = {"aa:bb:..", ...}} entries -- one per VAP that has
 -- the control enabled. A VAP with an empty allow-list still belongs here: that
@@ -92,8 +98,13 @@ function M.reconcile(rules)
 			M._exec("nft add set " .. NFT_TABLE .. " " .. set ..
 				" '{ type ether_addr; }'")
 			for _, mac in ipairs(rule.macs or {}) do
-				M._exec("nft add element " .. NFT_TABLE .. " " .. set ..
-					" '{ " .. mac .. " }' 2>/dev/null")
+				if is_mac(mac) then
+					M._exec("nft add element " .. NFT_TABLE .. " " .. set ..
+						" '{ " .. mac .. " }' 2>/dev/null")
+				else
+					io.stderr:write(("bcfilter: ignoring malformed MAC %q\n")
+						:format(tostring(mac)))
+				end
 			end
 			-- Matches frames leaving via this VAP (the LAN->WLAN direction)
 			-- that are group-addressed and not from an allow-listed sender.

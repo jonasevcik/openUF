@@ -152,4 +152,28 @@ return {
 			end)
 		end
 	},
+	{
+		name = "netconfig: apply_static refuses a malformed address rather than half-applying",
+		fn = function()
+			-- ip and gateway come off the wire and go into an `ip addr` /
+			-- `ip route` command line -- and before adoption that wire is
+			-- plain HTTP under the well-known default key. apply_dns already
+			-- had this rule; the address half did not. Refused WHOLE: an
+			-- address with no route is not what was asked for.
+			local orig = netconfig._exec
+			local cmds = {}
+			netconfig._exec = function(c) cmds[#cmds + 1] = c; return true end
+
+			assert_false(netconfig.apply_static("br-lan", "10.0.0.5; reboot", "255.255.255.0", "10.0.0.1"),
+				"an injected command in the address is refused")
+			assert_false(netconfig.apply_static("br-lan", "10.0.0.5", "255.255.255.0", "10.0.0.1; reboot"),
+				"and so is one in the gateway")
+			assert_eq(#cmds, 0, "and neither ran anything at all")
+
+			assert_true(netconfig.apply_static("br-lan", "10.0.0.5", "255.255.255.0", "10.0.0.1"),
+				"a well-formed push still applies")
+			assert_true(#cmds > 0, "and does run")
+			netconfig._exec = orig
+		end
+	},
 }

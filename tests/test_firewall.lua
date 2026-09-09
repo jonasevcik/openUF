@@ -81,4 +81,35 @@ return {
 			end)
 		end
 	},
+	{
+		name = "firewall: a malformed MAC never reaches the nft command line",
+		fn = function()
+			-- blocked_stas comes from the controller by way of state.json,
+			-- which is hand-editable too, and every entry is spliced straight
+			-- into a shell command. Before adoption the inform channel is
+			-- plain HTTP under the well-known default key, so a forged
+			-- block-sta is within reach of anyone on the path.
+			local orig_exec, orig_stderr = firewall._exec, io.stderr
+			local cmds, logged = {}, {}
+			firewall._exec = function(c) cmds[#cmds + 1] = c; return true end
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+			firewall.reconcile({
+				"aa:bb:cc:dd:ee:ff",
+				"aa:bb:cc:dd:ee:ff }; touch /tmp/pwned; nft add element x y '{ 1",
+				"not-a-mac",
+			})
+			local ok_deauth = firewall.deauth("$(id)", {"wlan0"})
+			firewall._exec, io.stderr = orig_exec, orig_stderr
+
+			local all = table.concat(cmds, "\n")
+			assert_true(all:find("aa:bb:cc:dd:ee:ff", 1, true) ~= nil, "the real MAC is added")
+			assert_true(all:find("touch", 1, true) == nil, "the injected command never runs")
+			assert_true(all:find("not%-a%-mac") == nil, "and neither does the junk entry")
+			assert_true(all:find("hostapd_cli") == nil, "deauth refuses a non-MAC outright")
+			assert_false(ok_deauth, "and says so")
+			assert_true(table.concat(logged):find("malformed") ~= nil, "each drop is logged")
+		end
+	},
 }

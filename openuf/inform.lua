@@ -273,6 +273,19 @@ local function is_hex32(s)
 	return type(s) == "string" and #s == 32 and s:match("^[0-9a-fA-F]+$") ~= nil
 end
 
+-- Exactly "aa:bb:cc:dd:ee:ff". Wire-supplied MACs -- the MAC filter's ACL, the
+-- Multicast/Broadcast Blocker's allow-list -- end up inside nft and
+-- hostapd_cli command lines (bcfilter.lua, firewall.lua) or in UCI lists
+-- hostapd parses, so anything not of this shape is refused at the boundary
+-- rather than escaped. The controller is authenticated once adopted, but
+-- before that the inform channel is plain HTTP under the well-known default
+-- key and a forged setparam is within reach of anyone on the path; this is
+-- what keeps that from becoming a shell.
+local function is_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+M._is_mac = is_mac
+
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
 -- Build a TNBU binary packet from a JSON string.
@@ -1839,7 +1852,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 			for k, val in pairs(e) do
 				local ki = k:match("^acl%.(%d+)%.mac$")
 				if ki and e["acl." .. ki .. ".status"] == "enabled" then
-					macs[#macs + 1] = val
+					-- The list becomes a UCI maclist hostapd parses, where a
+					-- malformed entry fails the whole BSS. The controller's UI
+					-- cannot produce one, so dropping it -- loudly -- is the
+					-- safe reading.
+					if is_mac(val) then
+						macs[#macs + 1] = val
+					else
+						io.stderr:write(("inform: macacl: ignoring malformed MAC %q\n")
+							:format(tostring(val)))
+					end
 				end
 			end
 			table.sort(macs)
@@ -1973,8 +1995,15 @@ function M._parse_wifi_system_cfg(sys_raw)
 			for k, val in pairs(w) do
 				local idx = k:match("^bcfilt%.(%d+)%.mac$")
 				if idx and _wire_bool(w["bcfilt." .. idx .. ".status"]) then
-					bcfilt_macs = bcfilt_macs or {}
-					bcfilt_macs[#bcfilt_macs + 1] = val
+					-- These go into an `nft add element` command line
+					-- (bcfilter.lua), so only a real MAC may pass.
+					if is_mac(val) then
+						bcfilt_macs = bcfilt_macs or {}
+						bcfilt_macs[#bcfilt_macs + 1] = val
+					else
+						io.stderr:write(("inform: bcfilt: ignoring malformed MAC %q\n")
+							:format(tostring(val)))
+					end
 				end
 			end
 			if bcfilt_macs then table.sort(bcfilt_macs) end
@@ -2570,6 +2599,24 @@ function M.handle_response(json_str, st, cfg)
 				for i in pairs(dns_by_idx) do idxs[#idxs + 1] = i end
 				table.sort(idxs)
 				for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
+			end
+
+			-- Shape check BEFORE anything is recorded or run. These three
+			-- values are interpolated into `ip addr` / `ip route` command
+			-- lines by netconfig.lua (which refuses them again itself), and
+			-- this is what keeps a malformed push out of state.json as well:
+			-- with the record written first, a refused apply would still leave
+			-- ip_mode=static and a bogus static_ip behind for the DHCP-revert
+			-- logic to act on. Feature-detected, so a test double standing in
+			-- for netconfig need not carry the validator.
+			local ipv4 = M._netconfig.is_ipv4
+			if ip and ipv4 and not (ipv4(ip)
+					and (netmask == nil or netmask == "" or ipv4(netmask))
+					and (gateway == nil or gateway == "" or ipv4(gateway))) then
+				io.stderr:write(("inform: ignoring IP Settings push with a malformed "
+					.. "address (ip=%q netmask=%q gateway=%q)\n"):format(
+					tostring(ip), tostring(netmask), tostring(gateway)))
+				ip = nil
 			end
 
 			if ip then
