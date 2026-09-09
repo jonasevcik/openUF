@@ -381,15 +381,27 @@ case "$1" in
 		# the install branch adds them with. Not sed: the entry contains the
 		# delimiter, and busybox sed's -i is not the same animal as GNU's.
 		if [ -f /etc/sysupgrade.conf ]; then
-			SU_TMP=$(mktemp) && {
+			SU_TMP=$(mktemp 2>/dev/null)
+			if [ ! -f "$SU_TMP" ]; then
+				echo "Warning: mktemp failed, leaving /etc/sysupgrade.conf alone."
+			else
 				grep -vxF -e "$INSTALL_DIR/conf.lua" \
 					/etc/sysupgrade.conf > "$SU_TMP"
-				# grep exits 1 on an empty result, which is a legitimate
-				# outcome here (the file held nothing else), so the copy is
-				# not conditional on its status.
-				cat "$SU_TMP" > /etc/sysupgrade.conf
+				su_rc=$?
+				# 0 is matches; 1 is an empty result, legitimate here (the
+				# file held nothing else). 2 is an error, and the temp file
+				# is then whatever got written before it -- on these boards
+				# a full /tmp tmpfs is the likely cause. Copying that back
+				# would silently drop the user's own keep entries, and they
+				# would find out at the next firmware upgrade.
+				if [ "$su_rc" -le 1 ]; then
+					cat "$SU_TMP" > /etc/sysupgrade.conf
+				else
+					echo "Warning: could not rewrite /etc/sysupgrade.conf," \
+						"leaving it alone."
+				fi
 				rm -f "$SU_TMP"
-			}
+			fi
 		fi
 
 		# Remove installed files (leave state dir so authkey is preserved)
