@@ -15,6 +15,18 @@ local function with_tmp(fn)
 	if not ok then error(err, 2) end
 end
 
+-- Capture what the module writes to stderr while fn runs.
+local function with_stderr(fn)
+	local orig, buf = io.stderr, {}
+	io.stderr = {write = function(_, ...)
+		for _, v in ipairs({...}) do buf[#buf + 1] = tostring(v) end
+	end}
+	local ok, err = pcall(fn)
+	io.stderr = orig
+	if not ok then error(err, 0) end
+	return table.concat(buf)
+end
+
 return {
 	{
 		name = "state: load from missing file returns defaults",
@@ -128,7 +140,8 @@ return {
 				local f = io.open(TMP, "w")
 				f:write("this is not json {{{")
 				f:close()
-				local st = state.load()
+				local st
+				with_stderr(function() st = state.load() end)
 				assert_eq(st.authkey, DEFKEY, "defaults on bad JSON")
 				assert_eq(st.adopted, false,  "defaults on bad JSON")
 			end)
@@ -194,6 +207,53 @@ return {
 			assert_eq(table.concat(missing, ", "), "",
 				"fields written to state but not registered in state.FIELDS "
 					.. "(they persist to disk and load back as nil)")
+		end
+	},
+	{
+		name = "state: save replaces the file atomically and leaves no temp behind",
+		fn = function()
+			with_tmp(function()
+				state.save({adopted = true, authkey = "f00d"})
+				local tmp = io.open(TMP .. ".tmp", "r")
+				if tmp then tmp:close() end
+				assert_nil(tmp, "the sibling temp file is renamed away, not left behind")
+
+				-- The observable half of writing via rename(2): replacing a
+				-- file needs permission on the DIRECTORY, not on the file. The
+				-- old in-place io.open(path, "w") failed outright here, and
+				-- since a truncated state.json reads back as "not adopted",
+				-- the same property is what stops a power cut mid-write from
+				-- costing the adoption.
+				os.execute("chmod 0444 '" .. TMP .. "'")
+				local ok = pcall(state.save, {adopted = true, authkey = "beef"})
+				os.execute("chmod 0644 '" .. TMP .. "' 2>/dev/null")
+				assert_true(ok, "an unwritable-but-replaceable state file is still saved")
+				assert_eq(state.load().authkey, "beef", "and it holds the new contents")
+			end)
+		end
+	},
+	{
+		name = "state: a corrupt state.json says so instead of quietly un-adopting",
+		fn = function()
+			with_tmp(function()
+				local f = io.open(TMP, "w")
+				f:write('{"adopted":true,"authkey":"f00d"')   -- truncated
+				f:close()
+				local warned = with_stderr(function()
+					local st = state.load()
+					assert_false(st.adopted, "unparseable state falls back to defaults")
+					assert_eq(st.authkey, DEFKEY, "and to the well-known key")
+				end)
+				assert_true(warned:find("not valid JSON") ~= nil,
+					"the fallback is announced -- from the controller's side it is "
+						.. "indistinguishable from a factory reset")
+
+				-- An empty file is the normal bootstrap case (install.sh
+				-- --bootstrap-adopt pre-creates one) and must stay quiet.
+				local e = io.open(TMP, "w"); e:write("\n"); e:close()
+				local quiet = with_stderr(function() state.load() end)
+				assert_eq(quiet, "", "an empty state file warns about nothing")
+			end)
 		end
 	},
 	{

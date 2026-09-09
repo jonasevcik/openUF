@@ -108,6 +108,15 @@ function M.load()
 
 	local ok, tbl = pcall(cjson.decode, raw)
 	if not ok or type(tbl) ~= "table" then
+		-- Falling back to defaults means the device comes up UNADOPTED with
+		-- the well-known key -- the right call for a garbage file, but it must
+		-- not be silent: from the controller's side that is indistinguishable
+		-- from a factory reset. An EMPTY file is normal (install.sh
+		-- --bootstrap-adopt pre-creates one) and says nothing.
+		if raw:match("%S") then
+			io.stderr:write("state: " .. M._state_file .. " is not valid JSON -- "
+				.. "starting from defaults; the device will appear unadopted\n")
+		end
 		return defaults()
 	end
 
@@ -127,18 +136,33 @@ end
 -- Save state to disk. Creates the parent directory only if the first write
 -- fails (avoids shelling out to `mkdir -p` on every heartbeat, since the
 -- directory almost always already exists).
+--
+-- Written to a sibling temp file and renamed into place. rename(2) is atomic
+-- within a filesystem, so a power cut or a full overlay mid-write leaves
+-- either the old file or the new one and never a truncated one. That matters
+-- more here than for most files: load() reads unparseable JSON as "start from
+-- defaults", which resets the authkey and clears `adopted` -- so an in-place
+-- write interrupted at the wrong moment cost the adoption outright.
+-- A side effect worth knowing: the bootstrap account now needs write
+-- permission on the DIRECTORY, not on the previous file.
 function M.save(st)
-	local f = io.open(M._state_file, "w")
+	local tmp = M._state_file .. ".tmp"
+	local f = io.open(tmp, "w")
 	if not f then
 		local dir = M._state_file:match("^(.*)/[^/]+$")
 		if dir then os.execute("mkdir -p '" .. dir .. "'") end
-		f = io.open(M._state_file, "w")
+		f = io.open(tmp, "w")
 		if not f then
-			error("state.save: cannot write to " .. M._state_file)
+			error("state.save: cannot write to " .. tmp)
 		end
 	end
 	f:write(cjson.encode(st))
 	f:close()
+	local ok, err = os.rename(tmp, M._state_file)
+	if not ok then
+		os.remove(tmp)
+		error("state.save: cannot replace " .. M._state_file .. ": " .. tostring(err))
+	end
 end
 
 -- Reset state to defaults and persist immediately.
