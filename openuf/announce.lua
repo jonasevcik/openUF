@@ -26,6 +26,11 @@ M.BROADCAST_ADDR = "255.255.255.255"
 M.MULTICAST_ADDR = "233.89.188.1"
 M.PORT = 10001
 
+-- Appended to the firmware version strings in the discovery packet. One
+-- definition: it used to be typed out twice, in build_packet and in the entry
+-- point below, and the two could drift.
+M.VERSION_SUFFIX = "-openUF-0.2"
+
 -- TLV type codes for the Ubiquiti discovery protocol
 local PKT = {
 	HW_ADDR        = 0x01,
@@ -99,7 +104,7 @@ function M.build_packet(cfg)
 	ufpkt.finish(w, packet)
 
 	-- 0x03: Firmware version verbose
-	local suffix = cfg.version_suffix or "-openUF-0.2"
+	local suffix = cfg.version_suffix or M.VERSION_SUFFIX
 	w = ufpkt.init(PKT.FWVER_VERBOSE)
 	ufpkt.catstr(w, cfg.fw_pre)
 	ufpkt.catstr(w, cfg.fw_ver)
@@ -271,9 +276,73 @@ function M.get_hostname()
 		or clean(M._popen("hostname"))
 end
 
+-- Lazily loaded state module (injectable), for the adopted flag below. The
+-- same sibling lookup inform.lua uses; nil when state.lua cannot be found.
+M._state = nil
+local function state_module()
+	if M._state then return M._state end
+	for _, p in ipairs({"state.lua", "openuf/state.lua"}) do
+		local f = io.open(p, "r")
+		if f then
+			f:close()
+			local ok, mod = pcall(dofile, p)
+			if ok and type(mod) == "table" then
+				M._state = mod
+				return mod
+			end
+		end
+	end
+	return nil
+end
+
+-- Is the device adopted, per state.json? nil when that cannot be answered (no
+-- state module, unreadable file), which callers treat as "leave the flag as it
+-- is" -- and it starts out false, the value the packet always carried.
+function M.adopted(state_file)
+	-- `sm`, not `st`: the state MODULE, whose _state_file seam is being set
+	-- here. A local called `st` would read as the state TABLE and trip
+	-- test_state's "every field any module writes is registered" scan.
+	local sm = state_module()
+	if not sm then return nil end
+	if state_file then sm._state_file = state_file end
+	local ok, s = pcall(sm.load)
+	if ok and type(s) == "table" then return s.adopted == true end
+	return nil
+end
+
+-- Re-read, before each broadcast, the facts that change while the broadcaster
+-- runs. The packet used to be built from startup values for the life of the
+-- process:
+--   • the IsDefault TLV said "unadopted" forever. run() was never handed
+--     `adopted`, so the byte make_blob_17_1a's comment insists must reflect
+--     adoption state never did;
+--   • the IP was whatever the interface had at boot -- wrong after a DHCP
+--     renewal or a controller-pushed static address;
+--   • uptime counted seconds since the DAEMON started, not since boot.
+-- Every read here is a proc file or one `ip` call.
+--   cfg.iface       interface to read the IP from (optional)
+--   cfg.state_file  state.json path for the adopted flag (optional)
+-- A field whose source cannot be read keeps its previous value.
+function M._refresh(cfg)
+	if cfg.iface then
+		local ip = M.get_ip(cfg.iface)
+		if ip then cfg.ip = ip end
+	end
+	local hostname = M.get_hostname()
+	if hostname then cfg.hostname = hostname end
+	local up = M._read_file("/proc/uptime")
+	local secs = up and tonumber(up:match("^(%S+)"))
+	if secs then cfg.uptime = math.floor(secs) end
+	local adopted = M.adopted(cfg.state_file)
+	if adopted ~= nil then cfg.adopted = adopted end
+	return cfg
+end
+
 -- Start the main announce loop (blocks forever).
 -- cfg: same table as build_packet() requires, plus:
---   interval  number  seconds between sends (default 10)
+--   interval    number  seconds between sends (default 10)
+--   iface       string  interface to re-read the IP from each tick
+--   state_file  string  state.json path, for the adopted flag
 function M.run(cfg)
 	local socket = require("socket")
 
@@ -285,19 +354,29 @@ function M.run(cfg)
 	-- fails with EACCES. Force real socket creation first via a bind.
 	udpb:setsockname("*", 0)
 	udpb:setoption("broadcast", true)
-	udpb:setpeername(M.BROADCAST_ADDR, M.PORT)
+	-- sendto on the unconnected socket, NOT setpeername + send. At boot this
+	-- process comes up before br-lan has an address; setpeername to the
+	-- broadcast address then fails with ENETUNREACH -- RETURNING nil rather
+	-- than raising -- and the first send raised "calling 'send' on bad self
+	-- (udp{connected} expected)", which took the process down. procd
+	-- respawned it five seconds later so it healed itself, but every boot
+	-- logged a crash. A failed sendto is logged and simply retried next tick.
 
-	local counter = cfg.counter or 0
-	local uptime  = cfg.uptime  or 0
+	local counter  = cfg.counter or 0
 	local interval = cfg.interval or 10
 
 	while true do
 		counter = counter + 1
-		uptime  = uptime + interval
 		cfg.counter = counter
-		cfg.uptime  = uptime
+		-- Counted as before, for the case where /proc/uptime is unreadable;
+		-- _refresh replaces it with the real figure whenever it can.
+		cfg.uptime = (cfg.uptime or 0) + interval
+		M._refresh(cfg)
 
-		udpb:send(M.build_packet(cfg))
+		local ok, err = udpb:sendto(M.build_packet(cfg), M.BROADCAST_ADDR, M.PORT)
+		if not ok then
+			io.stderr:write("announce: send failed: " .. tostring(err) .. "\n")
+		end
 		socket.select(nil, nil, interval)
 	end
 end
@@ -319,17 +398,24 @@ if not OPENUF_TEST_MODE then
 		local mac   = M.get_mac(iface) or {0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xad}
 		local ip    = M.get_ip(iface)  or {192, 168, 1, 1}
 		local hostname = M.get_hostname() or "openUF"
+		-- conf.lua's state_file, honoured here the way inform.lua and
+		-- hook/syswrapper.lua honour it, so all three agree on the file.
+		local state_file = (config and type(config.state_file) == "string"
+			and config.state_file ~= "") and config.state_file or nil
 
 		M.run({
 			mac           = mac,
 			ip            = ip,
 			hostname      = hostname,
+			adopted       = M.adopted(state_file) or false,
+			iface         = iface,
+			state_file    = state_file,
 			platform      = ufhw.uap.platform,
 			fw_pre        = ufhw.uap.fw.pre,
 			fw_ver        = ufhw.uap.fw.ver,
 			fw_buildtime  = ufhw.uap.fw.buildtime,
 			fw_factoryver = ufhw.uap.fw.factoryver,
-			version_suffix = "-openUF-0.2",
+			version_suffix = M.VERSION_SUFFIX,
 		})
 	end)
 	if not ok then

@@ -367,4 +367,88 @@ return {
 			assert_nil(bridged, "bridge exists but has no address -> nil")
 		end
 	},
+	{
+		name = "announce: the IsDefault byte follows the adopted flag",
+		fn = function()
+			-- 0x17 is IsDefault: 1 = unadopted (factory default), 0 = adopted.
+			-- The entry point never passed `adopted`, so this byte said
+			-- "factory default" for the life of the process however long ago
+			-- the device was adopted, and the controller's Discover list said
+			-- so too. _refresh now re-reads it from state.json each tick.
+			local un = announce.build_packet(sample_cfg())
+			local ad = announce.build_packet(sample_cfg({adopted = true}))
+			assert_eq(find_tlv(un, 0x17), string.char(0x01), "unadopted -> 1")
+			assert_eq(find_tlv(ad, 0x17), string.char(0x00), "adopted -> 0")
+		end
+	},
+	{
+		name = "announce: _refresh re-reads uptime, ip and the adopted flag each tick",
+		fn = function()
+			-- Everything the packet carries that can change while the
+			-- broadcaster runs. Before this the packet was frozen at the
+			-- values read at startup: uptime counted seconds since the DAEMON
+			-- started rather than since boot, and the IP stayed whatever the
+			-- interface had at boot -- wrong after a DHCP renewal or a
+			-- controller-pushed static address.
+			local orig_read, orig_popen, orig_state =
+				announce._read_file, announce._popen, announce._state
+			announce._read_file = function(path)
+				if path == "/proc/uptime" then return "864000.42 1700000.00\n" end
+				if path == "/proc/sys/kernel/hostname" then return "ap2\n" end
+				if path == "/sys/class/net/lan1/address" then return "aa:bb:cc:dd:ee:ff\n" end
+				return nil
+			end
+			announce._popen = function(cmd)
+				if cmd:find("^ip ") then return "inet 10.0.9.7/24 brd 10.0.9.255 scope global lan1\n" end
+				return ""
+			end
+			announce._state = {load = function() return {adopted = true} end}
+
+			local cfg = sample_cfg({iface = "lan1", uptime = 30, adopted = false})
+			announce._refresh(cfg)
+			announce._read_file, announce._popen, announce._state =
+				orig_read, orig_popen, orig_state
+
+			assert_eq(cfg.uptime, 864000, "uptime is seconds since BOOT, not since daemon start")
+			assert_eq(cfg.hostname, "ap2", "hostname is re-read")
+			assert_true(cfg.adopted, "the adopted flag is re-read from state.json")
+			assert_eq(table.concat(cfg.ip, "."), "10.0.9.7", "the live address wins over the boot one")
+		end
+	},
+	{
+		name = "announce: _refresh keeps the previous value when a source cannot be read",
+		fn = function()
+			-- A proc file that is missing, or a state module that cannot be
+			-- found, must not blank a field that was correct a second ago.
+			local orig_read, orig_popen, orig_state =
+				announce._read_file, announce._popen, announce._state
+			announce._read_file = function() return nil end
+			announce._popen = function() return "" end
+			announce._state = {load = function() error("no state file") end}
+
+			local cfg = sample_cfg({iface = "lan1", uptime = 30, adopted = true,
+				hostname = "ap2", ip = {10, 0, 9, 7}})
+			announce._refresh(cfg)
+			announce._read_file, announce._popen, announce._state =
+				orig_read, orig_popen, orig_state
+
+			assert_eq(cfg.uptime, 30, "uptime keeps the counted value")
+			assert_eq(cfg.hostname, "ap2", "hostname is kept")
+			assert_true(cfg.adopted, "the adopted flag is kept, not reset to false")
+			assert_eq(table.concat(cfg.ip, "."), "10.0.9.7", "the ip is kept")
+		end
+	},
+	{
+		name = "announce: the version suffix has exactly one definition",
+		fn = function()
+			-- It used to be written out in build_packet and again in the entry
+			-- point, so the short/verbose strings could drift from what the
+			-- daemon actually announced.
+			local cfg = sample_cfg()
+			cfg.version_suffix = nil     -- pairs() cannot deliver a nil override
+			local pkt = announce.build_packet(cfg)
+			assert_true(find_tlv(pkt, 0x16):find(announce.VERSION_SUFFIX, 1, true) ~= nil,
+				"the default suffix is M.VERSION_SUFFIX")
+		end
+	},
 }
