@@ -366,15 +366,23 @@ case "$1" in
 			sed -i '/^openuf:/d' /etc/group
 		fi
 
-		# Drop the sysupgrade keep-list entries this script added. The state
-		# dir itself stays (below), but a line pointing at a conf.lua that no
-		# longer exists is just litter in a file the user may also hand-edit.
+		# Drop the sysupgrade keep-list entry for conf.lua: that file goes
+		# with $INSTALL_DIR (below), and a line pointing at nothing is just
+		# litter in a file the user may also hand-edit.
+		# $STATE_DIR/ deliberately stays registered. The directory outlives
+		# this uninstall by design -- see the message at the end -- so that a
+		# later reinstall still finds the authkey, and un-registering it would
+		# hand the next sysupgrade precisely the deletion the entry exists to
+		# prevent. It is also not necessarily ours: an admin may have added
+		# that line by hand before openUF was ever installed. Should the user
+		# later remove the directory themselves, the stale line costs nothing
+		# -- add_conffiles swallows find's error and returns 0.
 		# Fixed-string, whole-line matching -- the mirror of the grep -qxF
-		# the install branch adds them with. Not sed: the entries contain the
+		# the install branch adds them with. Not sed: the entry contains the
 		# delimiter, and busybox sed's -i is not the same animal as GNU's.
 		if [ -f /etc/sysupgrade.conf ]; then
 			SU_TMP=$(mktemp) && {
-				grep -vxF -e "$STATE_DIR/" -e "$INSTALL_DIR/conf.lua" \
+				grep -vxF -e "$INSTALL_DIR/conf.lua" \
 					/etc/sysupgrade.conf > "$SU_TMP"
 				# grep exits 1 on an empty result, which is a legitimate
 				# outcome here (the file held nothing else), so the copy is
