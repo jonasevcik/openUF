@@ -2695,4 +2695,65 @@ return {
 			end)
 		end
 	},
+	{
+		name = "ucihelper: a regdomain change does not leave the old domain's caps cached forever",
+		fn = function()
+			-- rf_config dropped the cache when it wrote a new country -- but
+			-- the DRIVER only picks the domain up when `wifi reload` restarts
+			-- the radios, later in the same apply_config pass and
+			-- asynchronously at that. rf_config re-reads the caps moments
+			-- later (clamp_htmode, the beacon_rate check), so the cache came
+			-- straight back holding the OLD domain's channel list, DFS flags
+			-- and TX power limits -- and kept them until the daemon restarted.
+			-- The max_txpower reported to the controller, i.e. the bound on
+			-- its TX Power slider, was then the wrong regdomain's.
+			local orig_popen, orig_time = ucihelper._popen, ucihelper._time
+			local reads, clock = 0, 1000
+			ucihelper._time = function() return clock end
+			ucihelper._popen = function() reads = reads + 1; return "" end
+			ucihelper._phy_caps_cache = nil
+			ucihelper._phy_caps_read_at = nil
+			ucihelper._phy_caps_unstable_until = nil
+
+			ucihelper.phy_caps()
+			ucihelper.phy_caps()
+			assert_eq(reads, 1, "normally read once and cached")
+
+			with_ucihelper(function()
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "5g")
+				ucihelper._time = function() return clock end
+				ucihelper._popen = function() reads = reads + 1; return "" end
+				ucihelper.rf_config("radio0", nil, nil, nil, nil, nil, nil, nil, "PA")
+			end)
+			ucihelper._popen = function() reads = reads + 1; return "" end
+
+			reads = 0
+			ucihelper.phy_caps()
+			assert_eq(reads, 1, "the write itself drops the cache")
+			ucihelper.phy_caps()
+			assert_eq(reads, 1, "and a re-read moments later is still cached")
+
+			-- One heartbeat later, still inside the settle window: re-read,
+			-- because by now `wifi reload` may have landed.
+			clock = clock + 10
+			ucihelper.phy_caps()
+			assert_eq(reads, 2, "re-read once the reload has had time to land")
+
+			-- Past the window: back to cache-forever, no more re-reads.
+			clock = clock + 3600
+			ucihelper.phy_caps()
+			local settled = reads
+			ucihelper.phy_caps()
+			clock = clock + 3600
+			ucihelper.phy_caps()
+			assert_eq(reads, settled, "and once settled it is cached again")
+
+			ucihelper._popen, ucihelper._time = orig_popen, orig_time
+			ucihelper._phy_caps_cache = nil
+			ucihelper._phy_caps_read_at = nil
+			ucihelper._phy_caps_unstable_until = nil
+		end
+	},
 }

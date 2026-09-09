@@ -127,10 +127,32 @@ local PHY_RANK = {HT = 1, VHT = 2, HE = 3, EHT = 4}
 local RANK_PHY = {"HT", "VHT", "HE", "EHT"}
 
 -- Cached because it describes hardware, which does not change while openUF
--- runs. Reset it (M._phy_caps_cache = nil) after anything that changes what
--- the driver reports -- notably a regdomain change, which moves the per-channel
--- TX power limits below.
+-- runs -- with one exception. A regdomain change moves the per-channel TX
+-- power limits and the DFS flags, so rf_config drops the cache when it writes
+-- a new country. But the DRIVER only picks the new domain up when `wifi
+-- reload` restarts the radios, which happens later in the same apply_config
+-- pass and asynchronously at that -- while rf_config itself re-reads the caps
+-- moments after dropping them (clamp_htmode, the beacon_rate check). So the
+-- cache came straight back holding the OLD domain's figures and kept them
+-- until the daemon restarted, and the max_txpower reported to the controller
+-- -- the bound on its TX Power slider -- was the wrong regdomain's.
+--
+-- Hence the settle window: for PHY_CAPS_SETTLE seconds after a regdomain
+-- write, cached caps are trusted for at most PHY_CAPS_REREAD seconds at a
+-- time. After that it is back to cache-forever.
 M._phy_caps_cache = nil
+M._phy_caps_read_at = nil
+M._phy_caps_unstable_until = nil
+local PHY_CAPS_SETTLE = 60   -- the reload is long done inside this
+local PHY_CAPS_REREAD = 10   -- one heartbeat
+
+-- Injectable clock, for the settle window above.
+M._time = os.time
+
+local function regdomain_changed()
+	M._phy_caps_cache = nil
+	M._phy_caps_unstable_until = M._time() + PHY_CAPS_SETTLE
+end
 
 -- Parse `iw phy` output into per-band capabilities, keyed by band_for_device's
 -- own vocabulary ("ng"/"na"). Each band is identified by the frequencies it
@@ -238,8 +260,18 @@ end
 -- An empty table (no `iw`, unparseable output) means "unknown", which every
 -- caller must treat as "leave the controller's request alone".
 function M.phy_caps()
-	if not M._phy_caps_cache then
+	local now = M._time()
+	local stale = false
+	if M._phy_caps_cache and M._phy_caps_unstable_until then
+		if now < M._phy_caps_unstable_until then
+			stale = (now - (M._phy_caps_read_at or 0)) >= PHY_CAPS_REREAD
+		else
+			M._phy_caps_unstable_until = nil   -- settled: back to cache-forever
+		end
+	end
+	if not M._phy_caps_cache or stale then
 		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "")
+		M._phy_caps_read_at = now
 	end
 	return M._phy_caps_cache
 end
@@ -774,7 +806,7 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		-- below -- and it invalidates the cached driver capabilities, whose
 		-- per-channel dBm limits are regdomain-derived.
 		cursor:set("wireless", radio, "country", country)
-		M._phy_caps_cache = nil
+		regdomain_changed()
 	end
 	if chan then
 		cursor:set("wireless", radio, "channel", tostring(chan))
