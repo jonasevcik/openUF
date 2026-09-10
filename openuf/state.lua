@@ -38,12 +38,21 @@ M.DEFAULT_KEY = "ba86f2bbe107c7c57eb5f2690775c712"
 -- Override this in tests to point at a temp file
 M._state_file = "/etc/openuf/state.json"
 
+-- Inform URL used when state.json does not carry one -- a first boot, or the
+-- state after a factory reset. conf.lua's config.inform_url overrides this at
+-- startup (see inform.lua's entry point), which is what makes that documented
+-- option real: before, conf.lua's value was read by nothing and this constant
+-- was the only URL a fresh device ever used, while install.sh went on parsing
+-- conf.lua for "the URL openUF will really use" to decide whether to install
+-- luasec for an https:// controller.
+M.DEFAULT_INFORM_URL = "http://unifi:8080/inform"
+
 local function defaults()
 	return {
 		authkey                  = M.DEFAULT_KEY,
 		adopted                  = false,
 		cfgversion               = "",
-		inform_url               = "http://unifi:8080/inform",
+		inform_url               = M.DEFAULT_INFORM_URL,
 		use_gcm                  = false,
 		upgrade_requested_version = "",
 		upgrade_requested_url     = "",

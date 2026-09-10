@@ -427,7 +427,7 @@ announced on stderr rather than passed off as a fresh install.
 | `authkey` | 32 hex chars (16-byte AES-128 key); default = pre-adoption key |
 | `cfgversion` | Opaque string the controller uses to push config updates |
 | `upgrade_requested_version` / `upgrade_requested_url` | Set when the controller sends an `upgrade` command; stored for visibility only — openUF never downloads or flashes firmware (see below) |
-| `inform_url` | URL for the 10-second inform heartbeat |
+| `inform_url` | URL for the 10-second inform heartbeat. Seeded from `conf.lua` on a first boot (or after a factory reset) and overwritten by the controller or by `syswrapper.sh set-inform`; once present here it always wins over `conf.lua` |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |

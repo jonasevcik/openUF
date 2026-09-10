@@ -40,7 +40,9 @@ config = {
 
 	-- URL the inform loop posts to.  Overwritten at runtime when the controller
 	-- sends a new URL or when syswrapper.sh set-inform is called.
-	-- The value here is only used on first boot (before state.json exists).
+	-- The value here is used only when state.json carries no URL of its own --
+	-- a first boot, or the state after a factory reset.  install.sh also reads
+	-- it, to decide whether an https:// controller needs luasec installed.
 	inform_url = "http://unifi:8080/inform",
 
 	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url).

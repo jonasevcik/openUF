@@ -3608,6 +3608,17 @@ if not OPENUF_TEST_MODE then
 		if config and type(config.state_file) == "string" and config.state_file ~= "" then
 			M._state._state_file = config.state_file
 		end
+		-- Same story, same table, missed the first time round: conf.lua's
+		-- inform_url was documented as the first-boot URL and read by nothing.
+		-- state.lua's defaults() carried its own hardcoded copy, so editing
+		-- conf.lua moved nothing -- while install.sh parsed that very key to
+		-- decide whether an https:// controller needed luasec, and reported
+		-- success for a URL the daemon would never post to. Applied as the
+		-- DEFAULT, so it only takes effect when state.json has no URL of its
+		-- own: an adopted device keeps whatever the controller assigned it.
+		if config and type(config.inform_url) == "string" and config.inform_url ~= "" then
+			M._state.DEFAULT_INFORM_URL = config.inform_url
+		end
 		local ufhw = {uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
 		-- config (debug_dump_file, state_file, ...) is a separate global set by
 		-- conf.lua, not a field of dev.conf -- merge it in under .config so
