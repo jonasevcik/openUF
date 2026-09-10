@@ -117,18 +117,6 @@ function M.uptime()
 	end)
 end
 
--- Returns load averages as {one, five, fifteen} by parsing /proc/loadavg.
-function M.loadavg()
-	local s = M._read_file("/proc/loadavg")
-	if not s then return {one = 0, five = 0, fifteen = 0} end
-	local one, five, fifteen = s:match("^(%S+)%s+(%S+)%s+(%S+)")
-	return {
-		one     = tonumber(one)     or 0,
-		five    = tonumber(five)    or 0,
-		fifteen = tonumber(fifteen) or 0,
-	}
-end
-
 -- Returns {total_kb, free_kb} by parsing /proc/meminfo.
 function M.meminfo()
 	local s = M._read_file("/proc/meminfo")
@@ -148,7 +136,7 @@ M._prev_cpu = nil
 -- Returns CPU usage percent (0-100) since the previous call, by delta-
 -- sampling the aggregate "cpu" line in /proc/stat (matches the real
 -- inform payload's system-stats.cpu, which is a live percentage -- not to
--- be confused with M.loadavg(), a different metric real devices don't
+-- be confused with a load average, a different metric real devices don't
 -- report under this field). Returns 0 on the first call, since there's no
 -- prior sample to diff against yet.
 function M.cpu_percent()

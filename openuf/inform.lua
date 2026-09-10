@@ -308,7 +308,6 @@ end
 local function is_mac(s)
 	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
 end
-M._is_mac = is_mac
 
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 

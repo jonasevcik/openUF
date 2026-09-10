@@ -36,7 +36,6 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 	inform._sysinfo.end_pass()
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
-		if path:find("loadavg") then return fixture("proc_loadavg.txt") end
 		if path:find("meminfo") then return fixture("proc_meminfo.txt") end
 		if path:find("net/dev") then return fixture("proc_net_dev.txt") end
 		if with_wired and path:find("net/arp")     then return fixture("proc_net_arp.txt") end

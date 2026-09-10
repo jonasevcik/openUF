@@ -65,17 +65,6 @@ return {
 		end
 	},
 	{
-		name = "sysinfo: loadavg() parses /proc/loadavg correctly",
-		fn = function()
-			with_fixtures({["/proc/loadavg"] = fixture("proc_loadavg.txt")}, {}, function()
-				local la = sysinfo.loadavg()
-				assert_eq(la.one,     0.42, "1-min load")
-				assert_eq(la.five,    0.31, "5-min load")
-				assert_eq(la.fifteen, 0.19, "15-min load")
-			end)
-		end
-	},
-	{
 		name = "sysinfo: meminfo() parses /proc/meminfo total and free",
 		fn = function()
 			with_fixtures({["/proc/meminfo"] = fixture("proc_meminfo.txt")}, {}, function()
