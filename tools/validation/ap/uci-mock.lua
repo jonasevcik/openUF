@@ -64,6 +64,29 @@ function M.cursor()
 		end
 	end
 
+	-- Real libuci has get(); this mock did not, and the omission was not
+	-- harmless. usteer.set_enabled's no-op guard calls
+	-- cursor:get("usteer", "local", ...) on every WiFi setparam, so every
+	-- setparam in this environment died there with "attempt to call method
+	-- 'get' (a nil value)" -- inside _tick's pcall around handle_response, so
+	-- it surfaced as one stderr line and nothing else. Everything AFTER that
+	-- call was therefore never exercised in the lab: the bcfilter and shaper
+	-- reconciles, the switchvlan pass, and handle_response's own
+	-- M._state.save(st) at the end -- which is why a pushed static IP reached
+	-- the interface and never reached state.json. Found 2026-09-10 while
+	-- validating the startup-reapply fixes.
+	--
+	-- Two forms, both real: get(config, section) returns the section TYPE,
+	-- get(config, section, option) returns the option value. Absent config,
+	-- section or option is nil, which is what callers test for.
+	function cursor:get(config, section, option)
+		local c = db[config]
+		local s = c and c[section]
+		if not s then return nil end
+		if option == nil then return s[".type"] end
+		return s[option]
+	end
+
 	function cursor:foreach(config, stype, fn)
 		for _, name in ipairs(section_order[config] or {}) do
 			local s = db[config] and db[config][name]

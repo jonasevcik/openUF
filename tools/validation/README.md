@@ -13,6 +13,32 @@ end-to-end** in this environment, once the setup below is followed exactly — s
 PROTOCOL-VALIDATION.md's "Adoption: L2 vs L3" for how the two paths differ and
 what each requires.
 
+## 0. What this environment can and cannot show
+
+The "AP" is Alpine with an **in-memory UCI mock**, not OpenWrt. Two consequences
+worth knowing before you trust a result here:
+
+- **UCI does not survive a process restart.** The mock's `db` is a module-local
+  table seeded at load; `commit()` writes a JSON dump for inspection and nothing
+  ever reads it back. So anything whose correctness depends on UCI persisting
+  across a daemon restart — the startup reapply of the Multicast/Broadcast
+  Blocker and the WiFi Speed Limit, for instance — **cannot** be validated here.
+  What can be: that the reapply turns UCI markers into rules the real `nft` and
+  `tc` accept, which this container does have.
+- **`state.json` does survive**, since it is a real file in the container's
+  writable layer. `docker restart openuf-validation-ap` therefore makes a
+  faithful reboot test for anything driven from state.json — the static-IP
+  reapply, blocked clients, the LED toggle. The network is reset by Docker on
+  restart, exactly as a reboot resets it.
+
+The mock gained `cursor:get()` on 2026-09-10. It had never had one, and
+`usteer.set_enabled`'s no-op guard calls it on every WiFi setparam — so **every
+setparam in this environment died partway through**, inside `_tick`'s pcall,
+surfacing as a single stderr line. Everything after that call had therefore never
+run here: the bcfilter and shaper reconciles, the switchvlan pass, and
+`handle_response`'s own final `state.save`. If you see `handle_response failed`
+in the AP's log, stop and fix the cause before trusting anything downstream of it.
+
 ## 1. Start the environment
 
 ```sh

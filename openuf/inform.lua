@@ -2694,6 +2694,25 @@ function M.handle_response(json_str, st, cfg)
 						st.ip = ip  -- known directly, no need to re-read the interface
 					end
 				end
+				-- Persisted HERE, not at the end of handle_response.
+				--
+				-- The interface has already been reconfigured by this point,
+				-- and state.json is the only record that it was: M.run's
+				-- startup reapply is what puts a static address back after a
+				-- reboot, and it reads exactly these fields. Everything
+				-- between here and the save at the end of this function --
+				-- the WiFi pass, switchvlan, usteer, bcfilter, shaper -- shells
+				-- out or reaches into UCI and can raise, and _tick pcalls this
+				-- whole function by design, so an error there costs one log
+				-- line and nothing else. Leaving the write until the end meant
+				-- any such error left the kernel reconfigured and the record
+				-- lost, which is precisely the state the reapply cannot
+				-- recover from.
+				--
+				-- Observed exactly that in the validation lab on 2026-09-10:
+				-- usteer raised midway, the AP moved to its pushed static
+				-- address, and state.json never learned about it.
+				M._state.save(st)
 			end
 
 			-- Parsed once, out here: the switch pass below needs the vap_table

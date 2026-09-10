@@ -489,6 +489,48 @@ return {
 		end
 	},
 	{
+		-- Found in the validation lab 2026-09-10: usteer raised partway through
+		-- handle_response, the AP moved to its pushed static address, and
+		-- state.json never learned about it. _tick pcalls handle_response by
+		-- design, so the error cost one log line -- but the startup reapply
+		-- reads exactly these fields, so the address was unrecoverable after a
+		-- reboot. The record has to be written as soon as the interface is
+		-- changed, not after another 350 lines of shelling out.
+		name = "inform packet: handle_response persists IP settings before the WiFi pass can raise",
+		fn = function()
+			local st = sample_state()
+			local saved = nil
+			local orig_save, orig_exec = inform._state.save, inform._netconfig._exec
+			local orig_uci = inform._ucihelper
+			inform._netconfig._exec = function() return true end
+			inform._state.save = function(t)
+				-- snapshot, so a later save cannot mask an earlier omission
+				saved = {ip_mode = t.ip_mode, static_ip = t.static_ip,
+					static_netmask = t.static_netmask, static_gateway = t.static_gateway}
+			end
+			-- Everything after the IP branch blows up, the way usteer did.
+			inform._ucihelper = setmetatable({
+				begin_pass = function() end, end_pass = function() end,
+				apply_config = function() error("boom: anything downstream can raise") end,
+			}, {__index = orig_uci})
+
+			local cfg = {net = {lan_cpueth = "eth0"}, config = {}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n'
+				.. 'netconf.1.netmask=255.255.255.0\\nroute.1.gateway=172.19.0.1\\n'
+				.. 'aaa.1.ssid=x\\nwireless.1.ssid=x\\nwireless.1.parent=radio0\\n"}'
+			local ok = pcall(inform.handle_response, resp, st, cfg)
+
+			inform._state.save, inform._netconfig._exec = orig_save, orig_exec
+			inform._ucihelper = orig_uci
+
+			assert_false(ok, "the downstream failure really did raise")
+			assert_true(saved ~= nil, "state was saved anyway, before the raise")
+			assert_eq(saved.ip_mode, "static", "ip_mode reached disk")
+			assert_eq(saved.static_ip, "172.19.0.50", "static_ip reached disk")
+			assert_eq(saved.static_gateway, "172.19.0.1", "static_gateway reached disk")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam applies dhcp from system_cfg",
 		fn = function()
 			local st = sample_state({ip_mode = "static", static_ip = "172.19.0.50"})
