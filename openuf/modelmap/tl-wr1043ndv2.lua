@@ -11,9 +11,7 @@ dev.conf.net = {
 	lan_name 	= "lan",
 	lan_cpueth 	= "eth1",
 	lan_vlanid  = 1,
-	wan_name 	= "wan",
 	wan_cpueth 	= "eth0",
-	wan_vlanid 	= 4090,
 	-- UniFi port_idx -> physical socket, for the inform payload's port_table
 	-- and for per-port VLAN assignment (switchvlan.lua joins the controller's
 	-- switch.port.<n> onto port_idx). `swport` names a key in

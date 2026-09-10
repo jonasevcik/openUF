@@ -51,9 +51,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "wan",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "wan",
-	wan_vlanid	= 4090,
 	-- UniFi port_idx -> netdev. One entry per physical socket, which on DSA
 	-- needs no switch map: the netdev IS the socket. `idx` is fixed to a
 	-- socket and never to a role, so the controller's per-port overrides

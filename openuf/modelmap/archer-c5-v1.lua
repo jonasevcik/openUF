@@ -28,9 +28,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "eth1",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "eth0",
-	wan_vlanid	= 4090,
 	-- UniFi port_idx -> physical socket, for the inform payload's port_table
 	-- and for per-port VLAN assignment (switchvlan.lua joins the controller's
 	-- switch.port.<n> straight onto port_idx).
@@ -82,12 +80,22 @@ dev.conf.led = "green:system"
 -- carried a swport, but it surfaced the moment a tagged SSID needed a trunk:
 -- the generated port string tagged the WAN socket and skipped a LAN one.
 --
--- NOT verified: which *labelled* socket (LAN1..LAN4 on the case) maps to
--- which physical number -- TP-Link boards commonly reverse them. Only the
--- SET is confirmed. To settle it, watch `swconfig dev switch0 show | grep -A1
--- "^Port"` while moving one cable between sockets. Nothing openUF does today
--- depends on the ordering (the trunk tags every LAN port); a per-port VLAN
--- assignment would, so confirm before adding `swport` to dev.conf.net.ports.
+-- ⚠️ NOT verified, and it now MATTERS: which *labelled* socket (LAN1..LAN4 on
+-- the case) maps to which physical number -- TP-Link boards commonly reverse
+-- them. Only the SET is confirmed. To settle it, watch
+-- `swconfig dev switch0 show | grep -A1 "^Port"` while moving one cable
+-- between sockets.
+--
+-- An earlier version of this note said nothing openUF does depends on the
+-- ordering, and told the reader to confirm it before adding `swport` to
+-- dev.conf.net.ports. `swport` is in dev.conf.net.ports above, and has been
+-- since per-socket port reporting landed: inform resolves every port_table
+-- entry through switchvlan.resolve_swport. So a reversed map here does not
+-- wait for a per-port VLAN push to bite -- it mislabels the Ports view today,
+-- attributing each cable's link speed and its wired clients to the wrong
+-- port_idx, and lands the controller's per-port overrides on the wrong
+-- socket. (The uplink itself is still correct: that is detected from the ARL
+-- table, not from these labels.)
 dev.conf.vlan = {
 	-- swconfig device name, as `swconfig list` reports it.
 	device	= "switch0",

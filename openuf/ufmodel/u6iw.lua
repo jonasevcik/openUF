@@ -25,7 +25,6 @@ uap = {
 	},
 	bootver			= "",
 	required_version = "6.0.0",			-- minimum controller version
-	field			= {},
 }
 
 return uap

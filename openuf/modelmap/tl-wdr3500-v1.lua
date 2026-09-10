@@ -45,9 +45,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "eth0",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "eth1",
-	wan_vlanid	= 2,
 	-- The board's four LAN sockets, one port_idx each -- not the CPU netdev
 	-- they share. eth0's link is the internal SoC<->switch one (always
 	-- 1000/full) while the socket the cable is in had negotiated 100baseT, and

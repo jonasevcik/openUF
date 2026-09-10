@@ -16,7 +16,6 @@ uap = {
 		factoryver 	= "2.3.6"
 	},
 	bootver 		= "",
-	field			= {},
 }
 
 -- special flags
