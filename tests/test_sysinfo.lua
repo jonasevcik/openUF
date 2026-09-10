@@ -1372,4 +1372,34 @@ return {
 			sysinfo._uplink_cache = {}
 		end
 	},
+	{
+		name = "sysinfo: /proc/uptime is read once per payload, not once per radio",
+		fn = function()
+			-- build_json reports the uptime once, and scan_table reads it again
+			-- per radio as the CLOCK_BOOTTIME reference for each BSS's "last
+			-- seen" -- three opens a heartbeat on a two-radio box.
+			local orig_rf = sysinfo._read_file
+			local reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/uptime" then
+					reads = reads + 1
+					return "12345.67 98765.43\n"
+				end
+				return nil
+			end
+
+			sysinfo.end_pass()
+			sysinfo.uptime(); sysinfo.uptime()
+			assert_eq(reads, 2, "no pass open -- every call reads, as before")
+
+			reads = 0
+			sysinfo.begin_pass()
+			assert_eq(sysinfo.uptime(), 12345, "the uptime")
+			sysinfo.uptime(); sysinfo.uptime()
+			assert_eq(reads, 1, "one read for the whole payload")
+			sysinfo.end_pass()
+
+			sysinfo._read_file = orig_rf
+		end
+	},
 }

@@ -102,11 +102,19 @@ local function hosts_by_port(map)
 end
 
 -- Returns uptime in seconds (as a number) by parsing /proc/uptime.
+--
+-- Read once per pass: build_json reports it once and scan_table reads it again
+-- per radio, as the CLOCK_BOOTTIME reference for each BSS's "last seen" -- so
+-- it was three opens a heartbeat on a two-radio box. It is a monotonic counter
+-- whose drift across one payload is under a second, and reading it twice
+-- inside one payload was the less consistent of the two anyway.
 function M.uptime()
-	local s = M._read_file("/proc/uptime")
-	if not s then return 0 end
-	local secs = tonumber(s:match("^(%S+)"))
-	return secs and math.floor(secs) or 0
+	return pass_memo("uptime", function()
+		local s = M._read_file("/proc/uptime")
+		if not s then return 0 end
+		local secs = tonumber(s:match("^(%S+)"))
+		return secs and math.floor(secs) or 0
+	end)
 end
 
 -- Returns load averages as {one, five, fifteen} by parsing /proc/loadavg.
