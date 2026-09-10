@@ -738,8 +738,15 @@ empty 5 GHz list from 0 neighbours to 4, one of them an AP the radio cannot hear
 
 | Setting | Meaning |
 |---|---|
-| `rrm_enrichment` | `true` by default. Set `false` to never send a beacon request |
+| `rrm_enrichment` | `true` by default. Set `false` to never send a beacon request. Switching it off also tears down the background collector on the next cycle, and `/etc/init.d/openuf stop` does the same |
 | `rrm_request_interval` | Seconds between requests, across all radios and clients combined — they are asked one at a time, round-robin |
+
+Reports are collected by a detached `ubus subscribe hostapd.*` child that parks them in
+`/tmp/openuf-rrm.jsonl`; openUF drains and truncates that file on every inform. Because the
+child is reparented to init it outlives the daemon, so openUF kills it explicitly — on
+service stop, on uninstall, and when `rrm_enrichment` is turned off. If you ever find it
+running with openUF stopped (`pgrep -f 'ubus subscribe hostapd'`), nothing is draining the
+file and it will grow: `pkill -f 'ubus subscribe hostapd'` and delete it.
 
 Only clients advertising **active or passive** beacon measurement are ever asked. Clients
 advertising *beacon-table* only are skipped on purpose: the one real example acknowledged

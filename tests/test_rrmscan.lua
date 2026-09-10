@@ -273,6 +273,24 @@ return {
 		end
 	},
 	{
+		-- The collector is a detached `ubus subscribe` child reparented to
+		-- init, so it outlives the daemon. It has to be killed explicitly, and
+		-- the notification file has to go with it: harvest() is the only thing
+		-- that truncates it, so a file left behind with no reader grows without
+		-- bound on a RAM-disk /tmp.
+		name = "rrmscan: collector_stop kills the subscriber and removes the event file",
+		fn = function()
+			with_exec(function(cmds)
+				rrmscan.collector_stop()
+				local all = table.concat(cmds, "\n")
+				assert_true(all:find("pkill -f 'ubus subscribe hostapd'", 1, true) ~= nil,
+					"kills the subscriber by the pattern collector_ensure spawns")
+				assert_true(all:find("rm -f " .. rrmscan.EVENT_FILE, 1, true) ~= nil,
+					"removes the notification file it was appending to")
+			end)
+		end
+	},
+	{
 		name = "rrmscan: a request asks for an ACTIVE all-channel measurement",
 		fn = function()
 			with_exec(function(cmds)

@@ -3327,7 +3327,27 @@ end
 function M._rrm_tick(cfg)
 	local rrm = M._rrmscan
 	if not rrm then return false end
-	if not (cfg and cfg.config and cfg.config.rrm_enrichment) then return false end
+	if not (cfg and cfg.config and cfg.config.rrm_enrichment) then
+		-- Enrichment is off, but a collector from an earlier run with it ON may
+		-- still be alive: it is a detached `ubus subscribe` child reparented to
+		-- init, so it outlives both the config change and the daemon. Nothing
+		-- below this line runs any more, and harvest() is the ONLY thing that
+		-- truncates the notification file -- so left alone the child appends to
+		-- /tmp/openuf-rrm.jsonl forever with no reader and no cap. /tmp is a
+		-- RAM disk on these boards; the debug-dump cap above exists because
+		-- 31.7 MB there was measured starving state.json writes and apk.
+		--
+		-- Rate-limited on the collector's own liveness clock rather than run
+		-- every tick: this is a pgrep, and there is nothing to catch between
+		-- checks once the child is gone.
+		local now = M._time()
+		if now >= M._rrm_collector_next then
+			M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
+			local ok_r, running = pcall(rrm.collector_running)
+			if ok_r and running then pcall(rrm.collector_stop) end
+		end
+		return false
+	end
 
 	-- On M._time(), the seam the rest of the timed paths use, so the gate below
 	-- is testable. Note this is also the clock the age-out compares against,

@@ -3106,6 +3106,52 @@ return {
 		end
 	},
 	{
+		-- A3: turning rrm_enrichment off returns before collector_ensure AND
+		-- before harvest, so a collector started while it was on kept
+		-- appending to /tmp/openuf-rrm.jsonl with nothing left to drain it.
+		-- The child is detached and reparented to init, so nothing else was
+		-- going to clean it up either.
+		name = "inform: _rrm_tick stops an orphaned collector once enrichment is switched off",
+		fn = function()
+			local orig_rrm, orig_time = inform._rrmscan, inform._time
+			local stopped, ensured = 0, 0
+			inform._rrmscan = {
+				collector_running = function() return true end,
+				collector_stop    = function() stopped = stopped + 1 end,
+				collector_ensure  = function() ensured = ensured + 1 end,
+				harvest           = function() return {}, {} end,
+				hostapd_objects   = function() return {} end,
+			}
+			local clock = 1000
+			inform._time = function() return clock end
+			inform._rrm_collector_next = 0
+
+			local cfg = {config = {rrm_enrichment = false}}
+			assert_false(inform._rrm_tick(cfg), "still reports disabled")
+			assert_eq(stopped, 1, "the stale collector is killed")
+			assert_eq(ensured, 0, "and nothing is started in its place")
+
+			-- Rate-limited on the collector's own liveness clock: this is a
+			-- pgrep, and there is nothing to catch between checks.
+			inform._rrm_tick(cfg)
+			inform._rrm_tick(cfg)
+			assert_eq(stopped, 1, "not re-run on every tick")
+			clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+			inform._rrm_tick(cfg)
+			assert_eq(stopped, 2, "checked again once the interval has passed")
+
+			-- Nothing running is the steady state once it has been cleaned up,
+			-- and must not turn into a pkill every interval forever.
+			inform._rrmscan.collector_running = function() return false end
+			clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+			inform._rrm_tick(cfg)
+			assert_eq(stopped, 2, "no kill when there is no collector to kill")
+
+			inform._rrmscan, inform._time = orig_rrm, orig_time
+			inform._rrm_collector_next = 0
+		end
+	},
+	{
 		name = "inform: a 2.4 GHz-only station is asked for its own operating class",
 		fn = function()
 			-- Every station used to be asked for class 115 (5 GHz U-NII-1).

@@ -46,9 +46,31 @@ start_service() {
 }
 
 stop_service() {
+	# procd stops the two Lua instances itself. What it cannot see is the RRM
+	# collector: rrmscan.collector_ensure() spawns `ubus subscribe hostapd.*`
+	# with a trailing &, so it is reparented to init and outlives the daemon
+	# that started it. Left behind it appends beacon-report notifications to
+	# /tmp/openuf-rrm.jsonl forever, and harvest() -- the only thing that ever
+	# truncates that file -- is gone with the inform loop. /tmp is a RAM disk
+	# on these boards, so this is an unbounded leak, and `install.sh uninstall`
+	# calls us on its way to removing $OPENUF_DIR.
+	#
+	# Driven through rrmscan.lua rather than a pkill here so the subscribe
+	# pattern and the file path stay defined in exactly one place. Same
+	# cd-then-lua shape as the l2_announce probe above, and best-effort for the
+	# same reasons: this must not block a stop.
+	(cd "$OPENUF_DIR" 2>/dev/null && lua -e 'dofile("rrmscan.lua").collector_stop()') \
+		>/dev/null 2>&1
 	return 0
 }
 
-service_triggers() {
-	procd_add_reload_trigger "network" "wireless"
-}
+# NO service_triggers(). A procd_add_reload_trigger on "network"/"wireless" was
+# registered here and was unwired in both directions. It never fired for
+# openUF's own writes -- those go through libuci-lua, which does not emit the
+# ubus config.change event procd listens for -- and when something else fired
+# it (a LuCI apply, /sbin/reload_config) it did not reload but RESTARTED, since
+# /etc/rc.common degrades `reload` to `restart` when no reload_service() is
+# defined. That cost an in-flight inform POST, reset the 10 s cadence and
+# orphaned the RRM collector, on any unrelated wireless edit in LuCI. Nothing
+# was gained either way: ucihelper.begin_pass() re-reads /etc/config/wireless
+# on every heartbeat, so new config is picked up within 10 s regardless.
