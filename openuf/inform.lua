@@ -3292,6 +3292,28 @@ function M._warn_identity_change(prev_mac, st, cfg)
 	return true
 end
 
+-- Reapply a controller-pushed static IP at startup.
+--
+-- A static IP is live kernel state, not UCI: netconfig.apply_static() is
+-- `ip addr`/`ip route` only, so the address is gone after a reboot and netifd
+-- brings the interface back up on whatever the board's own config says. The
+-- controller does not re-push it either -- cfgversion is persisted, so it
+-- matches on the first inform and the reply is a noop carrying no system_cfg
+-- at all. Without this the device silently returns to DHCP (or to no address)
+-- while the controller's IP Settings page goes on showing the static one it
+-- assigned. Mirrors the blocked-client and LED reconciliation in M.run.
+--
+-- Only ip_mode == "static" acts. On "dhcp", and when IP Settings was never
+-- pushed at all, the board's own boot config is already right, and flushing
+-- the interface to re-lease would be exactly the destructive no-op that the
+-- steady-state DHCP push is guarded against (see handle_response).
+function M._reapply_static_ip(st, cfg)
+	if not st or st.ip_mode ~= "static" or not st.static_ip then return false end
+	local iface = cfg and cfg.net and cfg.net.lan_cpueth
+	return M._netconfig.apply_static(iface, st.static_ip, st.static_netmask,
+		st.static_gateway, st.static_dns) and true or false
+end
+
 -- Start the inform heartbeat loop (blocks forever).
 -- cfg, ufhw: passed through to build_json()
 -- One cycle of the client-assisted enrichment: keep the notification
@@ -3469,6 +3491,7 @@ end
 
 function M.run(cfg, ufhw)
 	local st = state.load()
+	M._reapply_static_ip(st, cfg)
 	-- The MAC persisted by the previous run, before _populate_net_info
 	-- overwrites it with the live one read off dev.conf.net.lan_cpueth.
 	local prev_mac = st.mac

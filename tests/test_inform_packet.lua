@@ -509,6 +509,78 @@ return {
 		end
 	},
 	{
+		-- A2: the static address is `ip addr` state only, so it dies with the
+		-- reboot, and cfgversion matching means the controller replies noop and
+		-- never re-pushes it. Without the startup reapply the device silently
+		-- comes back on the board's own boot config.
+		name = "inform packet: _reapply_static_ip reapplies a persisted static address at startup",
+		fn = function()
+			local st = sample_state({
+				ip_mode        = "static",
+				static_ip      = "172.19.0.50",
+				static_netmask = "255.255.255.0",
+				static_gateway = "172.19.0.1",
+			})
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local ok = inform._reapply_static_ip(st, {net = {lan_cpueth = "eth0"}})
+			inform._netconfig._exec = orig
+			assert_true(ok, "reapply reports success")
+			assert_eq(#cmds, 3, "three shell commands (flush, add, route)")
+			assert_contains(cmds[1], "ip addr flush dev eth0", "flushes the right interface")
+			assert_contains(cmds[2], "172.19.0.50/24 dev eth0", "restores address and prefix")
+			assert_contains(cmds[3], "172.19.0.1", "restores the default route")
+		end
+	},
+	{
+		name = "inform packet: _reapply_static_ip restores the pushed DNS servers too",
+		fn = function()
+			local st = sample_state({
+				ip_mode    = "static",
+				static_ip  = "172.19.0.50",
+				static_dns = {"1.1.1.1", "9.9.9.9"},
+			})
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			inform._reapply_static_ip(st, {net = {lan_cpueth = "eth0"}})
+			inform._netconfig._exec = orig
+			local resolv = cmds[#cmds]
+			assert_contains(resolv, "nameserver 1.1.1.1", "primary nameserver restored")
+			assert_contains(resolv, "nameserver 9.9.9.9", "secondary nameserver restored")
+		end
+	},
+	{
+		-- The board's own boot config already handles DHCP, and flushing to
+		-- re-lease is the destructive no-op handle_response guards against.
+		name = "inform packet: _reapply_static_ip does nothing on dhcp or when never pushed",
+		fn = function()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			assert_false(inform._reapply_static_ip(sample_state({ip_mode = "dhcp"}), cfg),
+				"dhcp mode does not reapply")
+			assert_false(inform._reapply_static_ip(sample_state(), cfg),
+				"never-pushed IP Settings does not reapply")
+			assert_false(inform._reapply_static_ip(
+				sample_state({ip_mode = "static"}), cfg),
+				"static mode with no recorded address does not reapply")
+			inform._netconfig._exec = orig
+			assert_eq(#cmds, 0, "no interface was touched in any of the three cases")
+		end
+	},
+	{
 		name = "inform packet: handle_response reads dhcpc.1.status=disabled as static, not DHCP",
 		fn = function()
 			-- The key's mere presence used to set dhcp=true regardless of its
