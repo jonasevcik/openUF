@@ -3523,6 +3523,26 @@ function M.run(cfg, ufhw)
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
 	-- account reconciliation just above).
 	M._firewall.reconcile(st.blocked_stas)
+	-- Same category, one level out: the "Multicast and Broadcast Blocker" is an
+	-- nftables ruleset and the "WiFi Speed Limit" is a tc qdisc, so both die
+	-- with the reboot, and neither has a UCI option OpenWrt itself applies.
+	-- They are only ever built inside apply_config, which runs on a setparam --
+	-- and after a reboot there is no setparam: cfgversion matches on the first
+	-- inform and the controller replies noop, carrying no system_cfg at all.
+	-- Both controls therefore stayed off indefinitely while the UI showed them
+	-- on. Rebuilt here from the openuf_bcfilt/openuf_ratelimit_* options
+	-- wlan_add stamps onto each managed section.
+	--
+	-- pcall'd because it reaches ubus for each VAP's live netdev name: no
+	-- radios, no wifi up yet, no ubus at all are ordinary outcomes on a board
+	-- openUF has never provisioned, and none of them may stop the daemon.
+	if M._ucihelper and M._ucihelper.reapply_runtime_rules then
+		local ok_rt, err_rt = pcall(M._ucihelper.reapply_runtime_rules)
+		if not ok_rt then
+			io.stderr:write("inform: could not reapply blocker/speed-limit rules: "
+				.. tostring(err_rt) .. "\n")
+		end
+	end
 	-- A Locate does NOT survive a restart, and must not: it is a transient
 	-- "which box is it" blink, nobody is still standing in front of the AP,
 	-- and unset-locate only ever arrives while someone is watching the

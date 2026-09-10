@@ -966,6 +966,44 @@ end
 --       controller-assigned device name, used as the WPS Device Name value
 --       when a vap has advertise_ap_name enabled ("Show Access Point Name in
 --       Beacon"); defaults to "openUF" if nil.
+-- Drive the two kernel-resident features from one normalized list of
+-- {ifname, bcfilt_enabled, bcfilt_macs, down_kbps, up_kbps} entries, so the
+-- setparam path and the startup reapply below cannot drift apart.
+--
+-- Both are reconciled unconditionally, even with an empty list: each rebuilds
+-- from scratch rather than diffing, so turning a control off in the controller
+-- tears the previous ruleset down instead of leaving it in place -- the same
+-- contract firewall.lua keeps. That is also why EVERY managed VAP is passed to
+-- the shaper and not just the capped ones: shaper.reconcile clears each
+-- interface it is handed before reshaping it, so a VAP whose limit was just
+-- removed has to appear here, with both rates nil, to get its old qdisc torn
+-- down.
+local function reconcile_runtime(entries)
+	local bcfilter = get_bcfilter()
+	if bcfilter then
+		local rules = {}
+		for _, e in ipairs(entries) do
+			if e.bcfilt_enabled then
+				rules[#rules + 1] = {ifname = e.ifname, macs = e.bcfilt_macs or {}}
+			end
+		end
+		bcfilter.reconcile(rules)
+	end
+
+	local shaper = get_shaper()
+	if shaper then
+		local rules = {}
+		for _, e in ipairs(entries) do
+			rules[#rules + 1] = {
+				ifname    = e.ifname,
+				down_kbps = e.down_kbps,
+				up_kbps   = e.up_kbps,
+			}
+		end
+		shaper.reconcile(rules)
+	end
+end
+
 -- Handles vap_table and radio_table from the setparam/config response.
 function M.apply_config(resp, cfg, opts)
 	local radio_table   = resp.radio_table   or {}
@@ -1342,48 +1380,74 @@ function M.apply_config(resp, cfg, opts)
 	M._ws_cache   = nil
 	M._pass_cache = nil
 
-	-- "Multicast and Broadcast Blocker" enforcement. Deliberately after the
-	-- reload: the rules key off each VAP's live netdev name, which only exists
-	-- (and can change) once netifd has brought the interfaces back up. Always
-	-- reconciled, even with no filtered VAPs, so turning the control off in the
-	-- controller tears the previous ruleset down rather than leaving it in
-	-- place -- the same reason firewall.lua rebuilds from scratch every time.
-	local bcfilter = get_bcfilter()
-	if bcfilter then
-		local rules = {}
-		for _, vap in ipairs(vap_table) do
-			if vap.bcfilt_enabled and vap.ssid and vap.radio then
-				local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
-				if ifname then
-					rules[#rules + 1] = {ifname = ifname, macs = vap.bcfilt_macs or {}}
-				end
+	-- "Multicast and Broadcast Blocker" (nftables) and "WiFi Speed Limit" (tc)
+	-- enforcement. Deliberately after the reload: the rules key off each VAP's
+	-- live netdev name, which only exists (and can change) once netifd has
+	-- brought the interfaces back up.
+	local entries = {}
+	for _, vap in ipairs(vap_table) do
+		if vap.ssid and vap.radio then
+			-- Resolved once per VAP and shared by both features -- this used to
+			-- be two lookups per VAP through the same ubus status call.
+			local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
+			if ifname then
+				entries[#entries + 1] = {
+					ifname         = ifname,
+					bcfilt_enabled = vap.bcfilt_enabled,
+					bcfilt_macs    = vap.bcfilt_macs,
+					down_kbps      = vap.ratelimit_down_kbps,
+					up_kbps        = vap.ratelimit_up_kbps,
+				}
 			end
 		end
-		bcfilter.reconcile(rules)
 	end
+	reconcile_runtime(entries)
+end
 
-	-- "WiFi Speed Limit" enforcement, after the reload for the same reason.
-	-- EVERY managed VAP is passed, not just the capped ones: shaper.reconcile
-	-- clears each interface it is handed before reshaping it, so a VAP whose
-	-- limit was just removed has to appear here (with both rates nil) to get
-	-- its old qdisc torn down.
-	local shaper = get_shaper()
-	if shaper then
-		local rules = {}
-		for _, vap in ipairs(vap_table) do
-			if vap.ssid and vap.radio then
-				local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
-				if ifname then
-					rules[#rules + 1] = {
-						ifname    = ifname,
-						down_kbps = vap.ratelimit_down_kbps,
-						up_kbps   = vap.ratelimit_up_kbps,
-					}
-				end
-			end
+-- Reapply both kernel-resident WiFi features from UCI.
+--
+-- The blocker is an nftables ruleset and the speed limit is a tc qdisc: both
+-- are LIVE KERNEL STATE that a reboot discards, and neither has a UCI option
+-- OpenWrt itself understands. apply_config() only ever runs on a setparam, and
+-- after a reboot there is no setparam to run it -- cfgversion is persisted, so
+-- it matches on the first inform and the controller replies noop with no
+-- system_cfg at all. Both features therefore stayed switched off indefinitely
+-- while the controller UI went on showing them as on.
+--
+-- The four openuf_bcfilt/openuf_ratelimit_* options wlan_add stamps onto each
+-- managed section are the record this reads back; before this they were
+-- written and never read by anything.
+--
+-- Called at startup by inform.M.run, alongside the blocked-client and LED
+-- reconciliation, and for the same reason. Returns the number of managed VAPs
+-- it found, for the caller's log line.
+function M.reapply_runtime_rules()
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local entries = {}
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		local name = s[".name"]
+		if not name or name:sub(1, #OPENUF_PREFIX) ~= OPENUF_PREFIX then return end
+		-- A disabled VAP has no netdev to attach a rule to. It also needs no
+		-- teardown: the reload that disabled it took its interface, and with it
+		-- every qdisc and every nft rule that named it.
+		if s.disabled == "1" then return end
+		local ok_if, ifname = pcall(M.get_ifname_for_vap, s.device, s.ssid)
+		if not (ok_if and ifname) then return end
+		local macs = {}
+		for mac in (s.openuf_bcfilt_macs or ""):gmatch("%S+") do
+			macs[#macs + 1] = mac
 		end
-		shaper.reconcile(rules)
-	end
+		entries[#entries + 1] = {
+			ifname         = ifname,
+			bcfilt_enabled = (s.openuf_bcfilt == "1"),
+			bcfilt_macs    = macs,
+			down_kbps      = tonumber(s.openuf_ratelimit_down),
+			up_kbps        = tonumber(s.openuf_ratelimit_up),
+		}
+	end)
+	reconcile_runtime(entries)
+	return #entries
 end
 
 -- ─── Read helpers (for inform payload builder) ───────────────────────────────

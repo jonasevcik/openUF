@@ -906,6 +906,97 @@ return {
 		end
 	},
 	{
+		-- A1: both features are live KERNEL state -- nftables for the blocker,
+		-- tc for the limit -- and neither has a UCI option OpenWrt applies. A
+		-- reboot discards both, and the controller never re-pushes: cfgversion
+		-- matches on the first inform, so the reply is a noop with no
+		-- system_cfg and apply_config never runs again. The openuf_* stamps are
+		-- the only record of what was configured; before this nothing read them.
+		name = "ucihelper: reapply_runtime_rules rebuilds blocker and speed limit from UCI",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "openuf_radio0_corp", "wifi-iface")
+				c:set("wireless", "openuf_radio0_corp", "device", "radio0")
+				c:set("wireless", "openuf_radio0_corp", "ssid", "corp")
+				c:set("wireless", "openuf_radio0_corp", "openuf_bcfilt", "1")
+				c:set("wireless", "openuf_radio0_corp", "openuf_bcfilt_macs",
+					"01:00:5e:00:00:fb aa:bb:cc:dd:ee:ff")
+				c:set("wireless", "openuf_radio0_corp", "openuf_ratelimit_down", "33000")
+				c:set("wireless", "openuf_radio0_corp", "openuf_ratelimit_up", "17000")
+				local bc, sh
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper._shaper   = {reconcile = function(r) sh = r end}
+				ucihelper.get_ifname_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return "wlan0" end
+				end
+
+				local n = ucihelper.reapply_runtime_rules()
+
+				assert_eq(n, 1, "one managed vap found")
+				assert_eq(#bc, 1, "the blocker ruleset is rebuilt")
+				assert_eq(bc[1].ifname, "wlan0", "on the vap's own netdev")
+				assert_eq(#bc[1].macs, 2, "both allow-listed MACs come back")
+				assert_eq(bc[1].macs[1], "01:00:5e:00:00:fb", "in the order recorded")
+				assert_eq(#sh, 1, "the shaper gets the vap back")
+				assert_eq(sh[1].down_kbps, 33000, "download cap restored as a number")
+				assert_eq(sh[1].up_kbps, 17000, "upload cap restored as a number")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: reapply_runtime_rules leaves unmanaged and disabled sections alone",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				-- Hand-configured SSID: openUF never provisioned it and must
+				-- not shape or filter it.
+				c:set("wireless", "homelab", "wifi-iface")
+				c:set("wireless", "homelab", "device", "radio0")
+				c:set("wireless", "homelab", "ssid", "homelab")
+				c:set("wireless", "homelab", "openuf_ratelimit_down", "1000")
+				-- Managed but switched off: the reload that disabled it took
+				-- its netdev, and every qdisc and nft rule naming it went too.
+				c:set("wireless", "openuf_radio0_old", "wifi-iface")
+				c:set("wireless", "openuf_radio0_old", "device", "radio0")
+				c:set("wireless", "openuf_radio0_old", "ssid", "old")
+				c:set("wireless", "openuf_radio0_old", "disabled", "1")
+				c:set("wireless", "openuf_radio0_old", "openuf_bcfilt", "1")
+				local bc, sh
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper._shaper   = {reconcile = function(r) sh = r end}
+				ucihelper.get_ifname_for_vap = function() return "wlan0" end
+
+				assert_eq(ucihelper.reapply_runtime_rules(), 0, "neither section qualifies")
+				-- Still reconciled, with nothing: each rebuilds from scratch, so
+				-- an empty list is what tears a stale ruleset down.
+				assert_true(bc ~= nil and sh ~= nil, "both are still reconciled")
+				assert_eq(#bc, 0, "no blocker rules")
+				assert_eq(#sh, 0, "no shaper rules")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: reapply_runtime_rules skips a vap whose netdev cannot be resolved",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "openuf_radio0_corp", "wifi-iface")
+				c:set("wireless", "openuf_radio0_corp", "device", "radio0")
+				c:set("wireless", "openuf_radio0_corp", "ssid", "corp")
+				c:set("wireless", "openuf_radio0_corp", "openuf_bcfilt", "1")
+				local bc
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper._shaper   = {reconcile = function() end}
+				-- Radio down, wifi not up yet, no ubus: all ordinary, and a
+				-- rule with a nil ifname would be worse than no rule.
+				ucihelper.get_ifname_for_vap = function() return nil end
+				assert_eq(ucihelper.reapply_runtime_rules(), 0, "unresolvable vap is skipped")
+				assert_eq(#bc, 0, "no rule is built without a netdev name")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config issues wifi reload BEFORE the bcfilter/shaper reconciles",
 		fn = function()
 			-- The ordering is load-bearing: both enforcements resolve live
