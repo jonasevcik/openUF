@@ -227,12 +227,13 @@ local dsa_forks = {}
 
 local function build_dsa(opts)
 	opts = opts or {}
-	dsa_forks = {fdb_br = 0, fdb_dev = 0}
+	dsa_forks = {fdb_br = 0, fdb_dev = 0, uptime = 0}
 	inject_sysinfo(false, false, false, false)
 	local base_read = inform._sysinfo._read_file
 	local base_cmd  = inform._sysinfo._run_cmd
 	inform._sysinfo._read_file = function(path)
 		if path:find("net/arp") then return fixture("proc_net_arp_dsa.txt") end
+		if path == "/proc/uptime" then dsa_forks.uptime = dsa_forks.uptime + 1 end
 		return base_read(path)
 	end
 	inform._sysinfo._run_cmd = function(cmd)
@@ -1632,6 +1633,12 @@ return {
 				.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n"})
 			assert_eq(dsa_forks.fdb_br, 1, "one dump of the kernel FDB per payload")
 			assert_eq(dsa_forks.fdb_dev, 0, "and no per-socket fork at all")
+			-- The payload's very first question is the uptime, and scan_table
+			-- asks it again per radio as its CLOCK_BOOTTIME reference. The pass
+			-- has to be open before that first call, not partway down the
+			-- function -- measuring a real heartbeat on hardware is what caught
+			-- it still being read twice.
+			assert_eq(dsa_forks.uptime, 1, "and /proc/uptime is read once for the payload")
 		end
 	},
 	{

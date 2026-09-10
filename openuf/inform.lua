@@ -560,6 +560,13 @@ end
 function M.build_json(st, cfg, ufhw)
 	local uap = ufhw and ufhw.uap or {}
 
+	-- Opened before the first sysinfo call, not partway down: this payload's
+	-- very first question -- the uptime -- is one scan_table asks again per
+	-- radio, and measuring a real heartbeat on hardware showed it still being
+	-- read twice because the pass started below it. Nothing in here may
+	-- outlive the payload; _tick closes it again even if this function throws.
+	if M._sysinfo.begin_pass then M._sysinfo.begin_pass() end
+
 	-- Collect sysinfo
 	local uptime     = M._sysinfo.uptime()
 	local meminfo    = M._sysinfo.meminfo()
@@ -621,13 +628,6 @@ function M.build_json(st, cfg, ufhw)
 		-- four-SSID box. Feature-detected: test doubles inject a ucihelper
 		-- without it. _tick() ends the pass even when this function throws.
 		if ufuci.begin_pass then ufuci.begin_pass() end
-	end
-	-- The same pass over sysinfo, opened unconditionally (it is not gated on
-	-- ufuci being usable): `/proc/net/arp` was read once per socket -- five
-	-- times a heartbeat -- `/tmp/dhcp.leases` four, and the switch's whole ARL
-	-- was walked once per socket. Nothing behind it may outlive this payload.
-	if M._sysinfo.begin_pass then M._sysinfo.begin_pass() end
-	if ufuci and ufuci.get_vap_table then
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
 		-- The modelmap's hwassign restricts which radios are reported; absent,
