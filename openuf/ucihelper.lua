@@ -52,6 +52,23 @@ local function get_uci()
 	return require("uci")
 end
 
+-- General memo for the lookup pass M.begin_pass/end_pass open (see the
+-- wireless_status cache further down, which was the first thing to need one).
+-- Anything in here answers the SAME question for the length of one inform
+-- payload; outside a pass every call recomputes, which is what keeps the test
+-- suite's per-test stubs independent of one another.
+M._pass_cache = nil
+local function pass_memo(key, fn)
+	local cache = M._ws_pass and M._pass_cache
+	if cache then
+		local hit = cache[key]
+		if hit ~= nil then return hit[1] end
+	end
+	local value = fn()
+	if cache then cache[key] = {value} end
+	return value
+end
+
 -- Load an enforcement sibling by path, mirroring inform.lua's _require_sibling:
 -- openUF's modules are not on package.path, and the working directory differs
 -- between running from openuf/ and from an install root. Returns nil rather
@@ -1318,9 +1335,12 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
-	-- netifd may hand the interfaces new netdev names on the way back up, so
-	-- the lookups below must not reuse anything read before the reload.
-	M._ws_cache = nil
+	-- netifd may hand the interfaces new netdev names on the way back up, and
+	-- the wireless config this reload just wrote is the very thing the radio
+	-- rows were read from, so the lookups below must not reuse anything read
+	-- before it.
+	M._ws_cache   = nil
+	M._pass_cache = nil
 
 	-- "Multicast and Broadcast Blocker" enforcement. Deliberately after the
 	-- reload: the rules key off each VAP's live netdev name, which only exists
@@ -1368,26 +1388,24 @@ end
 
 -- ─── Read helpers (for inform payload builder) ───────────────────────────────
 
--- Return a table of radio info for the inform payload.
--- hwassign: the modelmap's dev.openuf.uap.hwassign -- the radio names to
--- report. Documented since the first release as controlling exactly this, but
--- read by nothing until now, so every wifi-device in UCI was reported no matter
--- what the modelmap said. That matters on a board with a radio openUF should
--- not present as part of the emulated model (a third radio, a mesh-only or
--- monitor phy): the controller would show and try to configure a radio the
--- emulated model does not have. nil/empty keeps the report-everything
--- behavior, which is what a modelmap without hwassign means.
-function M.get_radio_table(hwassign)
+-- Every wifi-device in UCI, unfiltered, read once per pass.
+--
+-- get_radio_table was called TWICE per heartbeat -- once by build_json with
+-- the modelmap's hwassign, and once by get_vap_table with none, to build its
+-- band lookup -- so /etc/config/wireless was loaded through a fresh
+-- uci.cursor() twice for one answer, on config that changes only when the
+-- controller pushes one.
+--
+-- The rows are held UNFILTERED and hwassign is applied per call: the two
+-- callers want different filtering of the same rows, and a memo that held the
+-- filtered result would change which radios vap_table can resolve
+-- radio/channel/tx_power against.
+local function radio_rows()
+	return pass_memo("radio_rows", function()
 	local uci = get_uci()
 	local cursor = uci.cursor()
-	local allowed = nil
-	if type(hwassign) == "table" and #hwassign > 0 then
-		allowed = {}
-		for _, name in ipairs(hwassign) do allowed[name] = true end
-	end
 	local radios = {}
 	cursor:foreach("wireless", "wifi-device", function(s)
-		if allowed and not allowed[s[".name"]] then return end
 		radios[#radios + 1] = {
 			name             = s[".name"],
 			radio            = band_for_device(s),
@@ -1419,6 +1437,38 @@ function M.get_radio_table(hwassign)
 			min_rssi_raw     = tonumber(s.minrssi_rssi),
 		}
 	end)
+	return radios
+	end)
+end
+
+-- Return a table of radio info for the inform payload.
+-- hwassign: the modelmap's dev.openuf.uap.hwassign -- the radio names to
+-- report. Documented since the first release as controlling exactly this, but
+-- read by nothing until now, so every wifi-device in UCI was reported no matter
+-- what the modelmap said. That matters on a board with a radio openUF should
+-- not present as part of the emulated model (a third radio, a mesh-only or
+-- monitor phy): the controller would show and try to configure a radio the
+-- emulated model does not have. nil/empty keeps the report-everything
+-- behavior, which is what a modelmap without hwassign means.
+function M.get_radio_table(hwassign)
+	local allowed = nil
+	if type(hwassign) == "table" and #hwassign > 0 then
+		allowed = {}
+		for _, name in ipairs(hwassign) do allowed[name] = true end
+	end
+	local radios = {}
+	for _, row in ipairs(radio_rows()) do
+		if not allowed or allowed[row.name] then
+			-- A COPY per call. build_json writes the hardware caps, the
+			-- re-derived band and the payload's own fields onto the rows it
+			-- gets back and strips the internal ones; sharing the memoized
+			-- tables would let that reach the copy get_vap_table is reading
+			-- from -- and the next heartbeat's.
+			local copy = {}
+			for k, v in pairs(row) do copy[k] = v end
+			radios[#radios + 1] = copy
+		end
+	end
 	return radios
 end
 
@@ -1460,8 +1510,8 @@ end
 -- be ten identical forks per heartbeat on a two-radio, four-SSID box is one.
 M._ws_cache = nil      -- {status = <decoded table> | false} while a pass is open
 M._ws_pass  = false
-function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil end
-function M.end_pass()   M._ws_pass = false; M._ws_cache = nil end
+function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil; M._pass_cache = {} end
+function M.end_pass()   M._ws_pass = false; M._ws_cache = nil; M._pass_cache = nil end
 
 local function wireless_status()
 	if M._ws_pass and M._ws_cache then

@@ -2852,4 +2852,82 @@ return {
 			end)
 		end
 	},
+	{
+		name = "ucihelper: one wireless read serves a whole payload, and hwassign still filters",
+		fn = function()
+			-- get_radio_table was called twice per heartbeat -- once by
+			-- build_json with the modelmap's hwassign, once by get_vap_table
+			-- with none -- so /etc/config/wireless was loaded through a fresh
+			-- cursor twice for one answer.
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1", "radio2"})
+				local seed = ucihelper._uci.cursor()
+				for _, r in ipairs({"radio0", "radio1", "radio2"}) do
+					seed:set("wireless", r, "country", "CZ")
+				end
+				local reads = 0
+				local real_cursor = ucihelper._uci.cursor
+				ucihelper._uci.cursor = function(...)
+					reads = reads + 1
+					return real_cursor(...)
+				end
+
+				-- No pass open: every call reads, exactly as before.
+				ucihelper.end_pass()
+				ucihelper.get_radio_table()
+				ucihelper.get_radio_table()
+				assert_eq(reads, 2, "no pass open -- every call reads, as before")
+
+				reads = 0
+				ucihelper.begin_pass()
+				local all      = ucihelper.get_radio_table()
+				local assigned = ucihelper.get_radio_table({"radio0", "radio1"})
+				assert_eq(reads, 1, "one wireless read for the whole payload")
+
+				-- The trap: the two callers want DIFFERENT filtering of the
+				-- same rows. A memo holding the filtered result would change
+				-- which radios vap_table can resolve against.
+				assert_eq(#all, 3, "get_vap_table's call still sees every radio")
+				assert_eq(#assigned, 2, "and build_json's still honours hwassign")
+				assert_eq(assigned[1].name, "radio0", "the assigned ones")
+				assert_eq(assigned[2].name, "radio1", "and only those")
+
+				-- Each caller gets its own tables: build_json writes the
+				-- hardware caps onto what it gets and strips the internal
+				-- fields, which must not reach the other caller or the memo.
+				assigned[1].country = nil
+				assigned[1].nss     = 3
+				local again = ucihelper.get_radio_table()
+				assert_eq(again[1].country, "CZ", "a caller's writes do not reach the memo")
+				assert_nil(again[1].nss, "nor its added fields")
+				assert_eq(all[1].country, "CZ", "nor the other caller's copy")
+
+				ucihelper.end_pass()
+				reads = 0
+				ucihelper.get_radio_table()
+				ucihelper.get_radio_table()
+				assert_eq(reads, 2, "the pass is closed -- every call reads again")
+
+				ucihelper._uci.cursor = real_cursor
+			end)
+		end
+	},
+	{
+		name = "ucihelper: nothing read before a `wifi reload` is reused after it",
+		fn = function()
+			-- The radio rows come from the very config apply_config just
+			-- rewrote, so the reload has to drop them along with the netdev
+			-- names -- otherwise the enforcement that runs after the reload
+			-- reads the config as it was before the push.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.begin_pass()
+				ucihelper.get_radio_table()
+				assert_not_nil(ucihelper._pass_cache, "the pass is holding rows")
+				pcall(ucihelper.apply_config, {}, nil, nil)
+				assert_nil(ucihelper._pass_cache, "and the reload dropped them")
+				ucihelper.end_pass()
+			end)
+		end
+	},
 }
