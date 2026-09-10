@@ -1191,4 +1191,53 @@ return {
 			sysinfo.end_pass()
 		end
 	},
+	{
+		name = "sysinfo: the phy dump is parsed once per TTL, not once per radio per heartbeat",
+		fn = function()
+			-- Caching the phy dump's TEXT still left ~8 scans and a gmatch over
+			-- 40-odd kilobytes running per radio per heartbeat. Everything but
+			-- the live channel and TX power is derived from that text and is
+			-- exactly as static as it is, so the derivation is cached with it.
+			local orig_cmd, orig_time = sysinfo._run_cmd, sysinfo._time
+			local clock = 1000
+			sysinfo._time = function() return clock end
+			sysinfo._phy_info_cache = {}
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("iw phy") then
+					return "\t\tHT TX Max spatial streams: 3\n"
+						.. "\t\tVHT Capabilities (0x00000000):\n"
+				end
+				return "\twiphy 0\n\tchannel 36 (5180 MHz)\n\ttxpower 23.00 dBm\n"
+			end
+
+			local first = sysinfo.radio_caps("wlan0")
+			assert_eq(first.nss, 3, "the hardware's real stream count")
+			assert_true(first.is_11ac, "and its PHY generation")
+			assert_eq(first.channel, 36, "with the live channel merged on top")
+			assert_eq(first.tx_power, 23, "and the live TX power")
+
+			-- Reads come from the cached derivation, not from a fresh parse:
+			-- poison the cached half and it shows through.
+			sysinfo._phy_info_cache["0"].caps.nss = 99
+			assert_eq(sysinfo.radio_caps("wlan0").nss, 99,
+				"the hardware half is served from the cache, not re-parsed")
+
+			-- ...but the caller gets a COPY. build_json writes radio_caps and
+			-- wpa3_supported onto what it gets back, and one radio's payload
+			-- fields must not leak into the next radio's -- or into the cache.
+			local mine = sysinfo.radio_caps("wlan0")
+			mine.nss, mine.wpa3_supported = 1, true
+			local theirs = sysinfo.radio_caps("wlan0")
+			assert_eq(theirs.nss, 99, "a caller's writes do not reach the cache")
+			assert_nil(theirs.wpa3_supported, "nor its added fields")
+
+			-- Past the TTL everything is re-read AND re-derived, so a regdomain
+			-- change still lands within minutes.
+			clock = clock + sysinfo.PHY_INFO_TTL + 1
+			assert_eq(sysinfo.radio_caps("wlan0").nss, 3, "re-parsed once the TTL is up")
+
+			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
+			sysinfo._phy_info_cache = {}
+		end
+	},
 }

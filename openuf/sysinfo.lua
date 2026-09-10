@@ -542,49 +542,23 @@ end
 -- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for every
 -- radio on every heartbeat, although it describes the HARDWARE plus the
 -- regulatory domain and changes only with the latter. Cached per phy with a
--- TTL: long enough to take the parse off the 10-second path, short enough that
--- a regdomain change is reflected within minutes. (ucihelper keeps its own,
--- separately invalidated cache of `iw phy` for its clamping decisions.)
--- `iw dev <if> info` is NOT cached -- it carries the live channel and TX
--- power, which is the point of reading it every time.
+-- TTL: long enough to take the fetch AND the parse off the 10-second path,
+-- short enough that a regdomain change is reflected within minutes.
+-- (ucihelper keeps its own, separately invalidated cache of `iw phy` for its
+-- clamping decisions.) `iw dev <if> info` is NOT cached -- it carries the live
+-- channel and TX power, which is the point of reading it every time.
 M.PHY_INFO_TTL = 300
 M._phy_info_cache = {}
-function M._phy_info(phy)
-	local now = M._time()
-	local c = M._phy_info_cache[phy]
-	if c and (now - c.at) < M.PHY_INFO_TTL then return c.text end
-	local text = M._run_cmd("iw phy phy" .. phy .. " info")
-	if text and text ~= "" then
-		M._phy_info_cache[phy] = {text = text, at = now}
-	end
-	return text
-end
 
-function M.radio_caps(ifname)
-	if not ifname then return {} end
-	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
-	local phy = dev_info:match("wiphy%s+(%d+)")
-	if not phy then return {} end
-	local phy_info = M._phy_info(phy)
-	if not phy_info or phy_info == "" then return {} end
-
+-- Everything M.radio_caps() reports that comes from the phy dump rather than
+-- from the live interface. Split out and cached alongside the text it is
+-- derived from, because caching the TEXT alone still left ~8 scans and a
+-- gmatch over 40-odd kilobytes running per radio per heartbeat -- on a 560 MHz
+-- MIPS SoC that parse was the largest thing left on the path, and it produces
+-- the same answer for exactly as long as the text does.
+local function parse_phy_info(phy_info)
 	local has_dfs = phy_info:find("radar detection") ~= nil
-	-- The live negotiated channel ("channel 6 (2437 MHz), width: ...") is
-	-- more authoritative than UCI's own config value, which is frequently
-	-- "auto" (a config *intent*, not a number) -- the controller has no use
-	-- for the literal string "auto" here and was left showing channel 0.
-	local channel = dev_info:match("channel%s+(%d+)")
-	-- The live TX power ("txpower 23.00 dBm"), for exactly the same reason as
-	-- the channel above: UCI carries no `txpower` option at all while the
-	-- controller's Transmit Power is set to Auto (absent = driver default),
-	-- so the payload's tx_power was nil and the Radios view reported every
-	-- radio as transmitting at 0 dBm -- confirmed against a real controller,
-	-- with the hardware actually at 23 dBm (5GHz) and 17 dBm (2.4GHz).
-	-- Floored to whole dBm, which is the unit the field is in.
-	local txpower = tonumber(dev_info:match("txpower%s+([%d%.]+)"))
 	local caps = {
-		channel    = channel and tonumber(channel) or nil,
-		tx_power   = txpower and math.floor(txpower) or nil,
 		is_11ac    = phy_info:find("VHT Capabilities") ~= nil,
 		is_11ax    = (phy_info:find("HE PHY Capabilities") ~= nil) or (phy_info:find("HE MAC Capabilities") ~= nil),
 		is_11be    = phy_info:find("EHT PHY Capabilities") ~= nil,
@@ -634,6 +608,51 @@ function M.radio_caps(ifname)
 		end
 	end
 	caps.nss = nss and tonumber(nss) or 1
+
+	return caps
+end
+
+-- Returns the phy dump's text and the hardware capabilities parsed out of it.
+function M._phy_info(phy)
+	local now = M._time()
+	local c = M._phy_info_cache[phy]
+	if c and (now - c.at) < M.PHY_INFO_TTL then return c.text, c.caps end
+	local text = M._run_cmd("iw phy phy" .. phy .. " info")
+	if not text or text == "" then return text, nil end
+	local caps = parse_phy_info(text)
+	M._phy_info_cache[phy] = {text = text, caps = caps, at = now}
+	return text, caps
+end
+
+function M.radio_caps(ifname)
+	if not ifname then return {} end
+	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
+	local phy = dev_info:match("wiphy%s+(%d+)")
+	if not phy then return {} end
+	local phy_info, static = M._phy_info(phy)
+	if not phy_info or phy_info == "" or not static then return {} end
+
+	-- The hardware half comes off the cached phy dump; copied rather than
+	-- returned directly, since callers merge their own fields into what they
+	-- get back (build_json writes radio_caps/wpa3_supported onto it).
+	local caps = {}
+	for k, v in pairs(static) do caps[k] = v end
+
+	-- The live negotiated channel ("channel 6 (2437 MHz), width: ...") is
+	-- more authoritative than UCI's own config value, which is frequently
+	-- "auto" (a config *intent*, not a number) -- the controller has no use
+	-- for the literal string "auto" here and was left showing channel 0.
+	local channel = dev_info:match("channel%s+(%d+)")
+	-- The live TX power ("txpower 23.00 dBm"), for exactly the same reason as
+	-- the channel above: UCI carries no `txpower` option at all while the
+	-- controller's Transmit Power is set to Auto (absent = driver default),
+	-- so the payload's tx_power was nil and the Radios view reported every
+	-- radio as transmitting at 0 dBm -- confirmed against a real controller,
+	-- with the hardware actually at 23 dBm (5GHz) and 17 dBm (2.4GHz).
+	-- Floored to whole dBm, which is the unit the field is in.
+	local txpower = tonumber(dev_info:match("txpower%s+([%d%.]+)"))
+	caps.channel  = channel and tonumber(channel) or nil
+	caps.tx_power = txpower and math.floor(txpower) or nil
 
 	return caps
 end
