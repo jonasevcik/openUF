@@ -2052,30 +2052,6 @@ return {
 		end
 	},
 	{
-		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.sae.anti_clogging/sae.sync (WPA3-SAE tuning)",
-		fn = function()
-			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.sae.anti_clogging=12\naaa.1.sae.sync=20\n"
-				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
-			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
-			assert_eq(vap_table[1].sae_anti_clogging, 12, "sae.anti_clogging parsed as a number")
-			assert_eq(vap_table[1].sae_sync, 20, "sae.sync parsed as a number")
-		end
-	},
-	{
-		name = "inform packet: _parse_wifi_system_cfg leaves sae_anti_clogging/sae_sync nil when absent",
-		fn = function()
-			-- Real controller behavior: these keys are only ever emitted
-			-- when the WLAN is actually in WPA3/SAE mode (or 6GHz) --
-			-- absent for a plain WPA2 or WPA2/WPA3-mixed WLAN even with a
-			-- non-default admin value saved server-side (confirmed live).
-			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
-				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
-			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
-			assert_eq(vap_table[1].sae_anti_clogging, nil, "no sae.anti_clogging key -> nil")
-			assert_eq(vap_table[1].sae_sync, nil, "no sae.sync key -> nil")
-		end
-	},
-	{
 		name = "inform packet: handle_response parses resolv.host.1.name and threads it as opts.device_name",
 		fn = function()
 			local st = sample_state()

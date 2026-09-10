@@ -1759,7 +1759,15 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: apply_config writes sae_anti_clogging_threshold/sae_sync from vap fields",
+		-- Verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T
+		-- (filogic), both OpenWrt 25.12.5: neither name appears in the
+		-- wifi-iface schema, in /usr/share/ucode/wifi/, or in hostapd.sh's
+		-- config_add_* lists -- the three places a wifi-iface option can be
+		-- declared. openUF wrote both anyway; UCI stored them and the
+		-- generator dropped them without a word. A negative test, so the
+		-- write cannot quietly come back on the strength of the names being
+		-- real hostapd keys -- which they are, just not UCI ones.
+		name = "ucihelper: apply_config does not write UCI options OpenWrt has no schema for",
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
@@ -1771,26 +1779,13 @@ return {
 				}
 				ucihelper.apply_config(resp, nil)
 				local s = db.wireless.openuf_radio0_corp
-				assert_eq(s.sae_anti_clogging_threshold, "12", "sae_anti_clogging_threshold written")
-				assert_eq(s.sae_sync, "20", "sae_sync written")
-			end)
-		end
-	},
-	{
-		name = "ucihelper: apply_config omits sae_anti_clogging_threshold/sae_sync when absent",
-		fn = function()
-			with_ucihelper(function(db)
-				local resp = {
-					radio_table = {},
-					vap_table = {
-						{ssid = "corp", radio = "radio0", security = "wpa2",
-						 x_passphrase = "hunter22"},
-					},
-				}
-				ucihelper.apply_config(resp, nil)
-				local s = db.wireless.openuf_radio0_corp
-				assert_eq(s.sae_anti_clogging_threshold, nil, "no sae_anti_clogging_threshold written")
-				assert_eq(s.sae_sync, nil, "no sae_sync written")
+				assert_eq(s.sae_anti_clogging_threshold, nil,
+					"sae_anti_clogging_threshold is not a UCI option and is not written")
+				assert_eq(s.sae_sync, nil,
+					"sae_sync is not a UCI option and is not written")
+				-- The WLAN itself must still provision normally.
+				assert_eq(s.ssid, "corp", "the vap is still written")
+				assert_eq(s.encryption, "sae", "and still gets its WPA3 encryption")
 			end)
 		end
 	},

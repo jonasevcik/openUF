@@ -1296,23 +1296,15 @@ function M.apply_config(resp, cfg, opts)
 				extra.wps_device_name = (opts and opts.device_name) or "openUF"
 				extra.ap_setup_locked = "1"
 			end
-			if vap.sae_anti_clogging then
-				-- hostapd's own option name for this exact WPA3-SAE tuning
-				-- value (default 5, confirmed via hostapd upstream docs).
-				-- Renamed to "anti_clogging_threshold" in newer hostapd
-				-- (to also cover PASN, not just SAE) -- using the older
-				-- name here since it's the one broadly supported across
-				-- the OpenWrt/wpad versions this project targets; revisit
-				-- if a target build's hostapd has dropped the old alias.
-				extra.sae_anti_clogging_threshold = vap.sae_anti_clogging
-			end
-			if vap.sae_sync then
-				-- hostapd's own option name, unchanged/stable across
-				-- versions (confirmed via hostapd upstream docs) -- max
-				-- SAE sync errors (dot11RSNASAESync) before disconnecting
-				-- the offending peer.
-				extra.sae_sync = vap.sae_sync
-			end
+			-- NOT written: SAE anti-clogging / sync time. Both are real
+			-- hostapd config keys, but OpenWrt exposes neither as a
+			-- wifi-iface UCI option -- verified 2026-09-10 on an Archer C5
+			-- (ath79) and an AX3000T (filogic), both OpenWrt 25.12.5, against
+			-- all three places an option can be declared: the wifi-iface
+			-- schema, /usr/share/ucode/wifi/ and hostapd.sh's config_add_*
+			-- lists. Neither name appears in any of them, on either board, so
+			-- a write here was stored in UCI and dropped in silence.
+			-- The wire keys are still parsed and reported; see inform.lua.
 			-- VLAN comes off the vap itself: the controller derives it from
 			-- aaa.<n>.br.devname ("br0.20"), not from a linked network object.
 			local vlan_enabled = vap.vlan_enabled

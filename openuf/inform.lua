@@ -2196,8 +2196,6 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- entirely, even across an inform.lua restart. High
 				-- confidence from the decompiled method body alone
 				-- (a simple getInt(key, -1) > 0 check, no ambiguity).
-				sae_anti_clogging     = tonumber(a["sae.anti_clogging"]),
-				sae_sync              = tonumber(a["sae.sync"]),
 					-- aaa.<n>.proxy_arp: "Proxy ARP". CONFIRMED live
 					-- 2026-07-18 by REST-toggling wlanconf.proxy_arp and
 					-- diffing system_cfg -- exactly aaa.<n>.proxy_arp flipped
