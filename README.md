@@ -214,6 +214,11 @@ python3 tools/test_controller.py --adopt --verbose
 cd openuf && lua inform.lua
 ```
 
+On a real AP, `tools/heartbeat-probe.lua` reports what one inform actually costs
+that board — every process spawned and file opened, per command and path — by
+building its own payload in a throwaway process alongside the running daemon.
+See [USAGE § 8](USAGE.md#measuring-what-a-heartbeat-costs-on-the-device).
+
 ## Protocol notes
 
 openUF implements the **TNBU binary inform protocol**:

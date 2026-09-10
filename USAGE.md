@@ -919,3 +919,35 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 Log file: `/var/log/openuf.log`
 
 For development testing without hardware, see `tools/test_controller.py`.
+
+### Measuring what a heartbeat costs on the device
+
+`tools/heartbeat-probe.lua` builds one real inform payload and reports every
+process it spawns and every file it opens, broken down by command and path. It
+builds its own payload in a throwaway process, so it is safe to run on a live,
+adopted AP alongside `openuf`.
+
+```sh
+ssh root@<ap> 'cat > /tmp/heartbeat-probe.lua' < tools/heartbeat-probe.lua
+ssh root@<ap> 'cd /opt/openuf && lua /tmp/heartbeat-probe.lua'
+```
+
+Read the **steady** figure, not the cold one: the first payload of a process
+warms everything TTL-cached across heartbeats (the phy dump, the uplink lookup,
+the LLDP neighbour list), so it overstates what openUF pays every ten seconds.
+Add `payload` as an argument to also print the payload on stdout, which is how
+you show a change is behaviour-neutral — build one before and after, and diff
+them with the live counters (`time`, `uptime`, byte/packet counts, `signal`,
+`tx_mcs`, `capacity`, `throughput`, `satisfaction_now`, `idletime`) scrubbed.
+
+The probe measures the *build* half only. To confirm the daemon is still
+informing, count outbound TCP connections — an AP originates almost nothing
+else, so this rises once per heartbeat:
+
+```sh
+grep -A1 '^Tcp:' /proc/net/snmp | sed -n 2p | cut -d' ' -f6
+```
+
+Polling `netstat` for a connection to the controller does **not** work: a POST
+is sub-second, and once-a-second sampling misses it on a perfectly healthy AP.
+openUF logs nothing on success, so silence in `logread` is not evidence either.

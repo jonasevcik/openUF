@@ -1,3 +1,8 @@
+# Release artifacts (tools/dist.sh)
 build/
 openuf.tar.gz
 openuf.tar.gz.sha256
+
+# macOS Finder metadata. Written into any directory the Finder has merely
+# looked at, so it turns up in docs/ as readily as the root.
+.DS_Store
