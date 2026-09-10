@@ -15,21 +15,35 @@ what each requires.
 
 ## 0. What this environment can and cannot show
 
-The "AP" is Alpine with an **in-memory UCI mock**, not OpenWrt. Two consequences
-worth knowing before you trust a result here:
+The "AP" is Alpine with a **mocked UCI**, not OpenWrt. Two things to know before
+you trust a result here:
 
-- **UCI does not survive a process restart.** The mock's `db` is a module-local
-  table seeded at load; `commit()` writes a JSON dump for inspection and nothing
-  ever reads it back. So anything whose correctness depends on UCI persisting
-  across a daemon restart — the startup reapply of the Multicast/Broadcast
-  Blocker and the WiFi Speed Limit, for instance — **cannot** be validated here.
-  What can be: that the reapply turns UCI markers into rules the real `nft` and
-  `tc` accept, which this container does have.
+- **UCI persists across process restarts** (since 2026-09-10). The mock writes
+  `/var/lib/openuf-uci-mock.json` on every `set`/`delete` and reloads it at
+  module load, the way a real `/etc/config/*` survives a reboot. That is what
+  makes "does this survive a restart?" answerable here at all — the startup
+  reapply of the Multicast/Broadcast Blocker and the WiFi Speed Limit rebuilds
+  both from `openuf_bcfilt`/`openuf_ratelimit_*` stamped on each managed
+  section, and that is now testable end to end. Before this the mock reseeded
+  on every process start, so the whole question was invisible.
+  Clear it with `docker compose down -v` (it lives in the container's writable
+  layer) or `lua -e 'require("uci")._reset()'` for a clean run without
+  recreating the container.
 - **`state.json` does survive**, since it is a real file in the container's
   writable layer. `docker restart openuf-validation-ap` therefore makes a
   faithful reboot test for anything driven from state.json — the static-IP
   reapply, blocked clients, the LED toggle. The network is reset by Docker on
   restart, exactly as a reboot resets it.
+
+The mock also gained a correct `cursor:delete(config, section, option)` on the
+same date. It had ignored the third argument and deleted the whole **section**
+either way — and the option form is not a rare path: `rf_config` deletes
+`txpower`/`basic_rate`/`supported_rates`/`legacy_rates` on essentially every
+radio push, and `wlan_add` deletes `macfilter`/`maclist` on every WLAN without a
+MAC filter. The lab was destroying its own `radio0`/`radio1` wifi-device sections
+and its freshly written wifi-iface sections on the ordinary push. The unit-test
+mock in `tests/test_ucihelper.lua` always had this right, which is why unit tests
+never showed it.
 
 The mock gained `cursor:get()` on 2026-09-10. It had never had one, and
 `usteer.set_enabled`'s no-op guard calls it on every WiFi setparam — so **every
