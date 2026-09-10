@@ -65,6 +65,14 @@ local function pass_memo(key, fn)
 	return value
 end
 
+-- One read of the kernel's ARP cache per pass. Both readers of it below --
+-- _ip_by_mac for the wired-host join, _default_gateway_mac for the uplink
+-- question -- go through this, so the file is opened once per payload rather
+-- than once per socket plus one.
+local function arp_text()
+	return pass_memo("arp_text", function() return M._read_file("/proc/net/arp") end)
+end
+
 -- A {[mac] = port} map inverted into {[port] = {macs}}, multicast/broadcast
 -- dropped on the address's own bit and each bucket sorted (pairs() order is
 -- undefined; the payload must be stable).
@@ -700,7 +708,7 @@ end
 function M._ip_by_mac()
 	return pass_memo("ip_by_mac", function()
 		local by_mac = {}
-		local arp_out = M._read_file("/proc/net/arp")
+		local arp_out = arp_text()
 		if arp_out then
 			for line in arp_out:gmatch("[^\n]+") do
 				local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
@@ -866,6 +874,33 @@ function M.switch_status(device)
 	return status
 end
 
+-- Uplink detection is deliberately MEASURED rather than declared (see
+-- M.uplink_phys_port): a modelmap constant is wrong the moment someone moves
+-- the cable. But two of its three inputs are not measurements of the cable at
+-- all and were re-asked every ten seconds anyway -- which bridge a netdev is
+-- enslaved to (a `readlink` fork), and the default route's gateway IP (an
+-- `ip route` fork). Both change only when the network is reconfigured.
+--
+-- Cached with the same TTL discipline as PHY_INFO_TTL. What stays live is the
+-- part that actually follows the cable: the gateway's MAC is looked up in the
+-- ARP cache every time, and resolved against the ARL/FDB every time, so a
+-- moved cable is still picked up on the next heartbeat.
+--
+-- A nil answer is NOT cached. "No default route yet" and "not a bridge port
+-- yet" are both ordinary states during boot, before DHCP has settled or netifd
+-- has finished; caching them would leave the device unable to find its uplink
+-- for the next five minutes.
+M.UPLINK_TTL = 300
+M._uplink_cache = {}
+local function uplink_memo(key, fn)
+	local now = M._time()
+	local c = M._uplink_cache[key]
+	if c and (now - c.at) < M.UPLINK_TTL then return c.value end
+	local value = fn()
+	if value ~= nil then M._uplink_cache[key] = {value = value, at = now} end
+	return value
+end
+
 -- The MAC of the default gateway: its IP from the default route, then that
 -- IP's hardware address from the kernel's ARP cache. Lowercased. nil whenever
 -- any link of the chain is missing -- no default route, no ARP entry yet.
@@ -874,10 +909,12 @@ end
 -- detectors below are only different ways of asking the switch where that MAC
 -- lives: swconfig's ARL table on ath79, the bridge FDB on DSA.
 function M._default_gateway_mac()
-	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
-		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	local gw_ip = uplink_memo("default_gw_ip", function()
+		return tostring(M._run_cmd("ip route show default") or "")
+			:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	end)
 	if not gw_ip then return nil end
-	local arp_out = M._read_file("/proc/net/arp")
+	local arp_out = arp_text()
 	if not arp_out then return nil end
 	for line in arp_out:gmatch("[^\n]+") do
 		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
@@ -918,10 +955,12 @@ end
 -- /sys/class/net/<if>/master symlinks to the enslaving device.
 function M.bridge_of(ifname)
 	if not ifname then return nil end
-	local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
-	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
-	if m and m ~= "" and m ~= ifname then return m end
-	return nil
+	return uplink_memo("bridge_of:" .. ifname, function()
+		local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
+		m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
+		if m and m ~= "" and m ~= ifname then return m end
+		return nil
+	end)
 end
 
 -- {[mac] = port_ifname} for every host the bridge has LEARNED, from one

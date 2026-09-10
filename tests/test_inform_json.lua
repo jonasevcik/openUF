@@ -27,6 +27,13 @@ end
 -- info` sources return a real 5GHz (VHT+HE+DFS+160MHz) fixture instead of
 -- empty.
 local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_caps)
+	-- Caches whose whole point is to outlive a heartbeat: swapping the
+	-- fixtures underneath them is exactly what they are not built for, so each
+	-- payload starts from a clean one. (with_fixtures in test_sysinfo.lua does
+	-- the same, on the way in and out.)
+	inform._sysinfo._phy_info_cache = {}
+	inform._sysinfo._uplink_cache   = {}
+	inform._sysinfo.end_pass()
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
 		if path:find("loadavg") then return fixture("proc_loadavg.txt") end

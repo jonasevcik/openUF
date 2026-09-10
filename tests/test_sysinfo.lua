@@ -20,9 +20,11 @@ local function with_fixtures(file_map, cmd_map, fn)
 	-- not built for, so drop it on the way in AND on the way out: a test
 	-- feeding a canned phy dump must not leak those caps into a later one.
 	sysinfo._phy_info_cache = {}
-	-- Same reasoning for the lookup pass: a pass left open by a failed test
-	-- would memoize one test's fixtures into the next.
+	-- Same reasoning for the lookup pass and for the uplink cache, which holds
+	-- a `readlink` and an `ip route` answer for five minutes: a pass or an
+	-- entry left behind would memoize one test's fixtures into the next.
 	sysinfo.end_pass()
+	sysinfo._uplink_cache = {}
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -39,6 +41,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	sysinfo._read_file = orig_rf
 	sysinfo._run_cmd   = orig_cmd
 	sysinfo._phy_info_cache = {}
+	sysinfo._uplink_cache = {}
 	sysinfo.end_pass()
 	if not ok then error(err, 2) end
 end
@@ -1238,6 +1241,135 @@ return {
 
 			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
 			sysinfo._phy_info_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: the uplink's near-static inputs are cached, the cable-following ones are not",
+		fn = function()
+			-- Which socket the cable is in must stay measured every heartbeat.
+			-- Which BRIDGE a netdev is on, and what the default route's gateway
+			-- IP is, are not measurements of the cable and changed only when
+			-- the network was reconfigured -- two forks a heartbeat, forever.
+			local orig_cmd, orig_rf, orig_time =
+				sysinfo._run_cmd, sysinfo._read_file, sysinfo._time
+			local clock = 5000
+			sysinfo._time = function() return clock end
+			sysinfo._uplink_cache = {}
+			local readlinks, routes = 0, 0
+			local gw = "192.168.200.1"
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("readlink") then
+					readlinks = readlinks + 1
+					return "../../../../../virtual/net/br-lan\n"
+				elseif cmd:find("ip route") then
+					routes = routes + 1
+					return "default via " .. gw .. " dev br-lan \n"
+				end
+				return ""
+			end
+			local arp_reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					arp_reads = arp_reads + 1
+					return gw .. " 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+						.. "192.168.200.9 0x1 0x2 aa:bb:cc:00:00:09 * br-lan\n"
+				end
+				return nil
+			end
+
+			assert_eq(sysinfo.bridge_of("wan"), "br-lan", "the bridge is found")
+			sysinfo.bridge_of("wan"); sysinfo.bridge_of("wan")
+			assert_eq(readlinks, 1, "and asked for once, not once per heartbeat")
+
+			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:01", "the gateway")
+			sysinfo._default_gateway_mac()
+			assert_eq(routes, 1, "the default route is asked for once")
+			assert_eq(arp_reads, 2, "but the ARP cache is read every time -- it follows the cable")
+
+			-- The gateway moving to another socket is picked up immediately:
+			-- the same IP, a different MAC in the ARP cache.
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					return gw .. " 0x1 0x2 aa:bb:cc:00:00:0f * br-lan\n"
+				end
+				return nil
+			end
+			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:0f",
+				"a change on the live half lands on the very next heartbeat")
+
+			-- Past the TTL the near-static half is re-asked too.
+			clock = clock + sysinfo.UPLINK_TTL + 1
+			sysinfo.bridge_of("wan")
+			sysinfo._default_gateway_mac()
+			assert_eq(readlinks, 2, "the bridge is re-read once the TTL is up")
+			assert_eq(routes, 2, "and so is the default route")
+
+			sysinfo._run_cmd, sysinfo._read_file, sysinfo._time =
+				orig_cmd, orig_rf, orig_time
+			sysinfo._uplink_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: a device with no default route yet keeps asking",
+		fn = function()
+			-- "No default route" and "not a bridge port" are ordinary states
+			-- during boot, before DHCP has settled or netifd has finished.
+			-- Caching them would leave the device unable to find its uplink for
+			-- the next five minutes.
+			local orig_cmd, orig_rf = sysinfo._run_cmd, sysinfo._read_file
+			sysinfo._uplink_cache = {}
+			local up = false
+			sysinfo._run_cmd = function(cmd)
+				if not up then return "" end
+				if cmd:find("readlink") then return "/sys/devices/virtual/net/br-lan\n" end
+				if cmd:find("ip route") then return "default via 10.0.0.1 dev br-lan \n" end
+				return ""
+			end
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					return "10.0.0.1 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+				end
+				return nil
+			end
+			assert_nil(sysinfo.bridge_of("wan"), "nothing to find yet")
+			assert_nil(sysinfo._default_gateway_mac(), "nor a gateway")
+			up = true
+			assert_eq(sysinfo.bridge_of("wan"), "br-lan", "and it is found as soon as it exists")
+			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:01", "gateway too")
+
+			sysinfo._run_cmd, sysinfo._read_file = orig_cmd, orig_rf
+			sysinfo._uplink_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: one read of /proc/net/arp serves the whole payload",
+		fn = function()
+			-- _default_gateway_mac had its own inline read of the ARP cache,
+			-- separate from _ip_by_mac's -- so the pass covered four of the
+			-- five reads a heartbeat, not all five. Both go through one now.
+			local orig_rf, orig_cmd = sysinfo._read_file, sysinfo._run_cmd
+			sysinfo._uplink_cache = {}
+			local arp_reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					arp_reads = arp_reads + 1
+					return "10.0.0.1 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+				end
+				return nil
+			end
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("ip route") then return "default via 10.0.0.1 dev br-lan \n" end
+				return ""
+			end
+			sysinfo.begin_pass()
+			sysinfo._default_gateway_mac()
+			sysinfo._ip_by_mac()
+			sysinfo._default_gateway_mac()
+			assert_eq(arp_reads, 1, "the uplink lookup and the host join share one read")
+			sysinfo.end_pass()
+
+			sysinfo._read_file, sysinfo._run_cmd = orig_rf, orig_cmd
+			sysinfo._uplink_cache = {}
 		end
 	},
 }
