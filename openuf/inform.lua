@@ -186,26 +186,28 @@ function M._link_up(ifname)
 	return nil
 end
 
--- Returns the mtime (seconds since epoch, as a number) of path, or nil if
--- it can't be stat'd (missing, permission denied, stat unavailable, ...).
--- A token that changes whenever the state file changes. Compared for equality
--- only -- callers never interpret it -- so its type is free to vary.
+-- A token that changes whenever the state file changes, or nil when the file
+-- cannot be read. Compared for equality only -- callers never interpret it --
+-- so its type is free to vary.
 --
--- `stat -c %Y` first, since it costs no file read. But it cannot be relied on:
--- BusyBox gates `-c` behind FEATURE_STAT_FORMAT and some builds omit the stat
--- applet entirely (confirmed on a real TL-WDR3500 with no stat at all), and
--- coreutils-stat is 40 KB on boards that are already out of flash. When it is
--- unavailable, fall back to the file's own CONTENTS as the token: state.json
--- is a few hundred bytes, so re-reading it once per poll costs nothing, and it
--- needs no package, no applet and no busybox config.
+-- The token is the file's own CONTENTS. This used to try `stat -c %Y` first
+-- and keep the contents as a fallback, which cost a fork on the very first
+-- line of every heartbeat and bought nothing:
 --
--- The fallback is in fact the stronger test: mtime has one-second granularity,
--- so two writes inside the same second are indistinguishable by it, while the
--- contents are not.
+--   * it cannot be relied on anyway. BusyBox gates `-c` behind
+--     FEATURE_STAT_FORMAT and some builds omit the stat applet entirely
+--     (confirmed on a real TL-WDR3500 with no stat at all), so on those boards
+--     the fork was guaranteed to fail and this line ran regardless -- every
+--     ten seconds, forever.
+--   * the contents are the STRONGER test. mtime has one-second granularity,
+--     so two writes inside the same second are indistinguishable by it.
+--   * state.json is a few hundred bytes, and it is what M._state.load() is
+--     about to read anyway.
+--
+-- So the fork bought strictly less correctness than the free path it fell back
+-- to. The one thing lost with it is detecting a change to a file too large to
+-- want to re-read; state.json is not that file, and never will be.
 function M._state_mtime(path)
-	local out = M._run_cmd("stat -c %Y '" .. path .. "'")
-	local n = tonumber((out:gsub("%s+$", "")))
-	if n then return n end
 	return M._read_file(path)
 end
 

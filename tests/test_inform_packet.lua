@@ -2652,24 +2652,21 @@ return {
 		end
 	},
 	{
-		name = "inform: _state_mtime parses stat output as a number",
+		name = "inform: _state_mtime forks nothing and returns nil for a missing file",
 		fn = function()
-			local orig = inform._run_cmd
-			inform._run_cmd = function(cmd) return "1700000000\n" end
-			local mtime = inform._state_mtime("/tmp/whatever")
-			inform._run_cmd = orig
-			assert_eq(mtime, 1700000000, "mtime parsed as number")
-		end
-	},
-	{
-		name = "inform: _state_mtime returns nil when stat yields no output",
-		fn = function()
+			-- This runs on the first line of every heartbeat. It used to fork
+			-- `stat -c %Y` and keep the file contents as a fallback; the fork
+			-- bought strictly less than the fallback (mtime has one-second
+			-- granularity) and on a board with no stat applet it could only
+			-- ever fail. Nothing here may spawn a process.
 			local orig, orig_read = inform._run_cmd, inform._read_file
-			inform._run_cmd = function(cmd) return "" end
+			local forks = 0
+			inform._run_cmd = function() forks = forks + 1; return "1700000000\n" end
 			inform._read_file = function() return nil end
 			local mtime = inform._state_mtime("/nonexistent")
 			inform._run_cmd, inform._read_file = orig, orig_read
-			assert_true(mtime == nil, "nil when file missing")
+			assert_eq(forks, 0, "no process is spawned to poll the state file")
+			assert_true(mtime == nil, "nil when the file cannot be read")
 		end
 	},
 	{
@@ -2712,20 +2709,20 @@ return {
 		end
 	},
 	{
-		name = "inform: _state_mtime falls back to file contents without stat",
+		name = "inform: the state token tracks the file's contents",
 		fn = function()
-			-- BusyBox gates `stat -c` behind FEATURE_STAT_FORMAT and some
-			-- builds ship no stat applet at all -- confirmed on a real
-			-- TL-WDR3500 -- which silently disabled detection of an SSH
-			-- set-adopt or a manual reset-inform until openUF restarted.
+			-- Detecting an SSH set-adopt or a manual reset-inform hangs on
+			-- this: a state file written since the last heartbeat must produce
+			-- a different token. Contents, not mtime -- two writes inside one
+			-- second are indistinguishable by mtime and not by this.
 			local orig, orig_read = inform._run_cmd, inform._read_file
-			inform._run_cmd = function() return "" end        -- no stat anywhere
+			inform._run_cmd = function() return "" end
 			inform._read_file = function() return '{"adopted":false}' end
 			local a = inform._state_mtime("/etc/openuf/state.json")
 			inform._read_file = function() return '{"adopted":true}' end
 			local b = inform._state_mtime("/etc/openuf/state.json")
 			inform._run_cmd, inform._read_file = orig, orig_read
-			assert_not_nil(a, "a token is produced without stat")
+			assert_not_nil(a, "a token is produced")
 			assert_true(a ~= b, "and it changes when the file changes")
 		end
 	},
