@@ -3152,6 +3152,40 @@ return {
 		end
 	},
 	{
+		name = "inform: a build_json that throws still closes the sysinfo lookup pass",
+		fn = function()
+			-- The sysinfo pass memoizes /proc/net/arp, /tmp/dhcp.leases and the
+			-- bucketed switch ARL for the length of one payload. Leaving it
+			-- open past an error would feed the NEXT heartbeat this one's
+			-- wired-host data -- clients that have since moved socket or
+			-- changed address, reported where they used to be.
+			local orig = {
+				build_json = inform.build_json, sysinfo = inform._sysinfo,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			io.stderr = {write = function() end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			local open_passes = 0
+			inform._sysinfo = {
+				begin_pass = function() open_passes = open_passes + 1 end,
+				end_pass   = function() open_passes = open_passes - 1 end,
+			}
+			inform.build_json = function()
+				inform._sysinfo.begin_pass()
+				error("boom halfway through the payload")
+			end
+			inform._tick({inform_url = "http://unifi:8080/inform"}, nil, nil,
+				{interval = 10, backoff = 10})
+
+			inform.build_json, inform._sysinfo, inform._reload_if_changed,
+				inform._rrm_tick, io.stderr =
+				orig.build_json, orig.sysinfo, orig.reload, orig.rrm, orig.stderr
+			assert_eq(open_passes, 0, "the pass is closed even on the error path")
+		end
+	},
+	{
 		name = "inform: a streak of HTTP 400s names its likely cause once",
 		fn = function()
 			-- When lan_cpueth changes under an adopted device, every inform

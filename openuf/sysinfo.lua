@@ -25,6 +25,46 @@ M._run_cmd = function(cmd)
 	return s or ""
 end
 
+
+-- ─── Lookup pass ────────────────────────────────────────────────────────────
+--
+-- The same seam ucihelper.begin_pass/end_pass provides, for the same reason:
+-- build_json asks several of the functions below the SAME question once per
+-- socket, and the answer cannot change inside one payload. `/proc/net/arp` was
+-- read five times per heartbeat and `/tmp/dhcp.leases` four (once per
+-- downstream socket, from both mac_table and switch_mac_table, plus one more
+-- for the default gateway), and the switch's whole ARL table was walked once
+-- per socket to keep the handful of entries on it.
+--
+-- Scoped to a pass rather than given a TTL: both files are genuinely live
+-- between heartbeats, and none of this may outlast the payload it was read
+-- for. It also makes that payload internally CONSISTENT -- without it two
+-- sockets in one inform can disagree about a host's IP.
+--
+-- Outside a pass every function below behaves exactly as it did before, which
+-- is what keeps the test suite's per-test _read_file/_run_cmd stubs
+-- independent of one another. inform.build_json opens the pass and closes it
+-- on return; inform._tick closes it again even when build_json throws.
+M._pass       = false
+M._pass_cache = nil
+function M.begin_pass() M._pass = true;  M._pass_cache = {} end
+function M.end_pass()   M._pass = false; M._pass_cache = nil end
+
+-- Run fn() once per pass, keyed by `key`. Outside a pass fn() runs every time.
+-- A false/nil result is memoized as such (wrapped, so "computed and empty" is
+-- distinguishable from "not computed"): a missing /tmp/dhcp.leases must not be
+-- re-opened once per socket either.
+local function pass_memo(key, fn)
+	local cache = M._pass and M._pass_cache
+	if cache then
+		local hit = cache[key]
+		if hit ~= nil then return hit[1] end
+	end
+	local value = fn()
+	if cache then cache[key] = {value} end
+	return value
+end
+
 -- Returns uptime in seconds (as a number) by parsing /proc/uptime.
 function M.uptime()
 	local s = M._read_file("/proc/uptime")
@@ -611,32 +651,36 @@ end
 -- MAC -> IP from /proc/net/arp (the header line has no MAC and is skipped by
 -- the pattern itself). Shared by both wired-host sources below.
 function M._ip_by_mac()
-	local by_mac = {}
-	local arp_out = M._read_file("/proc/net/arp")
-	if arp_out then
-		for line in arp_out:gmatch("[^\n]+") do
-			local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-			if ip and mac then by_mac[mac:lower()] = ip end
+	return pass_memo("ip_by_mac", function()
+		local by_mac = {}
+		local arp_out = M._read_file("/proc/net/arp")
+		if arp_out then
+			for line in arp_out:gmatch("[^\n]+") do
+				local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+				if ip and mac then by_mac[mac:lower()] = ip end
+			end
 		end
-	end
-	return by_mac
+		return by_mac
+	end)
 end
 
 -- MAC -> hostname from dnsmasq's lease file, when this device runs the DHCP
 -- server (format: "<expiry> <mac> <ip> <hostname> <client-id>"). An AP usually
 -- is not, so this is empty far more often than not.
 function M._hostname_by_mac()
-	local by_mac = {}
-	local leases_out = M._read_file("/tmp/dhcp.leases")
-	if leases_out then
-		for line in leases_out:gmatch("[^\n]+") do
-			local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
-			if mac and hostname and hostname ~= "*" then
-				by_mac[mac:lower()] = hostname
+	return pass_memo("hostname_by_mac", function()
+		local by_mac = {}
+		local leases_out = M._read_file("/tmp/dhcp.leases")
+		if leases_out then
+			for line in leases_out:gmatch("[^\n]+") do
+				local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
+				if mac and hostname and hostname ~= "*" then
+					by_mac[mac:lower()] = hostname
+				end
 			end
 		end
-	end
-	return by_mac
+		return by_mac
+	end)
 end
 
 -- Returns a table of wired hosts learned on ifname's bridge port, by
@@ -854,6 +898,32 @@ function M.uplink_bridge_port(bridge)
 	return M.bridge_fdb_ports(bridge)[gw_mac]
 end
 
+-- The ARL bucketed by physical port, multicast/broadcast already dropped and
+-- each bucket sorted (pairs() order is undefined; the payload must be stable).
+--
+-- switch_mac_table walked the WHOLE table once per socket to keep only the
+-- entries on that one -- O(sockets x ARL) on a switch that may have learned a
+-- couple of hundred hosts. One bucketing pass answers every socket.
+--
+-- Memoized on the `arl` TABLE, not on a name: build_json fetches one dump per
+-- heartbeat (inform.lua's switch_status call) and hands the same table to
+-- every socket, so a pass given a fresh dump buckets it afresh.
+local function arl_by_port(arl)
+	return pass_memo(arl, function()
+		local by_port = {}
+		for mac, port in pairs(arl) do
+			local first_octet = tonumber(mac:sub(1, 2), 16)
+			if first_octet and first_octet % 2 == 0 then
+				local bucket = by_port[port]
+				if not bucket then bucket = {}; by_port[port] = bucket end
+				bucket[#bucket + 1] = mac
+			end
+		end
+		for _, bucket in pairs(by_port) do table.sort(bucket) end
+		return by_port
+	end)
+end
+
 -- The wired hosts learned on one physical switch port, in the same shape
 -- M.mac_table() returns ({mac, ip, hostname, age, uptime}) so port_table's
 -- consumer does not care which source a port's hosts came from.
@@ -864,17 +934,8 @@ end
 -- caller, which is where both sets are already known.
 function M.switch_mac_table(phys, arl)
 	if phys == nil or type(arl) ~= "table" then return {} end
-	local macs = {}
-	for mac, port in pairs(arl) do
-		if port == phys then
-			local first_octet = tonumber(mac:sub(1, 2), 16)
-			if first_octet and first_octet % 2 == 0 then
-				macs[#macs + 1] = mac
-			end
-		end
-	end
-	if #macs == 0 then return {} end
-	table.sort(macs)   -- pairs() order is undefined; keep the payload stable
+	local macs = arl_by_port(arl)[phys]
+	if not macs or #macs == 0 then return {} end
 
 	local ip_by_mac       = M._ip_by_mac()
 	local hostname_by_mac = M._hostname_by_mac()

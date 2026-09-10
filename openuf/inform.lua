@@ -610,6 +610,13 @@ function M.build_json(st, cfg, ufhw)
 		-- four-SSID box. Feature-detected: test doubles inject a ucihelper
 		-- without it. _tick() ends the pass even when this function throws.
 		if ufuci.begin_pass then ufuci.begin_pass() end
+	end
+	-- The same pass over sysinfo, opened unconditionally (it is not gated on
+	-- ufuci being usable): `/proc/net/arp` was read once per socket -- five
+	-- times a heartbeat -- `/tmp/dhcp.leases` four, and the switch's whole ARL
+	-- was walked once per socket. Nothing behind it may outlive this payload.
+	if M._sysinfo.begin_pass then M._sysinfo.begin_pass() end
+	if ufuci and ufuci.get_vap_table then
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
 		-- The modelmap's hwassign restricts which radios are reported; absent,
@@ -1579,6 +1586,7 @@ function M.build_json(st, cfg, ufhw)
 	}
 
 	if ufuci and ufuci.end_pass then ufuci.end_pass() end
+	if M._sysinfo.end_pass then M._sysinfo.end_pass() end
 	return M._fix_empty_arrays(cjson.encode(payload))
 end
 
@@ -3391,6 +3399,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- return; an error skips that close, and a stale pass would then feed
 	-- handle_response's own lookups pre-reload interface names.
 	if M._ucihelper and M._ucihelper.end_pass then pcall(M._ucihelper.end_pass) end
+	if M._sysinfo and M._sysinfo.end_pass then pcall(M._sysinfo.end_pass) end
 	if not ok_b then
 		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")
 		return ctx.interval

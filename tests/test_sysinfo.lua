@@ -20,6 +20,9 @@ local function with_fixtures(file_map, cmd_map, fn)
 	-- not built for, so drop it on the way in AND on the way out: a test
 	-- feeding a canned phy dump must not leak those caps into a later one.
 	sysinfo._phy_info_cache = {}
+	-- Same reasoning for the lookup pass: a pass left open by a failed test
+	-- would memoize one test's fixtures into the next.
+	sysinfo.end_pass()
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -36,6 +39,7 @@ local function with_fixtures(file_map, cmd_map, fn)
 	sysinfo._read_file = orig_rf
 	sysinfo._run_cmd   = orig_cmd
 	sysinfo._phy_info_cache = {}
+	sysinfo.end_pass()
 	if not ok then error(err, 2) end
 end
 
@@ -1028,6 +1032,96 @@ return {
 
 			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
 			sysinfo._phy_info_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: a pass reads /proc/net/arp and the leases once, not once per port",
+		fn = function()
+			-- _ip_by_mac/_hostname_by_mac are called from BOTH mac_table and
+			-- switch_mac_table, which build_json runs once per downstream
+			-- socket -- five reads of the ARP cache and four of the lease file
+			-- per heartbeat on the Archer C5, plus the ARL walked whole once
+			-- per socket. One pass answers every socket.
+			local orig_rf, orig_cmd = sysinfo._read_file, sysinfo._run_cmd
+			local arp_reads, lease_reads = 0, 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					arp_reads = arp_reads + 1
+					return "10.0.0.7 0x1 0x2 aa:bb:cc:dd:ee:01 * br-lan\n"
+				elseif path == "/tmp/dhcp.leases" then
+					lease_reads = lease_reads + 1
+					return "1700000000 aa:bb:cc:dd:ee:01 10.0.0.7 laptop *\n"
+				end
+				return nil
+			end
+			sysinfo._run_cmd = function() return "" end
+
+			-- No pass open: every call reads, exactly as before.
+			sysinfo.end_pass()
+			sysinfo._ip_by_mac(); sysinfo._ip_by_mac()
+			sysinfo._hostname_by_mac(); sysinfo._hostname_by_mac()
+			assert_eq(arp_reads, 2, "no pass open -- every call reads, as before")
+			assert_eq(lease_reads, 2, "and the same for the lease file")
+
+			arp_reads, lease_reads = 0, 0
+			sysinfo.begin_pass()
+			local arl = {["aa:bb:cc:dd:ee:01"] = 2, ["aa:bb:cc:dd:ee:02"] = 3}
+			local p2 = sysinfo.switch_mac_table(2, arl)
+			local p3 = sysinfo.switch_mac_table(3, arl)
+			sysinfo.switch_mac_table(4, arl)
+			assert_eq(arp_reads, 1, "one ARP read for every socket in the payload")
+			assert_eq(lease_reads, 1, "one lease read for every socket in the payload")
+			-- ...and the answers are still right, per socket.
+			assert_eq(#p2, 1, "port 2 keeps its own host")
+			assert_eq(p2[1].mac, "aa:bb:cc:dd:ee:01", "the right one")
+			assert_eq(p2[1].ip, "10.0.0.7", "with its IP from the shared ARP read")
+			assert_eq(p2[1].hostname, "laptop", "and its lease hostname")
+			assert_eq(#p3, 1, "port 3 keeps its own host")
+			assert_eq(p3[1].mac, "aa:bb:cc:dd:ee:02", "the right one")
+
+			-- A fresh ARL inside the same pass is bucketed afresh: the memo is
+			-- keyed on the table, so a new dump is never served a stale one.
+			local arl2 = {["aa:bb:cc:dd:ee:03"] = 2}
+			local again = sysinfo.switch_mac_table(2, arl2)
+			assert_eq(#again, 1, "a new ARL is bucketed, not served from the old one")
+			assert_eq(again[1].mac, "aa:bb:cc:dd:ee:03", "with its own host")
+
+			-- Closing the pass restores the un-memoized behaviour, and RELEASES
+			-- what it held: the memo pins an ARP map and a bucketed ARL, which
+			-- must not sit in a long-running daemon between heartbeats.
+			sysinfo.end_pass()
+			assert_nil(sysinfo._pass_cache, "end_pass releases the memo")
+			arp_reads = 0
+			sysinfo._ip_by_mac(); sysinfo._ip_by_mac()
+			assert_eq(arp_reads, 2, "the pass is closed -- every call reads again")
+
+			sysinfo._read_file, sysinfo._run_cmd = orig_rf, orig_cmd
+			sysinfo.end_pass()
+		end
+	},
+	{
+		name = "sysinfo: an absent lease file is not re-opened once per socket",
+		fn = function()
+			-- An AP is usually not the DHCP server, so _hostname_by_mac's read
+			-- returns nil -- which must be memoized as "computed and empty",
+			-- not as "not computed yet", or the common case keeps re-opening a
+			-- file that is not there.
+			local orig_rf = sysinfo._read_file
+			local lease_reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/tmp/dhcp.leases" then
+					lease_reads = lease_reads + 1
+					return nil
+				end
+				return nil
+			end
+			sysinfo.begin_pass()
+			sysinfo._hostname_by_mac()
+			sysinfo._hostname_by_mac()
+			sysinfo._hostname_by_mac()
+			assert_eq(lease_reads, 1, "the missing file is opened once, not once per socket")
+			sysinfo.end_pass()
+			sysinfo._read_file = orig_rf
 		end
 	},
 }
