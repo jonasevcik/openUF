@@ -108,6 +108,15 @@ M.RRM_BENCH_SECONDS  = 6 * 3600
 -- keep the Environment tab honest, not to poll.
 M.RRM_REQUEST_INTERVAL = 600
 
+-- How often the background collector is checked for life. That check forks
+-- `pgrep -f`, and ran on every 10-second heartbeat -- but the subscription
+-- only dies when one of the hostapd objects it named goes away, which is a
+-- config push, not a ten-second event. _tick re-arms it immediately after a
+-- config IS applied (see M._rrm_collector_next), so recovery stays instant
+-- exactly where it matters and the steady state costs nothing.
+M.RRM_COLLECTOR_CHECK_INTERVAL = 60
+M._rrm_collector_next = 0
+
 -- Matches rrmscan.merge_into's own cutoff, which exists because the
 -- controller's rogue-AP ingestion silently drops any entry with age >= 30.
 local RRM_MAX_AGE = 30
@@ -3298,7 +3307,15 @@ function M._rrm_tick(cfg)
 	if not rrm then return false end
 	if not (cfg and cfg.config and cfg.config.rrm_enrichment) then return false end
 
-	pcall(rrm.collector_ensure)
+	-- On M._time(), the seam the rest of the timed paths use, so the gate below
+	-- is testable. Note this is also the clock the age-out compares against,
+	-- and n.seen_at comes from rrmscan's own M._now -- a test that stubs one
+	-- must stub the other, or "freshness" is measured between two clocks.
+	local now = M._time()
+	if now >= M._rrm_collector_next then
+		M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
+		pcall(rrm.collector_ensure)
+	end
 
 	local ok, fresh, reporters = pcall(rrm.harvest)
 	if ok then
@@ -3314,7 +3331,6 @@ function M._rrm_tick(cfg)
 		end
 	end
 
-	local now  = os.time()
 	local live = {}
 	for bssid, n in pairs(M._rrm_cache) do
 		if now - n.seen_at < RRM_MAX_AGE then
@@ -3440,7 +3456,14 @@ function M._tick(st, cfg, ufhw, ctx)
 		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
 		return ctx.interval
 	end
-	if applied then return 0 end
+	if applied then
+		-- A config push runs `wifi reload`, which takes every hostapd object
+		-- the RRM collector subscribed to away with it and kills the
+		-- subscription. That is the one moment the liveness check must not
+		-- wait out its interval.
+		M._rrm_collector_next = 0
+		return 0
+	end
 	return ctx.interval
 end
 

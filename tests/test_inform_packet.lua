@@ -3149,6 +3149,84 @@ return {
 		end
 	},
 	{
+		name = "inform: the RRM collector is checked once a minute, not every heartbeat",
+		fn = function()
+			-- collector_ensure forks `pgrep -f` to ask whether the background
+			-- `ubus subscribe` child is alive. That ran on every 10-second
+			-- heartbeat, but the subscription only dies when one of the
+			-- hostapd objects it named goes away -- a config push, not a
+			-- ten-second event.
+			local orig = {rrm = inform._rrmscan, time = inform._time}
+			local clock, checks = 4000, 0
+			inform._time = function() return clock end
+			inform._rrm_collector_next = 0
+			inform._rrmscan = {
+				collector_ensure = function() checks = checks + 1 end,
+				harvest = function() return {}, {} end,
+				_now = function() return clock end,
+			}
+			local cfg = {config = {rrm_enrichment = true}}
+
+			inform._rrm_tick(cfg)
+			clock = clock + 10; inform._rrm_tick(cfg)
+			clock = clock + 10; inform._rrm_tick(cfg)
+			assert_eq(checks, 1, "one liveness check, not one per heartbeat")
+
+			clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+			inform._rrm_tick(cfg)
+			assert_eq(checks, 2, "and another once the interval is up")
+
+			inform._rrmscan, inform._time = orig.rrm, orig.time
+			inform._rrm_collector_next = 0
+		end
+	},
+	{
+		name = "inform: a config push re-arms the RRM collector check immediately",
+		fn = function()
+			-- `wifi reload` takes every hostapd object the collector subscribed
+			-- to away with it and kills the subscription. That is the one
+			-- moment the check must not wait out its interval -- otherwise
+			-- 802.11k enrichment is dead for up to a minute after every push,
+			-- which is exactly when the neighbourhood is worth re-reading.
+			local orig = {
+				rrm = inform._rrmscan, time = inform._time,
+				build = inform.build_json, packet = inform.build_packet,
+				post = inform.http_post, parse = inform.parse_packet,
+				handle = inform.handle_response, reload = inform._reload_if_changed,
+			}
+			local clock, checks = 4000, 0
+			inform._time = function() return clock end
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrmscan = {
+				collector_ensure = function() checks = checks + 1 end,
+				harvest = function() return {}, {} end,
+				_now = function() return clock end,
+			}
+			inform.build_json    = function() return "{}" end
+			inform.build_packet  = function() return "pkt" end
+			inform.http_post     = function() return "body" end
+			inform.parse_packet  = function() return "{}" end
+			inform.handle_response = function() return true end   -- config applied
+			inform._rrm_collector_next = 0
+			local cfg = {config = {rrm_enrichment = true}}
+			local ctx = {interval = 10, backoff = 10}
+
+			assert_eq(inform._tick({inform_url = "u"}, cfg, nil, ctx), 0,
+				"a config was applied, so the AP re-informs at once")
+			assert_eq(checks, 1, "the first heartbeat checked")
+			-- Well inside the interval, so without the re-arm this would not.
+			clock = clock + 10
+			inform._tick({inform_url = "u"}, cfg, nil, ctx)
+			assert_eq(checks, 2, "and the push re-armed the check straight away")
+
+			inform._rrmscan, inform._time = orig.rrm, orig.time
+			inform.build_json, inform.build_packet = orig.build, orig.packet
+			inform.http_post, inform.parse_packet = orig.post, orig.parse
+			inform.handle_response, inform._reload_if_changed = orig.handle, orig.reload
+			inform._rrm_collector_next = 0
+		end
+	},
+	{
 		name = "inform: a build_json that throws still closes the sysinfo lookup pass",
 		fn = function()
 			-- The sysinfo pass memoizes /proc/net/arp, /tmp/dhcp.leases and the
