@@ -34,18 +34,55 @@ M._read_file = function(path)
 	return s
 end
 
+-- Injectable: override in tests to control elapsed time deterministically.
+M._time = os.time
+
 -- Returns the local port's kernel ifindex (an integer), or nil if the
 -- interface doesn't exist / /sys is unavailable (e.g. off-target tests).
+--
+-- Memoized for the life of the process: a netdev's ifindex is fixed for as
+-- long as that netdev exists. This is read from the per-NEIGHBOUR record
+-- builder, not the per-interface loop, so a port with two neighbours on it was
+-- opening the same file twice for the same answer.
+M._port_idx_cache = {}
 function M._local_port_idx(port_name)
+	local hit = M._port_idx_cache[port_name]
+	if hit ~= nil then return hit or nil end
 	local s = M._read_file("/sys/class/net/" .. port_name .. "/ifindex")
-	return s and tonumber(s:match("%d+")) or nil
+	local idx = s and tonumber(s:match("%d+")) or nil
+	-- `false` is "asked, and there is no such netdev" -- distinct from "not
+	-- asked yet", so a port that does not exist is not re-opened per neighbour
+	-- either.
+	M._port_idx_cache[port_name] = idx or false
+	return idx
 end
 
 -- Returns a table of LLDP neighbors, one entry per port/neighbor pair.
 -- Each entry: {port, local_port_idx, chassis_id, port_id, port_descr,
 --              system_name, system_desc, capabilities}
 -- Returns {} if lldpctl is not available or has no neighbors.
+-- How long a neighbour list is reused. lldpd advertises on a 30-second TX
+-- interval by default and the controller renders this as topology rather than
+-- as a statistic, so re-forking lldpctl and cjson-decoding a full
+-- chassis/port/capability tree on every 10-second heartbeat bought nothing.
+-- The trade: a topology change -- a new neighbour, a moved cable -- reaches
+-- the controller up to a minute late.
+M.NEIGHBOURS_TTL = 60
+M._neighbours_cache = nil
+
 function M.neighbors()
+	local now = M._time()
+	local c = M._neighbours_cache
+	if c and (now - c.at) < M.NEIGHBOURS_TTL then return c.value end
+	local value = M._neighbors_uncached()
+	-- Only a real answer is cached. No lldpd, a failed fork or a truncated
+	-- reply all come back empty, and pinning that for a minute would blank the
+	-- topology on a transient the very next heartbeat would have fixed.
+	if #value > 0 then M._neighbours_cache = {value = value, at = now} end
+	return value
+end
+
+function M._neighbors_uncached()
 	local output = M._run_cmd("lldpctl -f json")
 	if not output or output == "" then return {} end
 

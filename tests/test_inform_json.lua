@@ -70,8 +70,12 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 		end
 		return ""
 	end
-	-- Return empty neighbor list (no lldpd on dev machine)
+	-- Return empty neighbor list (no lldpd on dev machine). The neighbour list
+	-- is TTL-cached for a minute, so a test that fed it a real lldpctl reply
+	-- would otherwise keep answering for the tests after it.
 	inform._lldp._run_cmd = function() return "" end
+	inform._lldp._neighbours_cache = nil
+	inform._lldp._port_idx_cache   = {}
 end
 
 -- Inject a mock ucihelper so build_json's radio/vap/stats wiring can be
