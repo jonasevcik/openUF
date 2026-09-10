@@ -128,6 +128,7 @@ local test_files = {
 	"tests/test_announce.lua",
 	"tests/test_state.lua",
 	"tests/test_crypto.lua",
+	"tests/test_inflate.lua",
 	"tests/test_inform_packet.lua",
 	"tests/test_sysinfo.lua",
 	"tests/test_lldp.lua",

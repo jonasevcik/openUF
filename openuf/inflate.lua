@@ -30,7 +30,16 @@ local function bitstream(data)
 
 	function bs.getbit()
 		if bitcnt == 0 then
-			bitbuf = byte(data, pos) or 0
+			-- Running off the end is an ERROR, not a supply of zero bits.
+			-- Faking zeroes here does not degrade gracefully: M.inflate's
+			-- `repeat ... until bfinal == 1` reads bfinal=0, btype=0 (stored)
+			-- and a length of 0 forever, so a truncated or corrupted response
+			-- HUNG the inform loop in a tight zero-length-block loop -- no
+			-- error, no heartbeat, no recovery, and procd cannot respawn a
+			-- process that never exits. Raising instead lands in _tick's
+			-- pcall around parse_packet, which costs one heartbeat and logs.
+			bitbuf = byte(data, pos)
+			if not bitbuf then error("inflate: truncated stream") end
 			pos    = pos + 1
 			bitcnt = 8
 		end
@@ -51,7 +60,8 @@ local function bitstream(data)
 
 	function bs.align()  bitcnt = 0 end          -- discard to byte boundary
 	function bs.getbyte()
-		local b = byte(data, pos) or 0
+		local b = byte(data, pos)
+		if not b then error("inflate: truncated stream") end
 		pos = pos + 1
 		return b
 	end
