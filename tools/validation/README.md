@@ -49,13 +49,113 @@ docker compose -f tools/validation/docker-compose.yml up -d --build
 First boot of `unifi-db` takes a few seconds to run `init-mongo.sh`; give it a
 moment before the controller container comes up healthy.
 
+## 1b. The whole thing without a browser (recommended)
+
+Sections 2–4 describe the UI path. **None of it needs a browser** — the entire
+setup, adoption and config-push flow is the controller's own REST API, which is
+far faster and is what you want when a `down -v` reset is part of the loop.
+Verified end to end against 10.4.57 on 2026-09-10.
+
+```sh
+J=/tmp/uc.jar                      # cookie jar
+B=https://localhost:8443
+
+# 1. Wait for the controller (302 = up; 000 = not yet, it takes ~60-90 s)
+until [ "$(curl -sk -o /dev/null -w '%{http_code}' $B/)" != "000" ]; do sleep 10; done
+
+# 2. First-run setup. No auth, works only while the controller is unconfigured;
+#    this is the whole of the "Advanced Setup -> Skip -> credentials" wizard.
+curl -sk -X POST $B/api/cmd/sitemgr -H 'Content-Type: application/json' \
+  -d '{"cmd":"add-default-admin","name":"admin","email":"admin@openuf.local","x_password":"openufopenuf"}'
+
+# 3. Log in (every later call needs -b $J)
+curl -sk -c $J -X POST $B/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"openufopenuf"}'
+
+# 4. Controller IP, then the inform-host and SSH settings of section 3.
+CIP=$(docker inspect openuf-validation-controller \
+      --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+SI=$(curl -sk -b $J $B/api/s/default/get/setting/super_identity \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['_id'])")
+curl -sk -b $J -X PUT $B/api/s/default/set/setting/super_identity/$SI \
+  -H 'Content-Type: application/json' \
+  -d "{\"key\":\"super_identity\",\"hostname\":\"$CIP\"}"
+MG=$(curl -sk -b $J $B/api/s/default/get/setting/mgmt \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['_id'])")
+curl -sk -b $J -X PUT $B/api/s/default/set/setting/mgmt/$MG \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"mgmt","x_ssh_enabled":true,"x_ssh_auth_password_enabled":true,"x_ssh_username":"root","x_ssh_password":"openuf"}'
+
+# 5. Point the AP at the controller and start it (section 4, scripted)
+docker exec openuf-validation-ap sh -c \
+  'sed -i "s|http://unifi:8080/inform|http://controller:8080/inform|" /opt/openuf/conf.lua'
+docker exec -d openuf-validation-ap sh -c 'cd /opt/openuf && exec lua announce.lua > /tmp/announce.log 2>&1'
+docker exec -d openuf-validation-ap sh -c 'cd /opt/openuf && exec lua inform.lua   > /tmp/inform.log   2>&1'
+
+# 6. Wait for it to appear (state=2, adopted=false), then adopt
+sleep 25
+curl -sk -b $J $B/api/s/default/stat/device | python3 -m json.tool | grep -E '"mac"|"state"|"adopted"'
+MAC=<from above>
+curl -sk -b $J -X POST $B/api/s/default/cmd/devmgr -H 'Content-Type: application/json' \
+  -d "{\"cmd\":\"adopt\",\"mac\":\"$MAC\"}"
+# state goes 2 -> 7 (adopting) -> 5 (provisioning) -> 1 (connected), ~45 s
+```
+
+Driving config from there:
+
+```sh
+# device_id comes from stat/device -- NOT from /rest/device, which 404s on this build
+DEV=$(curl -sk -b $J $B/api/s/default/stat/device \
+      | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['device_id'])")
+
+# IP Settings -> Static (emits netconf.1.*, route.1.gateway, resolv.nameserver.N.ip)
+curl -sk -b $J -X PUT $B/api/s/default/rest/device/$DEV -H 'Content-Type: application/json' \
+  -d '{"config_network":{"type":"static","ip":"172.19.0.50","netmask":"255.255.255.0","gateway":"172.19.0.1","dns1":"1.1.1.1","dns2":"9.9.9.9"}}'
+
+# ...and back to DHCP
+curl -sk -b $J -X PUT $B/api/s/default/rest/device/$DEV -H 'Content-Type: application/json' \
+  -d '{"config_network":{"type":"dhcp"}}'
+
+# Forget a device (its MAC changes whenever the container is RECREATED, so the
+# old record lingers as state=0 and the new one arrives unadopted)
+curl -sk -b $J -X POST $B/api/s/default/cmd/sitemgr -H 'Content-Type: application/json' \
+  -d "{\"cmd\":\"delete-device\",\"mac\":\"$MAC\"}"
+```
+
+Three things that will cost you time otherwise:
+
+- **Check for silent failures before believing any result:**
+  `docker exec openuf-validation-ap grep -c "handle_response failed" /tmp/inform.log`
+  must be `0`. `_tick` pcalls `handle_response`, so anything that raises mid-push
+  costs one stderr line and skips everything after it — including the final
+  `state.save`. See section 0.
+- **`HTTP 404` from the inform POST is success**, not an error — see
+  PROTOCOL-VALIDATION.md's "General protocol finding". A *connection* error is
+  the real failure.
+- **Never `pkill -f` a pattern from inside `docker exec`** if the pattern also
+  matches your own command line — the exec shell kills itself and the block
+  aborts with exit 143. Kill by PID, or match on something the wrapper does not
+  contain.
+
+`override_inform_host` on the `mgmt` setting did not persist on 10.4.57 in the
+run above; setting `super_identity.hostname` to the controller's container IP was
+enough for adoption and informs to work. If you hit `invalid inform_ip` in
+`server.log`, that is the knob to revisit.
+
 ## 2. Complete the controller's first-run setup
+
+> The UI walkthrough, kept because it explains *what* each step is for. To just get
+> a working environment, use [1b](#1b-the-whole-thing-without-a-browser-recommended).
+
 
 Open `https://localhost:8443` (self-signed cert — accept the browser warning) and
 step through the setup wizard: **Advanced Setup → Skip** (do not create a real
 Ubiquiti cloud account) → set local admin credentials → Finish.
 
 ## 3. Set the Inform Host Override (required — do this before adopting anything)
+
+> Scripted equivalent in [1b](#1b-the-whole-thing-without-a-browser-recommended), step 4.
+
 
 Docker deployments of the UniFi Network Application don't know their own
 externally-reachable address by default, and devices/informs get rejected
@@ -83,6 +183,9 @@ Settings** (or search "inform" in the settings search box) →
 - Apply Changes.
 
 ## 4. Start openUF inside the AP container (L2 / broadcast adoption)
+
+> Scripted equivalent in [1b](#1b-the-whole-thing-without-a-browser-recommended), steps 5-6.
+
 
 `debug_dump_file` and the `eth0` interface override are already baked into the
 image (`ap/Dockerfile`), along with the real Ubiquiti factory-default `ubnt`/`ubnt`
