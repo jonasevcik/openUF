@@ -1334,10 +1334,16 @@ function M.build_json(st, cfg, ufhw)
 	-- Otherwise no entry would be flagged at all and the uplink would publish
 	-- a mac_table of the entire far side -- worse than the static fallback.
 	local uplink_ifname = nil
+	-- Kept in scope for the port loop: the FDB dump uplink_bridge_port already
+	-- takes of this bridge carries every socket's hosts too, so each socket's
+	-- mac_table below is served from it rather than forking a `bridge fdb show
+	-- dev <socket>` of its own.
+	local uplink_bridge = nil
 	if not next(sw.ports) then
 		local lan = cfg and cfg.net and cfg.net.lan_cpueth
 		local ok_br, br = pcall(M._sysinfo.bridge_of, lan)
 		if ok_br and br then
+			uplink_bridge = br
 			local ok_up, name = pcall(M._sysinfo.uplink_bridge_port, br)
 			if ok_up and name then
 				for _, p in ipairs(ports) do
@@ -1452,7 +1458,7 @@ function M.build_json(st, cfg, ufhw)
 			-- network, not an end host.
 			if not entry.is_uplink then
 				entry.mac_table = arr(_filter_hosts(
-					M._sysinfo.mac_table, p.ifname, nil, self_macs, station_macs))
+					M._sysinfo.mac_table, p.ifname, uplink_bridge, self_macs, station_macs))
 			end
 		end
 		port_table[#port_table + 1] = entry

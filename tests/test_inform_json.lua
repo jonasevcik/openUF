@@ -209,8 +209,14 @@ local DSA_CFG = {
 -- build() for a DSA board: no swconfig output at all (there is no such
 -- binary), so everything comes from sysfs per socket plus the bridge FDB.
 -- opts.fdb overrides the captured `bridge fdb show br br-lan`.
+-- Commands the last build_dsa() run forked, by kind. Lets a test assert on the
+-- COST of a payload, not only its content -- which is the only way to pin that
+-- build_json actually threads the shared FDB dump down to the port loop.
+local dsa_forks = {}
+
 local function build_dsa(opts)
 	opts = opts or {}
+	dsa_forks = {fdb_br = 0, fdb_dev = 0}
 	inject_sysinfo(false, false, false, false)
 	local base_read = inform._sysinfo._read_file
 	local base_cmd  = inform._sysinfo._run_cmd
@@ -226,15 +232,25 @@ local function build_dsa(opts)
 		if cmd:find("readlink") then
 			return "../../../../../../../../virtual/net/br-lan\n"
 		end
+		local fdb = opts.fdb or fixture("bridge_fdb_br_dsa.txt")
 		if cmd:find("bridge fdb show br", 1, true) then
-			return opts.fdb or fixture("bridge_fdb_br_dsa.txt")
+			dsa_forks.fdb_br = dsa_forks.fdb_br + 1
+			return fdb
 		end
 		-- `bridge fdb show dev <socket>`: on DSA each socket is its own
-		-- bridge port, so the per-port FDB is the per-socket host list.
-		if cmd:find("bridge fdb show dev lan3", 1, true) then
-			return "aa:bb:cc:dd:ee:01 master br-lan\n"
+		-- bridge port, so the per-port FDB is the per-socket host list. Derived
+		-- from the SAME dump rather than canned separately -- they are one
+		-- kernel table, and a stub that let them disagree would hide exactly
+		-- the substitution build_json now makes between them.
+		local dev = cmd:match("bridge fdb show dev (%S+)")
+		if dev then
+			dsa_forks.fdb_dev = dsa_forks.fdb_dev + 1
+			local lines = {}
+			for line in fdb:gmatch("[^\n]+") do
+				if line:match("dev%s+(%S+)") == dev then lines[#lines + 1] = line end
+			end
+			return table.concat(lines, "\n") .. "\n"
 		end
-		if cmd:find("bridge fdb show dev", 1, true) then return "" end
 		return base_cmd(cmd)
 	end
 	-- Per-socket sysfs: the uplink is up at gigabit, the rest are empty.
@@ -1581,12 +1597,30 @@ return {
 		fn = function()
 			-- The per-port bridge FDB is already per-socket here, so no ARL
 			-- equivalent is needed for the host list -- only for deciding
-			-- which socket to suppress.
-			local d = build_dsa()
+			-- which socket to suppress. The captured dump has nothing on lan3
+			-- (that board had one cable in it), so a host is added explicitly
+			-- rather than fabricated into the capture.
+			local d = build_dsa({fdb = fixture("bridge_fdb_br_dsa.txt")
+				.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n"})
 			local p = by_idx(d.port_table)
 			assert_eq(#p[3].mac_table, 1, "the host plugged into lan3")
 			assert_eq(p[3].mac_table[1].mac, "aa:bb:cc:dd:ee:01", "its mac")
 			assert_eq(#p[2].mac_table, 0, "and nothing on the empty socket")
+		end
+	},
+	{
+		name = "inform json: a DSA payload dumps the bridge FDB once, not once per socket",
+		fn = function()
+			-- build_json already dumps the whole bridge FDB to find the uplink
+			-- socket, and that dump carries every socket's hosts. Each socket
+			-- forked `bridge fdb show dev <socket>` for a subset of it anyway.
+			-- Asserting the host lists alone cannot catch a regression here:
+			-- both sources are the same kernel table and give the same answer,
+			-- so only the fork count says which one was asked.
+			build_dsa({fdb = fixture("bridge_fdb_br_dsa.txt")
+				.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n"})
+			assert_eq(dsa_forks.fdb_br, 1, "one dump of the kernel FDB per payload")
+			assert_eq(dsa_forks.fdb_dev, 0, "and no per-socket fork at all")
 		end
 	},
 	{

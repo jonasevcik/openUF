@@ -1124,4 +1124,71 @@ return {
 			sysinfo._read_file = orig_rf
 		end
 	},
+	{
+		name = "sysinfo: one `bridge fdb show br` serves every socket in a payload",
+		fn = function()
+			-- uplink_bridge_port already dumps the WHOLE bridge FDB to find the
+			-- gateway's socket, and that one dump carries every socket's hosts.
+			-- mac_table forked `bridge fdb show dev <socket>` per socket anyway
+			-- -- four more forks a heartbeat on the AX3000T for a strict subset
+			-- of what was already in hand. Given the bridge, it reads the
+			-- shared dump; without one it forks exactly as before.
+			local orig_cmd = sysinfo._run_cmd
+			local br_dumps, dev_dumps = 0, 0
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("bridge fdb show br", 1, true) then
+					br_dumps = br_dumps + 1
+					return table.concat({
+						"aa:bb:cc:dd:ee:01 dev lan2 master br-lan ",
+						"aa:bb:cc:dd:ee:02 dev lan3 master br-lan ",
+						"01:00:5e:00:00:01 dev lan3 master br-lan ",   -- multicast
+						"d4:53:2a:b2:03:3c dev lan2 master br-lan permanent",
+						"aa:bb:cc:dd:ee:02 dev lan3 self ",
+					}, "\n") .. "\n"
+				elseif cmd:find("bridge fdb show dev", 1, true) then
+					dev_dumps = dev_dumps + 1
+					return "aa:bb:cc:dd:ee:09 dev lan9 master br-lan \n"
+				end
+				return ""
+			end
+
+			sysinfo.begin_pass()
+			local l2 = sysinfo.mac_table("lan2", "br-lan")
+			local l3 = sysinfo.mac_table("lan3", "br-lan")
+			local l4 = sysinfo.mac_table("lan4", "br-lan")
+			assert_eq(br_dumps, 1, "one dump of the kernel FDB for every socket")
+			assert_eq(dev_dumps, 0, "and not one per-socket fork")
+			assert_eq(#l2, 1, "lan2's own host")
+			assert_eq(l2[1].mac, "aa:bb:cc:dd:ee:01", "the right one")
+			assert_eq(#l3, 1, "lan3's own host -- multicast and self dropped")
+			assert_eq(l3[1].mac, "aa:bb:cc:dd:ee:02", "the right one")
+			assert_eq(#l4, 0, "a socket with nothing on it reports no hosts")
+			-- `permanent` is the socket's OWN address; counting it would put
+			-- this device's socket in its own client list.
+			for _, h in ipairs(l2) do
+				assert_true(h.mac ~= "d4:53:2a:b2:03:3c", "never the port's own address")
+			end
+
+			-- The uplink question and the host lists share the one dump.
+			assert_eq(sysinfo.bridge_fdb_ports("br-lan")["aa:bb:cc:dd:ee:01"], "lan2",
+				"the same dump still answers which socket a MAC is behind")
+			assert_eq(br_dumps, 1, "without a second fork")
+
+			-- No bridge given: the per-socket fork, exactly as before.
+			local solo = sysinfo.mac_table("lan9")
+			assert_eq(dev_dumps, 1, "no bridge -- mac_table forks per socket, as before")
+			assert_eq(#solo, 1, "and still answers")
+			assert_eq(solo[1].mac, "aa:bb:cc:dd:ee:09", "with that socket's host")
+
+			-- Outside a pass the shared dump is re-read every time.
+			sysinfo.end_pass()
+			br_dumps = 0
+			sysinfo.mac_table("lan2", "br-lan")
+			sysinfo.mac_table("lan3", "br-lan")
+			assert_eq(br_dumps, 2, "the pass is closed -- every call dumps again")
+
+			sysinfo._run_cmd = orig_cmd
+			sysinfo.end_pass()
+		end
+	},
 }

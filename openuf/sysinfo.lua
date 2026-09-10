@@ -65,6 +65,34 @@ local function pass_memo(key, fn)
 	return value
 end
 
+-- A {[mac] = port} map inverted into {[port] = {macs}}, multicast/broadcast
+-- dropped on the address's own bit and each bucket sorted (pairs() order is
+-- undefined; the payload must be stable).
+--
+-- Both wired-host sources hand us that exact shape -- the switch's ARL table
+-- and the bridge's FDB -- and both were scanned WHOLE once per socket to keep
+-- the entries on that one, O(sockets x hosts) on a switch that may have
+-- learned a couple of hundred. One inversion answers every socket.
+--
+-- Memoized on the map TABLE, not on a name: build_json fetches one dump per
+-- heartbeat and hands the same table to every socket, so a pass given a fresh
+-- dump buckets it afresh rather than serving the previous one.
+local function hosts_by_port(map)
+	return pass_memo(map, function()
+		local by_port = {}
+		for mac, port in pairs(map) do
+			local first_octet = tonumber(mac:sub(1, 2), 16)
+			if first_octet and first_octet % 2 == 0 then
+				local bucket = by_port[port]
+				if not bucket then bucket = {}; by_port[port] = bucket end
+				bucket[#bucket + 1] = mac
+			end
+		end
+		for _, bucket in pairs(by_port) do table.sort(bucket) end
+		return by_port
+	end)
+end
+
 -- Returns uptime in seconds (as a number) by parsing /proc/uptime.
 function M.uptime()
 	local s = M._read_file("/proc/uptime")
@@ -698,22 +726,36 @@ end
 -- reports multicast/broadcast group addresses) -- neither is a real client.
 -- A multicast-bit check on the MAC's first octet is kept as a second filter
 -- in case a caller's mocked/real bridge output ever omits those markers.
-function M.mac_table(ifname)
+--
+-- `bridge` is optional and names the bridge ifname is enslaved to. Given one,
+-- the hosts come from the single `bridge fdb show br <bridge>` that
+-- M.bridge_fdb_ports already ran for the uplink question -- one dump of the
+-- kernel FDB carries every port's hosts, and it applies the identical
+-- master/self/permanent filter, so `bridge fdb show dev <socket>` per socket
+-- was re-dumping a strict subset of it. On the AX3000T's four sockets that was
+-- four forks per heartbeat for data already in hand. Without a bridge (every
+-- direct caller, and the tests) it forks per socket exactly as before.
+function M.mac_table(ifname, bridge)
 	if not ifname then return {} end
-	local fdb_out = M._run_cmd("bridge fdb show dev " .. ifname)
-	local macs = {}
-	for line in fdb_out:gmatch("[^\n]+") do
-		if not line:find("self") and not line:find("permanent") and line:find("master") then
-			local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-			if mac then
-				local first_octet = tonumber(mac:sub(1, 2), 16)
-				if first_octet and first_octet % 2 == 0 then
-					macs[#macs + 1] = mac
+	local macs
+	if bridge then
+		macs = hosts_by_port(M.bridge_fdb_ports(bridge))[ifname]
+	else
+		local fdb_out = M._run_cmd("bridge fdb show dev " .. ifname)
+		macs = {}
+		for line in fdb_out:gmatch("[^\n]+") do
+			if not line:find("self") and not line:find("permanent") and line:find("master") then
+				local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+				if mac then
+					local first_octet = tonumber(mac:sub(1, 2), 16)
+					if first_octet and first_octet % 2 == 0 then
+						macs[#macs + 1] = mac
+					end
 				end
 			end
 		end
 	end
-	if #macs == 0 then return {} end
+	if not macs or #macs == 0 then return {} end
 
 	local ip_by_mac       = M._ip_by_mac()
 	local hostname_by_mac = M._hostname_by_mac()
@@ -874,8 +916,13 @@ end
 -- AX3000T lists every learned MAC a second time as "dev wan self", but those
 -- lines carry no "master" and are already excluded).
 function M.bridge_fdb_ports(bridge)
+	if not bridge then return {} end
+	-- Memoized for the length of a pass: this one dump answers the uplink
+	-- question AND every socket's own host list (see M.mac_table), which
+	-- otherwise forked `bridge fdb show dev <socket>` once per socket for a
+	-- strict subset of what is already here.
+	return pass_memo("fdb_br:" .. bridge, function()
 	local ports = {}
-	if not bridge then return ports end
 	local out = M._run_cmd("bridge fdb show br " .. bridge)
 	if not out or out == "" then return ports end
 	for line in out:gmatch("[^\n]+") do
@@ -887,6 +934,7 @@ function M.bridge_fdb_ports(bridge)
 		end
 	end
 	return ports
+	end)
 end
 
 -- Which bridge port -- i.e. which socket -- the uplink cable is in, as an
@@ -896,32 +944,6 @@ function M.uplink_bridge_port(bridge)
 	local gw_mac = M._default_gateway_mac()
 	if not gw_mac then return nil end
 	return M.bridge_fdb_ports(bridge)[gw_mac]
-end
-
--- The ARL bucketed by physical port, multicast/broadcast already dropped and
--- each bucket sorted (pairs() order is undefined; the payload must be stable).
---
--- switch_mac_table walked the WHOLE table once per socket to keep only the
--- entries on that one -- O(sockets x ARL) on a switch that may have learned a
--- couple of hundred hosts. One bucketing pass answers every socket.
---
--- Memoized on the `arl` TABLE, not on a name: build_json fetches one dump per
--- heartbeat (inform.lua's switch_status call) and hands the same table to
--- every socket, so a pass given a fresh dump buckets it afresh.
-local function arl_by_port(arl)
-	return pass_memo(arl, function()
-		local by_port = {}
-		for mac, port in pairs(arl) do
-			local first_octet = tonumber(mac:sub(1, 2), 16)
-			if first_octet and first_octet % 2 == 0 then
-				local bucket = by_port[port]
-				if not bucket then bucket = {}; by_port[port] = bucket end
-				bucket[#bucket + 1] = mac
-			end
-		end
-		for _, bucket in pairs(by_port) do table.sort(bucket) end
-		return by_port
-	end)
 end
 
 -- The wired hosts learned on one physical switch port, in the same shape
@@ -934,7 +956,7 @@ end
 -- caller, which is where both sets are already known.
 function M.switch_mac_table(phys, arl)
 	if phys == nil or type(arl) ~= "table" then return {} end
-	local macs = arl_by_port(arl)[phys]
+	local macs = hosts_by_port(arl)[phys]
 	if not macs or #macs == 0 then return {} end
 
 	local ip_by_mac       = M._ip_by_mac()
