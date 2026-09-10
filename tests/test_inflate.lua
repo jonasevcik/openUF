@@ -127,7 +127,14 @@ return {
 		fn = function()
 			-- CM (low nibble of byte 1) must be 8. Anything else is some other
 			-- format, and guessing at it would hand cjson garbage.
-			local ok, err = pcall(inflate.zlib_decompress, "\x79\x01abcdefgh")
+			-- string.char, not a "\x79" literal: \xNN hex escapes arrived in Lua
+			-- 5.2, and 5.1 -- what CI runs, and what the APs run -- silently
+			-- yields the literal character after an unknown backslash escape,
+			-- so there it is the three bytes "x79" -- whose first byte
+			-- 0x78 has low nibble 8 and PASSES the CM check, so the test sailed
+			-- past the branch it exists to pin and failed on the message instead.
+			local ok, err = pcall(inflate.zlib_decompress,
+				string.char(0x79, 0x01) .. "abcdefgh")
 			assert_false(ok, "a non-DEFLATE stream raises")
 			assert_true(tostring(err):find("CM~=8", 1, true) ~= nil,
 				"and says which check failed")
@@ -166,7 +173,10 @@ return {
 		fn = function()
 			-- bfinal=1, btype=3 -> 0x07. RFC 1951 reserves it; treating it as
 			-- anything else would desynchronise the bitstream.
-			local ok, err = pcall(inflate.inflate, "\x07")
+			-- string.char for the same reason as above: on Lua 5.1 that escape is
+			-- the literal "x07", whose first byte decodes as a stored block and
+			-- dies as a truncated stream rather than as a reserved block type.
+			local ok, err = pcall(inflate.inflate, string.char(0x07))
 			assert_false(ok, "reserved block type raises")
 			assert_true(tostring(err):find("reserved block type 3", 1, true) ~= nil,
 				"and names the reason")
