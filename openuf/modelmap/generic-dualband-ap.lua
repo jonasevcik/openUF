@@ -59,6 +59,8 @@ dev.conf.led = nil
 
 -- Switch layout (common for both target devices)
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it.
+	device	= "switch0",
 	cpu_lan	= 0,
 	cpu_wan	= 6,
 	ports	= {

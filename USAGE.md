@@ -185,8 +185,13 @@ The modelmap sets:
   there the uplink is detected from the bridge FDB (`bridge fdb show br br-lan`, which
   names the port each MAC was learned on) instead of from a switch ARL table. Keep the
   flag only for a board where neither source can answer
-- `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
-- `dev.conf.switch`         — Switch device name (e.g. `switch0`)
+- `dev.conf.net.wan_cpueth` — WAN-side CPU netdev (e.g. `eth0`). Only used as the uplink
+  entry of a fallback `port_table` for a board that declares no `dev.conf.net.ports`
+- `dev.conf.vlan.device`    — swconfig device name (e.g. `switch0`), as `swconfig list`
+  reports it. Boards that name it something else — `switch1` is common on ath79 and
+  ramips — must set this, or every `swconfig` call silently addresses the wrong device
+  and per-socket port reporting falls back to the CPU-port netdev. Not used on a DSA
+  board, which has no swconfig at all
 - `dev.conf.led`            — status LED, driven by the controller's Locate action and its
   **Manage → LED** toggle. Accepts a full sysfs path (`/sys/class/leds/tp-link:green:wlan`)
   or a bare LED name (`tp-link:green:wlan`). `nil` by default, since a generic profile can't

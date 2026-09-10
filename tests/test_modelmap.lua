@@ -241,4 +241,27 @@ return {
 			end)
 		end
 	},
+	{
+		-- B2: five call sites read cfg.vlan.device -- switchvlan's backend
+		-- detection, its VLAN-table sizing and the swconfig port reads in
+		-- inform -- and every one of them fell through to a hardcoded
+		-- "switch0", because no modelmap ever set it. On a board whose switch
+		-- is switch1 (common on ath79 and ramips) every swconfig call then
+		-- addressed a device that does not exist, silently: per-socket port
+		-- reporting degraded to the CPU-port netdev with nothing logged.
+		name = "modelmap: every swconfig map names its switch device",
+		fn = function()
+			each_modelmap(function(name, dev)
+				local vlan = dev.conf and dev.conf.vlan
+				-- A DSA board has no swconfig and declares no vlan block at
+				-- all; the key is meaningless there.
+				if type(vlan) ~= "table" then return end
+				assert_eq(type(vlan.device), "string",
+					name .. ": declares vlan.device rather than relying on the "
+					.. "\"switch0\" fallback")
+				assert_true(vlan.device:match("^%w+$") ~= nil,
+					name .. ": vlan.device looks like a swconfig device name")
+			end)
+		end
+	},
 }

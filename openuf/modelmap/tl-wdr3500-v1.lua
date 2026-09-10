@@ -86,6 +86,8 @@ dev.conf.led = "green:system"
 -- Stock config puts LAN sockets 1-4 on VLAN 1 with the CPU port tagged
 -- ("1 2 3 4 0t"), which is what dev.conf.net above assumes.
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it.
+	device	= "switch0",
 	cpu_lan	= 0,
 	cpu_wan	= 0,
 	ports	= {

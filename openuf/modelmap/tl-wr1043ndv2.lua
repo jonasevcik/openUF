@@ -47,6 +47,8 @@ dev.conf.net = {
 dev.conf.led = "/sys/class/leds/tp-link:green:system"
 
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it.
+	device 	= "switch0",
 	cpu_lan 	= 0,
 	cpu_wan 	= 6,
 	ports 		= {

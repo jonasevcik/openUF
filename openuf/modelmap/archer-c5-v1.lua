@@ -89,6 +89,8 @@ dev.conf.led = "green:system"
 -- depends on the ordering (the trunk tags every LAN port); a per-port VLAN
 -- assignment would, so confirm before adding `swport` to dev.conf.net.ports.
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it.
+	device	= "switch0",
 	cpu_lan	= 0,
 	cpu_wan	= 6,
 	ports	= {
