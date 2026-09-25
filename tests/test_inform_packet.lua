@@ -17,6 +17,12 @@ inform._firewall = {
 	reconcile = function() end,
 	deauth = function() end,
 }
+-- Same for the controller's L2 hardening (nft) and system settings (UCI
+-- system, root's crontab); the tests that exercise them stub their own.
+inform._l2guard = {reconcile = function() return 0 end,
+	parse = function() return nil end, spec_from = function() return {} end}
+inform._sysconf = {parse = function() return nil end, apply = function() return {} end,
+	apply_cron = function() return false end}
 
 -- Deterministic IV for the TEST FILE's own crypto instance -- affects only
 -- tests that call crypto.* directly (e.g. the zlib round-trip). inform's
@@ -3314,20 +3320,50 @@ return {
 		end
 	},
 	{
-		name = "inform: a factory reset tears the l2guard table down",
+		name = "inform: a factory reset, from the controller or reset-inform, forgets the controller's leftovers",
 		fn = function()
-			local orig = {l2 = inform._l2guard, fw = inform._firewall, stderr = io.stderr}
+			local orig = {l2 = inform._l2guard, fw = inform._firewall, sc = inform._sysconf,
+				mtime = inform._state_mtime, load = inform._state.load, stderr = io.stderr}
 			io.stderr = {write = function() end}
-			local calls = {}
-			inform._l2guard = {reconcile = function(spec, names) calls[#calls + 1] = {spec = spec, n = #names} end}
+			local l2calls, crons = {}, {}
+			inform._l2guard = {reconcile = function(spec, names) l2calls[#l2calls + 1] = {spec = spec, n = #names} end}
 			inform._firewall = {reconcile = function() end}
+			inform._sysconf = {apply_cron = function(c) crons[#crons + 1] = c end}
+
+			-- 1. The controller's setdefault.
+			inform._controller_interval = 300
 			local ok, err = pcall(inform.handle_response, '{"_type":"setdefault"}',
 				sample_state({adopted = true, l2guard = {bpdu = true, tagdrop = true, ifnames = {"x"}}}),
 				{config = {}})
-			inform._l2guard, inform._firewall, io.stderr = orig.l2, orig.fw, orig.stderr
+			local interval_after_setdefault = inform._controller_interval
+
+			-- 2. An out-of-process reset-inform, seen through the state-file reload.
+			inform._controller_interval = 300
+			inform._state_mtime = function() return "reset" end
+			inform._state.load = function() return {adopted = false} end
+			local st = sample_state({adopted = true, l2guard = {bpdu = true, tagdrop = true, ifnames = {"x"}}})
+			inform._reload_if_changed(st, {config = {}}, "before")
+			local interval_after_reset = inform._controller_interval
+			-- 3. A reload that stays adopted forgets nothing.
+			inform._controller_interval = 300
+			inform._state.load = function() return {adopted = true} end
+			inform._reload_if_changed(sample_state({adopted = true}), {config = {}}, "before")
+			local interval_kept = inform._controller_interval
+
+			inform._l2guard, inform._firewall, inform._sysconf, inform._state_mtime,
+				inform._state.load, io.stderr =
+				orig.l2, orig.fw, orig.sc, orig.mtime, orig.load, orig.stderr
+			inform._controller_interval = nil
+
 			assert_true(ok, tostring(err))
-			assert_eq(#calls, 1, "reconciled once")
-			assert_nil(calls[1].spec, "with nothing to enforce, which only deletes the table")
+			assert_eq(#l2calls, 2, "the l2guard table is torn down on both paths, and only those")
+			assert_nil(l2calls[1].spec, "with nothing to enforce, which only deletes the table")
+			assert_nil(l2calls[2].spec, "on the reset-inform path too")
+			assert_eq(#crons, 2, "the controller's cron block is removed on both paths")
+			assert_false(crons[1].enabled, "by applying an empty, disabled cron block")
+			assert_nil(interval_after_setdefault, "the controller's interval is forgotten")
+			assert_nil(interval_after_reset, "on both paths")
+			assert_eq(interval_kept, 300, "a reload that stays adopted keeps it")
 		end
 	},
 	{

@@ -3040,8 +3040,7 @@ function M.handle_response(json_str, st, cfg)
 		st.mac, st.ip, st.hostname = mac, ip, hostname
 		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 		M._firewall.reconcile(st.blocked_stas)
-		-- st.l2guard went with the reset; the kernel table must follow.
-		if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
+		M._forget_controller()
 		return false
 	end
 
@@ -3387,11 +3386,27 @@ end
 -- bootstrap account (if enabled) locked/unlocked to match the reloaded
 -- adopted state. Returns the current mtime (unchanged from last_mtime if
 -- the file didn't change).
+-- What a controller left behind outside state.json, torn down when the
+-- device stops being adopted -- a `setdefault` (controller "Forget") or an
+-- out-of-process `syswrapper.sh reset-inform`. The l2guard table is kernel
+-- state that st.l2guard no longer describes once the reset cleared it; the
+-- nightly 11k-scan cron job would keep scanning every radio on behalf of a
+-- controller that no longer manages the device; and a long noop interval
+-- would slow re-adoption to one attempt per interval. The pushed timezone and
+-- NTP servers stay: they are sane settings for the board either way, and
+-- their originals remain stamped in UCI (USAGE § 6).
+function M._forget_controller()
+	M._controller_interval = nil
+	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
+	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end
+end
+
 function M._reload_if_changed(st, cfg, last_mtime)
 	local mtime = M._state_mtime(M._state._state_file)
 	if mtime == nil or mtime == last_mtime then
 		return last_mtime
 	end
+	local was_adopted = st.adopted
 	-- mac/ip/hostname are populated once at M.run() startup and never
 	-- persisted to state.json -- preserve them across the reload.
 	local mac, ip, hostname = st.mac, st.ip, st.hostname
@@ -3401,6 +3416,7 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	st.mac, st.ip, st.hostname = mac, ip, hostname
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	M._firewall.reconcile(st.blocked_stas)
+	if was_adopted and not st.adopted then M._forget_controller() end
 	return mtime
 end
 

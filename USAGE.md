@@ -955,7 +955,7 @@ The intent and the VAP list are recorded in `state.json` (`l2guard`), and the ta
 rebuilt on every start. The daemon also re-reads the VAP list once a minute and rebuilds
 when it changed. That covers an SSID added by a push whose `wifi reload` had not
 finished yet, and wireless coming up after the daemon at boot. A factory reset
-(`setdefault`) removes the table.
+(`setdefault`, or `syswrapper.sh reset-inform`) removes the table.
 
 Needs **`kmod-nft-bridge`**: `iifname`/`oifname` in the bridge family live in
 `nft_meta_bridge`. Without it every rule is rejected and openUF logs
@@ -1002,8 +1002,10 @@ logread -e openuf | grep 11k-scan   # "11k-scan requested -- scanned 2 radio(s)"
 To take a board back from the controller's timezone, copy `openuf_timezone_orig` back
 to `timezone` (`uci get system.@system[0].openuf_timezone_orig`). For NTP, copy
 `openuf_ntp_orig` back to `server`, delete both stamps, and run `uci commit system`.
-The controller re-applies its values on the next full push. `install.sh uninstall`
-removes the marked cron block, but it leaves the timezone and NTP values in place.
+The controller re-applies its values on the next full push. Three things remove
+the marked cron block: `install.sh uninstall`, a controller *Forget* (`setdefault`) and
+`syswrapper.sh reset-inform`. All three leave the timezone and NTP values in place:
+those are sane settings for the board either way, and the originals stay stamped.
 
 ---
 
