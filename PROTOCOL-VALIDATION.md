@@ -938,6 +938,30 @@ reflected. Two details worth keeping:
 A disabled WLAN is still provisioned, just with `disabled=1`, so its configuration survives
 a re-enable.
 
+### `system.timezone` / `ntpclient.*` / `cron.*` — system settings
+
+Carried by every full push, and not read by openUF until 2026-09-25. The yesrab/openUF
+fork's capture (2026-09-15) found them; openUF has not yet captured them itself:
+
+```
+system.timezone=IST-5:30                    # a POSIX TZ string, not an Olson name
+locale.timezone=IST-5:30                    # the same value again
+ntpclient.status=enabled
+ntpclient.1.status=enabled
+ntpclient.1.server=0.ubnt.pool.ntp.org      # x4, slots 1-4
+cron.status=enabled
+cron.1.status=enabled
+cron.1.user=<the site's device SSH user>
+cron.1.job.1.status=enabled
+cron.1.job.1.schedule=0 4 * * *
+cron.1.job.1.cmd=syswrapper.sh 11k-scan
+```
+
+The cron job is how the controller schedules the nightly neighbour scan: it runs through
+the AP's own crond at 04:00 device-local time. That is why the timezone matters. See USAGE
+§ 6 for what `sysconf.lua` does with each block. `cron.<n>.user` is deliberately left
+unrecognized, so it shows in the dropped-key report.
+
 ---
 
 ## The first DSA / 802.11ax board

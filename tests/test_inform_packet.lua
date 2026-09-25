@@ -3145,6 +3145,98 @@ return {
 		end
 	},
 	{
+		name = "inform: an 11k-scan request scans every radio once, a stale or absent one does nothing",
+		fn = function()
+			local FILE = "/tmp/openuf_test_scan_request"
+			local orig = {file = inform.SCAN_REQUEST_FILE, uci = inform._ucihelper,
+				time = inform._time, stderr = io.stderr}
+			io.stderr = {write = function() end}
+			local popens = {}
+			inform._ucihelper = {
+				get_radio_table = function() return {{name = "radio0"}, {name = "radio1"}} end,
+				get_ifname_for_radio = function(r) return (r == "radio0") and "phy0-ap0" or "phy1-ap0" end,
+				_popen = function(cmd)
+					popens[#popens + 1] = cmd
+					return cmd:find("phy0", 1, true) and "scan-ok\n" or ""
+				end,
+			}
+			inform.SCAN_REQUEST_FILE = FILE
+			inform._time = function() return 1000000 end
+			local function request(at)
+				local f = io.open(FILE, "w"); f:write(tostring(at), "\n"); f:close()
+			end
+
+			os.remove(FILE)
+			local none = inform._maybe_service_scan_request({})
+			request(1000000 - 30)
+			local fresh = inform._maybe_service_scan_request({})
+			local file_gone = io.open(FILE, "r") == nil
+			local again = inform._maybe_service_scan_request({})
+			local before = #popens
+			local scanned_n = inform._scan_all_radios({})
+			for _ = before + 1, #popens do table.remove(popens) end
+			request(1000000 - 3600)
+			local stale = inform._maybe_service_scan_request({})
+			local stale_gone = io.open(FILE, "r") == nil
+
+			os.remove(FILE)
+			inform.SCAN_REQUEST_FILE, inform._ucihelper, inform._time, io.stderr =
+				orig.file, orig.uci, orig.time, orig.stderr
+
+			assert_false(none, "no request, no scan")
+			assert_true(fresh, "a fresh request scans")
+			assert_eq(#popens, 2, "one scan per radio")
+			assert_contains(popens[1], "iw dev phy0-ap0 scan ap-force",
+				"on the live netdev, forced: mac80211 refuses a plain scan on a beaconing AP")
+			assert_contains(popens[2], "iw dev phy1-ap0 scan ap-force", "of each radio")
+			assert_eq(scanned_n, 1, "only the scan iw accepted is counted")
+			assert_true(file_gone, "the request is consumed")
+			assert_false(again, "and served only once")
+			assert_false(stale, "an hour-old request is ignored")
+			assert_true(stale_gone, "but still removed")
+		end
+	},
+	{
+		name = "inform: a setparam's timezone/NTP/cron blocks reach sysconf, and are not reported as dropped",
+		fn = function()
+			local orig = {sysconf = inform._sysconf, dbg = inform._debug_dropped_keys,
+				stderr = io.stderr}
+			local parsed_from, applied
+			inform._sysconf = {
+				parse = function(raw) parsed_from = raw; return {timezone = "CET-1CEST,M3.5.0,M10.5.0/3"} end,
+				apply = function(sc) applied = sc; return {} end,
+			}
+			local logged = {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+			-- The dropped-key report is gated on debug_dump_file, which
+			-- handle_response reads off cfg on every call.
+			local DUMP = "/tmp/openuf_test_sysconf_dump.txt"
+			local sys_raw = "system.timezone=CET-1CEST,M3.5.0,M10.5.0/3\n"
+				.. "locale.timezone=CET-1CEST,M3.5.0,M10.5.0/3\n"
+				.. "ntpclient.status=enabled\nntpclient.1.server=0.ubnt.pool.ntp.org\n"
+				.. "cron.status=enabled\ncron.1.status=enabled\ncron.1.user=pusheduser\n"
+				.. "cron.1.job.1.schedule=0 4 * * *\ncron.1.job.1.cmd=syswrapper.sh 11k-scan\n"
+			local ok, err = pcall(inform.handle_response,
+				require("cjson").encode({_type = "setparam", system_cfg = sys_raw}),
+				sample_state({adopted = true}), {config = {debug_dump_file = DUMP}})
+			os.remove(DUMP)
+			inform._sysconf, inform._debug_dropped_keys, io.stderr =
+				orig.sysconf, orig.dbg, orig.stderr
+			assert_true(ok, "handle_response survives: " .. tostring(err))
+			assert_eq(parsed_from, sys_raw, "sysconf parses the whole system_cfg")
+			assert_eq(applied and applied.timezone, "CET-1CEST,M3.5.0,M10.5.0/3", "and applies what it parsed")
+			local out = table.concat(logged)
+			assert_true(out:find("cron.<n>.user", 1, true) ~= nil,
+				"the ignored cron user is still reported as dropped")
+			for _, k in ipairs({"system.timezone", "locale.timezone", "ntpclient.", "cron.status",
+					"cron.<n>.job"}) do
+				assert_true(out:find(k, 1, true) == nil, k .. " is recognized, not dropped")
+			end
+		end
+	},
+	{
 		name = "inform: a missing UCI binding is announced, not silently survived",
 		fn = function()
 			-- libuci-lua is what require("uci") comes from; `lua` does not

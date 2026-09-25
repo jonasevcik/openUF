@@ -934,6 +934,46 @@ lua -e "dofile('/opt/openuf/ucihelper.lua').wlan_clear()"
 # or simply reset-inform and re-adopt
 ```
 
+### Controller-managed system settings (timezone, NTP, nightly scan)
+
+Every full `system_cfg` push also carries three blocks, which `sysconf.lua` applies:
+
+| Wire keys | Applied to | Undo trail |
+|---|---|---|
+| `system.timezone` (and its twin `locale.timezone`), a POSIX TZ string such as `CET-1CEST,M3.5.0,M10.5.0/3` | UCI `system.@system[0].timezone`, then `/etc/init.d/system reload`. The stale Olson `zonename` is moved aside, because it now names a different zone | `openuf_timezone_orig` / `openuf_zonename_orig` on the same section (the first original is kept) |
+| `ntpclient.status`, `ntpclient.<n>.server` | UCI `system.ntp.server` (a list, in slot order), then `/etc/init.d/sysntpd restart`. An explicit `ntpclient.status=disabled` puts the board's own list back | `openuf_ntp_orig` + the `openuf_ntp_managed` marker on `system.ntp` |
+| `cron.<n>.job.<m>.schedule` / `.cmd` | A marked block in `/etc/crontabs/root` (`# openuf-cron-begin` … `# openuf-cron-end`), then `cron enable` + `restart`. Lines outside the markers are never touched. The block is removed once a push stops carrying jobs | the markers themselves |
+
+Nothing is written when the pushed value already matches, so the identical pushes of
+a steady state cost no flash writes. Malformed values (a timezone with a quote, a
+server name with a space, a schedule that is not five plain fields) are logged and
+refused.
+
+**Cron runs only commands openUF provides.** The one the controller pushes today is
+`syswrapper.sh 11k-scan` at `0 4 * * *`, the nightly neighbour scan. Anything else is
+logged as `not a command this build provides` and never written: crond runs it as
+root. The pushed `cron.<n>.user` is ignored, since that account does not exist here.
+
+`syswrapper.sh 11k-scan` does not scan by itself. It leaves a dated request in
+`/tmp/openuf-scan-request`, and the inform daemon consumes it on its next heartbeat. It
+runs `iw dev <if> scan ap-force` on every reported radio right before building the
+payload, so that inform's `scan_table` carries the fresh results. `ap-force` is
+required because mac80211 refuses a plain scan on a beaconing AP interface. A radio
+where iw still refuses logs `iw refused to scan <if>`, and the count leaves it out. A request older than ten minutes
+(say, one left behind by a stopped daemon) is discarded rather than fired at boot.
+You can run it by hand to trigger a scan:
+
+```sh
+syswrapper.sh 11k-scan
+logread -e openuf | grep 11k-scan   # "11k-scan requested -- scanned 2 radio(s)"
+```
+
+To take a board back from the controller's timezone, copy `openuf_timezone_orig` back
+to `timezone` (`uci get system.@system[0].openuf_timezone_orig`). For NTP, copy
+`openuf_ntp_orig` back to `server`, delete both stamps, and run `uci commit system`.
+The controller re-applies its values on the next full push. `install.sh uninstall`
+removes the marked cron block, but it leaves the timezone and NTP values in place.
+
 ---
 
 ## 7. LLDP topology

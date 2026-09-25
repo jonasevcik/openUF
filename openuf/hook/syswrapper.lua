@@ -8,6 +8,7 @@
 	  syswrapper.sh set-adopt  <inform_url> <authkey_hex32>
 	  syswrapper.sh set-inform <inform_url>
 	  syswrapper.sh reset-inform
+	  syswrapper.sh 11k-scan          -- the controller's nightly cron job
 
 	authkey_hex32: exactly 32 hex characters (= 16 bytes, AES-128 key).
 	inform_url:    http(s)://host:port/inform
@@ -60,6 +61,7 @@ local function usage()
 		"Usage: syswrapper.sh set-adopt <url> <key32hex>\n" ..
 		"       syswrapper.sh set-inform <url>\n" ..
 		"       syswrapper.sh reset-inform\n" ..
+		"       syswrapper.sh 11k-scan\n" ..
 		"\n" ..
 		"key32hex: exactly 32 hexadecimal characters (16 bytes, AES-128)\n"
 	)
@@ -122,6 +124,27 @@ local function cmd_reset_inform()
 	return true
 end
 
+-- 11k-scan
+-- What the controller's pushed cron job runs at 04:00 every night (see
+-- sysconf.lua): a neighbour scan on every radio. The scan itself is the
+-- inform daemon's job -- it owns the radios' netdev names and the scan
+-- cache, and its next heartbeat carries the result out -- so this only
+-- leaves a dated request file that inform.lua's _maybe_service_scan_request
+-- picks up within one interval and discards if it is more than ten minutes
+-- old (a request left behind by a stopped daemon must not fire at boot).
+local scan_request_file = "/tmp/openuf-scan-request"
+local function cmd_11k_scan()
+	local f = io.open(scan_request_file, "w")
+	if not f then
+		io.stderr:write("syswrapper: cannot write " .. scan_request_file .. "\n")
+		return false
+	end
+	f:write(tostring(os.time()), "\n")
+	f:close()
+	io.stdout:write("syswrapper: neighbour scan requested; the inform daemon runs it within one heartbeat\n")
+	return true
+end
+
 -- ─── Entry point ─────────────────────────────────────────────────────────────
 
 local function main(args)
@@ -136,6 +159,8 @@ local function main(args)
 		end
 	elseif cmd == "reset-inform" then
 		cmd_reset_inform()
+	elseif cmd == "11k-scan" then
+		if not cmd_11k_scan() then os.exit(1) end
 	else
 		io.stderr:write("syswrapper: unknown command: " .. tostring(cmd) .. "\n")
 		usage()
@@ -155,6 +180,8 @@ return {
 	cmd_set_adopt  = cmd_set_adopt,
 	cmd_set_inform = cmd_set_inform,
 	cmd_reset_inform = cmd_reset_inform,
+	cmd_11k_scan = cmd_11k_scan,
+	_set_scan_request_file = function(p) scan_request_file = p end,
 	is_hex32 = is_hex32,
 	is_url   = is_url,
 	_set_state = function(s) state = s end,

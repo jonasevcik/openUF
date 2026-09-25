@@ -413,6 +413,15 @@ case "$ACTION" in
 		# Remove symlink
 		rm -f "$BIN_LINK"
 
+		# The controller's cron jobs (sysconf.lua) call the symlink just
+		# removed; take openUF's marked block out of root's crontab so crond
+		# does not fail on it every night. Lines outside the markers stay.
+		if grep -q '^# openuf-cron-begin' /etc/crontabs/root 2>/dev/null; then
+			sed -i '/^# openuf-cron-begin/,/^# openuf-cron-end$/d' /etc/crontabs/root
+			/etc/init.d/cron restart 2>/dev/null
+			echo "Removed openUF's controller cron jobs from /etc/crontabs/root."
+		fi
+
 		# Remove the SSH bootstrap account/group if present (hygiene --
 		# symmetric with what install --bootstrap-adopt added, regardless of
 		# whether that flag is passed here).

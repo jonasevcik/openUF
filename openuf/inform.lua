@@ -60,6 +60,7 @@ local firewall  = _require_sibling("firewall")
 local usteer    = _require_sibling("usteer")
 local switchvlan = _require_sibling("switchvlan")
 local rrmscan   = _require_sibling("rrmscan")
+local sysconf   = _require_sibling("sysconf")
 
 local M = {}
 
@@ -79,6 +80,7 @@ M._firewall  = firewall
 M._usteer    = usteer
 M._switchvlan = switchvlan
 M._rrmscan    = rrmscan
+M._sysconf    = sysconf
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -2547,6 +2549,16 @@ local RECOGNIZED_SYSTEM_CFG = {
 	"^switch%.vlan%.status$",
 	"^switch%.vlan%.%d+%.",
 	"^switch%.port%.%d+%.",
+	-- Controller-managed system settings (sysconf.lua). cron.<n>.user is
+	-- deliberately NOT here: the pushed account does not exist and the jobs
+	-- run as root, so the key stays in the report as ignored.
+	"^system%.timezone$",
+	"^locale%.timezone$",
+	"^ntpclient%.status$",
+	"^ntpclient%.%d+%.",
+	"^cron%.status$",
+	"^cron%.%d+%.status$",
+	"^cron%.%d+%.job%.%d+%.",
 }
 
 local RECOGNIZED_MGMT_CFG = {
@@ -2978,6 +2990,19 @@ function M.handle_response(json_str, st, cfg)
 					-- cannot notice on its own.
 					M._sysinfo.forget_uplink_cache()
 				end)
+			end
+
+			-- Controller-managed system settings: timezone, NTP servers and
+			-- the nightly `syswrapper.sh 11k-scan` cron job (sysconf.lua).
+			-- Each part is pcall'd inside apply(); this pcall covers parse.
+			if M._sysconf then
+				local ok_sc, err_sc = pcall(function()
+					local sc = M._sysconf.parse(sys_raw)
+					if sc then M._sysconf.apply(sc) end
+				end)
+				if not ok_sc then
+					io.stderr:write("inform: sysconf: " .. tostring(err_sc) .. "\n")
+				end
 			end
 		end
 
@@ -3582,6 +3607,68 @@ function M._rrm_tick(cfg)
 	return true
 end
 
+-- ─── The controller's scheduled neighbour scan ──────────────────────────────
+
+-- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
+-- sysconf.lua -- leaves its dated request. Consumed and removed by the next
+-- heartbeat; ignored when older than SCAN_REQUEST_MAX_AGE, so a request a
+-- stopped daemon never saw does not fire at the next boot in the middle of
+-- hostapd's ACS sweep.
+M.SCAN_REQUEST_FILE    = "/tmp/openuf-scan-request"
+M.SCAN_REQUEST_MAX_AGE = 600
+
+-- `iw dev <if> scan ap-force` on every reported radio (the modelmap's
+-- hwassign, as build_json uses). Blocking, a few seconds per radio -- which is
+-- the point: build_json runs next and its `scan dump` then carries the fresh
+-- results. `ap-force` is not optional: the netdev is a beaconing AP, and
+-- mac80211 refuses a scan there with EOPNOTSUPP unless the request carries
+-- NL80211_SCAN_FLAG_AP. The scan output itself is discarded (the dump reads
+-- the cache); only iw's exit status is kept, so the count is of scans that
+-- actually ran, not of commands sent. Returns that count.
+function M._scan_all_radios(cfg)
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
+	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
+	if not ok_r or type(radios) ~= "table" then return 0 end
+	local issued = 0
+	for _, radio in ipairs(radios) do
+		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+		if ok_if and ifname then
+			local out = ufuci._popen("iw dev " .. ifname
+				.. " scan ap-force >/dev/null 2>&1 && echo scan-ok")
+			if out:find("scan-ok", 1, true) then
+				issued = issued + 1
+			else
+				io.stderr:write("inform: 11k-scan: iw refused to scan " .. ifname .. "\n")
+			end
+		end
+	end
+	return issued
+end
+
+-- True when a fresh 11k-scan request was waiting; the file is removed either
+-- way, so a request is served at most once.
+function M._scan_requested()
+	local raw = M._read_file(M.SCAN_REQUEST_FILE)
+	if not raw then return false end
+	os.remove(M.SCAN_REQUEST_FILE)
+	local at = tonumber(raw:match("%d+"))
+	local age = at and (M._time() - at)
+	if not age or age < -60 or age > M.SCAN_REQUEST_MAX_AGE then
+		io.stderr:write("inform: ignoring a stale 11k-scan request\n")
+		return false
+	end
+	return true
+end
+
+-- Serve a pending 11k-scan request. Returns true when radios were scanned.
+function M._maybe_service_scan_request(cfg)
+	if not M._scan_requested() then return false end
+	local n = M._scan_all_radios(cfg)
+	io.stderr:write(("inform: 11k-scan requested -- scanned %d radio(s)\n"):format(n))
+	return n > 0
+end
+
 -- One heartbeat: build, send, dispatch. Returns the number of seconds the
 -- caller should wait before the next one -- 0 means "again, now", the
 -- config-applied case, where a real AP re-informs immediately. ctx carries the
@@ -3606,6 +3693,9 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- Before build_json, so anything a client reported since the last cycle
 	-- rides out on THIS inform rather than waiting for the next.
 	pcall(M._rrm_tick, cfg)
+	-- The controller's nightly scan (syswrapper.sh 11k-scan), also before
+	-- build_json so the fresh scan dump is what this inform reports.
+	pcall(M._maybe_service_scan_request, cfg)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
