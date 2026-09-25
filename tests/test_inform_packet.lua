@@ -2483,12 +2483,13 @@ return {
 			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
 			local orig_cache = inform._spectrum_cache
 			inform._spectrum_cache = {}
+			local popens = {}
 			inform._ucihelper = {
 				get_radio_table = function()
 					return { { name = "radio0", channel = "6", ht = "HT40" } }
 				end,
 				get_ifname_for_radio = function() return "wlan0" end,
-				_popen = function() return "" end,
+				_popen = function(cmd) popens[#popens + 1] = cmd; return "scan-ok\n" end,
 			}
 			inform._sysinfo.radio_stats = function()
 				return {
@@ -2509,10 +2510,44 @@ return {
 				assert_true(cached.table[1].width == 40, "width derived from radio's HT40 htmode")
 				assert_true(cached.table[1].utilization == 37, "utilization = channel_time_busy/channel_time * 100")
 				assert_true(cached.table[1].interference == -95, "interference is best-effort noise-floor passthrough")
+				-- mac80211 refuses a plain scan on a beaconing AP interface
+				-- (EOPNOTSUPP without NL80211_SCAN_FLAG_AP), so the sweep the
+				-- whole table depends on never ran.
+				assert_eq(#popens, 1, "one sweep")
+				assert_contains(popens[1], "iw dev wlan0 scan ap-force", "forced, or mac80211 refuses it")
 			end)
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
 			inform._spectrum_cache = orig_cache
 			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a refused spectrum sweep is logged and still reports the survey it has",
+		fn = function()
+			local st = sample_state()
+			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
+			local orig_cache, orig_stderr = inform._spectrum_cache, io.stderr
+			inform._spectrum_cache = {}
+			local logged = {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
+			inform._ucihelper = {
+				get_radio_table = function() return { { name = "radio0", channel = "6", ht = "HT20" } } end,
+				get_ifname_for_radio = function() return "wlan0" end,
+				_popen = function() return "" end,   -- iw failed: no scan-ok
+			}
+			inform._sysinfo.radio_stats = function()
+				return { { freq = 2437, noise = -95, channel_time = 100, channel_time_busy = 10 } }
+			end
+			local ok, err = pcall(inform.handle_response, '{"_type":"cmd","cmd":"spectrum-scan"}', st)
+			local cached = inform._spectrum_cache.radio0
+			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
+			inform._spectrum_cache, io.stderr = orig_cache, orig_stderr
+			assert_true(ok, tostring(err))
+			assert_contains(table.concat(logged), "spectrum-scan: iw refused to scan wlan0",
+				"the refusal is visible, not silent")
+			assert_true(cached ~= nil and #cached.table == 1, "the operating channel is still reported")
 		end
 	},
 	{
@@ -2535,7 +2570,7 @@ return {
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function(cmd)
 					if tostring(cmd):match("scan") then scanned = true end
-					return ""
+					return "scan-ok\n"
 				end,
 			}
 			inform._sysinfo.radio_stats = function()

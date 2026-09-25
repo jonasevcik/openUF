@@ -3182,7 +3182,10 @@ function M.handle_response(json_str, st, cfg)
 									end
 								end
 							end
-							ufuci._popen("iw dev " .. ifname .. " scan")
+							-- A refused sweep still leaves the operating
+							-- channel's survey, so the table is built either
+							-- way; _force_scan has logged the refusal.
+							M._force_scan(ufuci, ifname, "spectrum-scan")
 							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 							if ok_rs then
 								local width = _width_from_htmode(radio.ht)
@@ -3710,14 +3713,26 @@ end
 M.SCAN_REQUEST_FILE    = "/tmp/openuf-scan-request"
 M.SCAN_REQUEST_MAX_AGE = 600
 
--- `iw dev <if> scan ap-force` on every reported radio (the modelmap's
--- hwassign, as build_json uses). Blocking, a few seconds per radio -- which is
--- the point: build_json runs next and its `scan dump` then carries the fresh
--- results. `ap-force` is not optional: the netdev is a beaconing AP, and
+-- One blocking off-channel sweep on an AP netdev: `iw dev <if> scan
+-- ap-force`. `ap-force` is not optional: the netdev is a beaconing AP, and
 -- mac80211 refuses a scan there with EOPNOTSUPP unless the request carries
--- NL80211_SCAN_FLAG_AP. The scan output itself is discarded (the dump reads
--- the cache); only iw's exit status is kept, so the count is of scans that
--- actually ran, not of commands sent. Returns that count.
+-- NL80211_SCAN_FLAG_AP -- a plain `scan` returns at once having swept
+-- nothing, and since _popen drops stderr that looked exactly like success.
+-- The scan output itself is discarded (callers read the kernel's caches:
+-- `scan dump`, `survey dump`); only iw's exit status is kept. Returns true
+-- when the sweep ran; logs and returns false when iw refused it.
+function M._force_scan(ufuci, ifname, who)
+	local out = ufuci._popen("iw dev " .. ifname
+		.. " scan ap-force >/dev/null 2>&1 && echo scan-ok")
+	if out:find("scan-ok", 1, true) then return true end
+	io.stderr:write("inform: " .. who .. ": iw refused to scan " .. ifname .. "\n")
+	return false
+end
+
+-- A forced sweep on every reported radio (the modelmap's hwassign, as
+-- build_json uses). Blocking, a few seconds per radio -- which is the point:
+-- build_json runs next and its `scan dump` then carries the fresh results.
+-- Returns how many sweeps actually ran, not how many were asked for.
 function M._scan_all_radios(cfg)
 	local ufuci = M._ucihelper
 	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
@@ -3726,14 +3741,8 @@ function M._scan_all_radios(cfg)
 	local issued = 0
 	for _, radio in ipairs(radios) do
 		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-		if ok_if and ifname then
-			local out = ufuci._popen("iw dev " .. ifname
-				.. " scan ap-force >/dev/null 2>&1 && echo scan-ok")
-			if out:find("scan-ok", 1, true) then
-				issued = issued + 1
-			else
-				io.stderr:write("inform: 11k-scan: iw refused to scan " .. ifname .. "\n")
-			end
+		if ok_if and ifname and M._force_scan(ufuci, ifname, "11k-scan") then
+			issued = issued + 1
 		end
 	end
 	return issued
