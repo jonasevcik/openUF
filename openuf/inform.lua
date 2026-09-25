@@ -61,6 +61,7 @@ local usteer    = _require_sibling("usteer")
 local switchvlan = _require_sibling("switchvlan")
 local rrmscan   = _require_sibling("rrmscan")
 local sysconf   = _require_sibling("sysconf")
+local l2guard   = _require_sibling("l2guard")
 
 local M = {}
 
@@ -81,6 +82,7 @@ M._usteer    = usteer
 M._switchvlan = switchvlan
 M._rrmscan    = rrmscan
 M._sysconf    = sysconf
+M._l2guard    = l2guard
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -2559,6 +2561,10 @@ local RECOGNIZED_SYSTEM_CFG = {
 	"^cron%.status$",
 	"^cron%.%d+%.status$",
 	"^cron%.%d+%.job%.%d+%.",
+	-- The ebtables hardening block (l2guard.lua). ebtables.add_vlan.status
+	-- is not read and stays in the report.
+	"^ebtables%.status$",
+	"^ebtables%.%d+%.cmd$",
 }
 
 local RECOGNIZED_MGMT_CFG = {
@@ -3004,6 +3010,17 @@ function M.handle_response(json_str, st, cfg)
 					io.stderr:write("inform: sysconf: " .. tostring(err_sc) .. "\n")
 				end
 			end
+
+			-- The ebtables.* hardening block (l2guard.lua): BPDU and
+			-- VLAN-tag drop on every AP VAP. After the WiFi pass on purpose,
+			-- so a VAP this push added has its netdev by now if netifd was
+			-- quick; _l2guard_resync picks it up if not.
+			if M._l2guard then
+				local ok_l2, err_l2 = pcall(M._l2guard_apply_push, sys_raw, st)
+				if not ok_l2 then
+					io.stderr:write("inform: l2guard: " .. tostring(err_l2) .. "\n")
+				end
+			end
 		end
 
 		M._state.save(st)
@@ -3023,6 +3040,8 @@ function M.handle_response(json_str, st, cfg)
 		st.mac, st.ip, st.hostname = mac, ip, hostname
 		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 		M._firewall.reconcile(st.blocked_stas)
+		-- st.l2guard went with the reset; the kernel table must follow.
+		if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
 		return false
 	end
 
@@ -3607,6 +3626,64 @@ function M._rrm_tick(cfg)
 	return true
 end
 
+-- ─── The controller's ebtables hardening (l2guard.lua) ──────────────────────
+
+function M._l2guard_live_ifnames()
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.ap_ifnames) then return {} end
+	local ok, names = pcall(ufuci.ap_ifnames)
+	return (ok and type(names) == "table") and names or {}
+end
+
+local function same_names(a, b)
+	if type(a) ~= "table" or type(b) ~= "table" or #a ~= #b then return false end
+	for i = 1, #a do if a[i] ~= b[i] then return false end end
+	return true
+end
+
+-- A push's ebtables.* block -> st.l2guard, and the table rebuilt. A push
+-- without the block (a partial one) leaves the current state alone.
+function M._l2guard_apply_push(sys_raw, st)
+	local eb = M._l2guard.parse(sys_raw)
+	if not eb then return false end
+	for _, u in ipairs(eb.unknown or {}) do
+		io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
+			.. ("%q"):format(u) .. "\n")
+	end
+	local spec = M._l2guard.spec_from(eb)
+	local names = M._l2guard_live_ifnames()
+	if #names == 0 and type(st.l2guard) == "table" and type(st.l2guard.ifnames) == "table" then
+		names = st.l2guard.ifnames   -- wireless not answering yet: last known
+	end
+	spec.ifnames = names
+	st.l2guard = spec
+	M._l2guard.reconcile(spec, names)
+	return true
+end
+
+-- Once a minute: if the live VAP list no longer matches the one the table was
+-- built for (an SSID added by a push whose `wifi reload` had not finished, or
+-- wireless coming up after the daemon at boot), rebuild. An empty live list
+-- is "not answering", never "no VAPs": it leaves the table alone. Returns true
+-- when it rebuilt.
+M.L2GUARD_RESYNC_INTERVAL = 60
+M._l2guard_next = 0
+function M._l2guard_resync(st)
+	local g = st and st.l2guard
+	if not (M._l2guard and type(g) == "table" and (g.bpdu or g.tagdrop)) then return false end
+	local now = M._time()
+	if now < M._l2guard_next then return false end
+	M._l2guard_next = now + M.L2GUARD_RESYNC_INTERVAL
+	local names = M._l2guard_live_ifnames()
+	if #names == 0 or same_names(names, g.ifnames) then return false end
+	io.stderr:write("l2guard: AP interfaces changed (" .. table.concat(names, " ")
+		.. ") -- rebuilding\n")
+	g.ifnames = names
+	M._state.save(st)
+	M._l2guard.reconcile(g, names)
+	return true
+end
+
 -- ─── The controller's scheduled neighbour scan ──────────────────────────────
 
 -- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
@@ -3696,6 +3773,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- The controller's nightly scan (syswrapper.sh 11k-scan), also before
 	-- build_json so the fresh scan dump is what this inform reports.
 	pcall(M._maybe_service_scan_request, cfg)
+	pcall(M._l2guard_resync, st)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
@@ -3853,6 +3931,17 @@ function M.run(cfg, ufhw)
 	-- blocklist. A tap that is not reinstalled fails silently, as an empty
 	-- mac_table, which is the bug it exists to fix.
 	if M._switchvlan then pcall(M._switchvlan.reconcile_mac_taps) end
+	-- The controller's ebtables hardening is nft state too. Rebuilt from
+	-- state.json's record with the live VAP list, or the names recorded at
+	-- the last push while wireless is not answering yet; _l2guard_resync
+	-- corrects the list once it is.
+	if M._l2guard and type(st.l2guard) == "table" then
+		pcall(function()
+			local names = M._l2guard_live_ifnames()
+			if #names == 0 and type(st.l2guard.ifnames) == "table" then names = st.l2guard.ifnames end
+			M._l2guard.reconcile(st.l2guard, names)
+		end)
+	end
 
 	local socket = require("socket")
 	local ctx = {

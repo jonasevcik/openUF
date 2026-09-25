@@ -103,6 +103,10 @@ M.FIELDS = {
 	-- it, before per-port VLAN moved any socket out of it. Same job, and the
 	-- same "only record of what to put back".
 	dsa_brlan_ports           = "table",
+	-- The controller's ebtables.* intent ({bpdu, tagdrop, ifnames}), so the
+	-- nft rules l2guard builds from it come back after a reboot like the
+	-- blocklist does.
+	l2guard                   = "table",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security

@@ -27,7 +27,7 @@ the device has.
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
-| `kmod-nft-bridge` | The Multicast/Broadcast Blocker only. `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
+| `kmod-nft-bridge` | The Multicast/Broadcast Blocker and the L2 hardening (`bridge openuf_l2guard`). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
 | `kmod-sched-act-police` | The **upload** half of WiFi Speed Limit only. `police` is a tc *action*, a separate module from the ingress qdisc and absent from a stock filogic image. Without it the download cap applies and the upload cap does not — openUF logs which interface `tc` rejected and names this package rather than reporting the whole limit as applied |
@@ -886,8 +886,8 @@ from the client-blocking `bridge openuf` table, which is rebuilt wholesale on ev
 block/unblock and would otherwise wipe these rules). Frames leaving a filtered SSID are
 dropped unless the *sender's* MAC is allow-listed.
 
-This needs **`kmod-nft-bridge`**, and it is the only feature that does. The drop rule is
-openUF's one bridge-family `meta` match, and `nft_meta_bridge` is a separate module that
+This needs **`kmod-nft-bridge`**, as does the L2 hardening below. The drop rule is
+a bridge-family `meta` match, and `nft_meta_bridge` is a separate module that
 `nftables` does not depend on — absent from a stock filogic *and* ath79 image alike. The
 failure is quiet in the worst way: the table, the chain and the per-VAP allow-list set
 are all created and populated, and only the drop rule is rejected, so the control reads
@@ -932,6 +932,37 @@ To remove all provisioned SSIDs:
 ```sh
 lua -e "dofile('/opt/openuf/ucihelper.lua').wlan_clear()"
 # or simply reset-inform and re-adopt
+```
+
+### L2 hardening: BPDU and VLAN-tag drop on the SSIDs
+
+Every full push also carries an `ebtables.*` block, the literal ebtables fragments stock
+firmware replays. It amounts to two rules on every VAP:
+
+- **BPDU drop, both ways.** Frames to the Bridge Group Address `01:80:c2:00:00:00`,
+  where STP BPDUs go. With STP off (OpenWrt's default) the bridge *forwards* them, so
+  without this rule a wireless client could inject BPDUs into the wired LAN.
+- **VLAN-tag drop, inbound.** A wireless client may not send 802.1Q-tagged frames, so
+  there is no VLAN hopping from the air.
+
+`l2guard.lua` enforces both as nftables rules in a dedicated `bridge openuf_l2guard`
+table, on the AP-mode VAP netdevs only (station and mesh interfaces are left out). The
+controller's bridge-wide `--vlan-id <n>` rule is deliberately narrowed to the VAPs. On a
+DSA board openUF's tagged uplink sits on the bridge itself (`br-lan.<vid>`), so a
+bridge-wide tag drop would cut a tagged SSID's uplink.
+
+The intent and the VAP list are recorded in `state.json` (`l2guard`), and the table is
+rebuilt on every start. The daemon also re-reads the VAP list once a minute and rebuilds
+when it changed. That covers an SSID added by a push whose `wifi reload` had not
+finished yet, and wireless coming up after the daemon at boot. A factory reset
+(`setdefault`) removes the table.
+
+Needs **`kmod-nft-bridge`**: `iifname`/`oifname` in the bridge family live in
+`nft_meta_bridge`. Without it every rule is rejected and openUF logs
+`l2guard: nft rejected the … rule … kmod-nft-bridge`. Check with:
+
+```sh
+nft list table bridge openuf_l2guard
 ```
 
 ### Controller-managed system settings (timezone, NTP, nightly scan)

@@ -3200,7 +3200,8 @@ return {
 		name = "inform: a setparam's timezone/NTP/cron blocks reach sysconf, and are not reported as dropped",
 		fn = function()
 			local orig = {sysconf = inform._sysconf, dbg = inform._debug_dropped_keys,
-				stderr = io.stderr}
+				stderr = io.stderr, l2 = inform._l2guard}
+			inform._l2guard = nil   -- no real nft from a unit test
 			local parsed_from, applied
 			inform._sysconf = {
 				parse = function(raw) parsed_from = raw; return {timezone = "CET-1CEST,M3.5.0,M10.5.0/3"} end,
@@ -3218,12 +3219,14 @@ return {
 				.. "ntpclient.status=enabled\nntpclient.1.server=0.ubnt.pool.ntp.org\n"
 				.. "cron.status=enabled\ncron.1.status=enabled\ncron.1.user=pusheduser\n"
 				.. "cron.1.job.1.schedule=0 4 * * *\ncron.1.job.1.cmd=syswrapper.sh 11k-scan\n"
+				.. "ebtables.status=enabled\n"
+				.. "ebtables.1.cmd=-t nat -A PREROUTING --in-interface ath0 -d BGA -j DROP\n"
 			local ok, err = pcall(inform.handle_response,
 				require("cjson").encode({_type = "setparam", system_cfg = sys_raw}),
 				sample_state({adopted = true}), {config = {debug_dump_file = DUMP}})
 			os.remove(DUMP)
-			inform._sysconf, inform._debug_dropped_keys, io.stderr =
-				orig.sysconf, orig.dbg, orig.stderr
+			inform._sysconf, inform._debug_dropped_keys, io.stderr, inform._l2guard =
+				orig.sysconf, orig.dbg, orig.stderr, orig.l2
 			assert_true(ok, "handle_response survives: " .. tostring(err))
 			assert_eq(parsed_from, sys_raw, "sysconf parses the whole system_cfg")
 			assert_eq(applied and applied.timezone, "CET-1CEST,M3.5.0,M10.5.0/3", "and applies what it parsed")
@@ -3231,9 +3234,100 @@ return {
 			assert_true(out:find("cron.<n>.user", 1, true) ~= nil,
 				"the ignored cron user is still reported as dropped")
 			for _, k in ipairs({"system.timezone", "locale.timezone", "ntpclient.", "cron.status",
-					"cron.<n>.job"}) do
+					"cron.<n>.job", "ebtables.status", "ebtables.<n>.cmd"}) do
 				assert_true(out:find(k, 1, true) == nil, k .. " is recognized, not dropped")
 			end
+		end
+	},
+	{
+		name = "inform: an ebtables push builds l2guard on the live VAPs and records it; a push without the block changes nothing",
+		fn = function()
+			local orig = {l2 = inform._l2guard, uci = inform._ucihelper, stderr = io.stderr}
+			io.stderr = {write = function() end}
+			local reconciled = {}
+			inform._l2guard = setmetatable({
+				reconcile = function(spec, names) reconciled[#reconciled + 1] = {spec = spec, names = names}; return 3 end,
+			}, {__index = dofile("openuf/l2guard.lua")})
+			local live = {"phy0-ap0", "phy1-ap0"}
+			inform._ucihelper = {ap_ifnames = function() return live end}
+			local sys_raw = "ebtables.status=enabled\n"
+				.. "ebtables.1.cmd=-t nat -A PREROUTING --in-interface ath0 -d BGA -j DROP\n"
+				.. "ebtables.2.cmd=-t broute -A BROUTING --vlan-id 10 -p 802_1Q -j DROP\n"
+			local st = {}
+			local applied = inform._l2guard_apply_push(sys_raw, st)
+			-- wireless not answering: the recorded names are used
+			live = {}
+			inform._l2guard_apply_push(sys_raw, st)
+			local partial = inform._l2guard_apply_push("radio.1.channel=6\n", st)
+			inform._l2guard, inform._ucihelper, io.stderr = orig.l2, orig.uci, orig.stderr
+
+			assert_true(applied, "applied")
+			assert_true(st.l2guard.bpdu and st.l2guard.tagdrop, "both ideas recorded")
+			assert_eq(table.concat(st.l2guard.ifnames, ","), "phy0-ap0,phy1-ap0", "live names recorded")
+			assert_eq(table.concat(reconciled[1].names, ","), "phy0-ap0,phy1-ap0", "and enforced")
+			assert_eq(table.concat(reconciled[2].names, ","), "phy0-ap0,phy1-ap0",
+				"an unanswering wireless falls back to the recorded names")
+			assert_false(partial, "a push without the block is a no-op")
+			assert_eq(#reconciled, 2, "and does not touch the table")
+		end
+	},
+	{
+		name = "inform: _l2guard_resync rebuilds once a minute when the VAP list changed, never on an empty answer",
+		fn = function()
+			local orig = {l2 = inform._l2guard, uci = inform._ucihelper, time = inform._time,
+				save = inform._state.save, stderr = io.stderr}
+			io.stderr = {write = function() end}
+			local rebuilt, saves = {}, 0
+			inform._l2guard = {reconcile = function(_, names) rebuilt[#rebuilt + 1] = table.concat(names, ",") end}
+			inform._state.save = function() saves = saves + 1 end
+			local live = {"phy0-ap0"}
+			inform._ucihelper = {ap_ifnames = function() return live end}
+			local now = 5000
+			inform._time = function() return now end
+			inform._l2guard_next = 0
+			local st = {l2guard = {bpdu = true, tagdrop = true, ifnames = {"phy0-ap0"}}}
+
+			local same = inform._l2guard_resync(st)
+			live = {"phy0-ap0", "phy0-ap1"}
+			now = now + 10
+			local too_soon = inform._l2guard_resync(st)
+			now = now + 60
+			local changed = inform._l2guard_resync(st)
+			live = {}
+			now = now + 60
+			local empty = inform._l2guard_resync(st)
+			local off = inform._l2guard_resync({l2guard = {bpdu = false, tagdrop = false, ifnames = {}}})
+
+			inform._l2guard, inform._ucihelper, inform._time, inform._state.save, io.stderr =
+				orig.l2, orig.uci, orig.time, orig.save, orig.stderr
+			inform._l2guard_next = 0
+
+			assert_false(same, "unchanged list: nothing")
+			assert_false(too_soon, "rate-limited")
+			assert_true(changed, "a new VAP rebuilds")
+			assert_eq(rebuilt[1], "phy0-ap0,phy0-ap1", "on the new list")
+			assert_eq(table.concat(st.l2guard.ifnames, ","), "phy0-ap0,phy0-ap1", "which is recorded")
+			assert_eq(saves, 1, "and saved")
+			assert_false(empty, "an empty answer is 'not up', not 'no VAPs'")
+			assert_eq(#rebuilt, 1, "so the table is left alone")
+			assert_false(off, "nothing enforced, nothing to resync")
+		end
+	},
+	{
+		name = "inform: a factory reset tears the l2guard table down",
+		fn = function()
+			local orig = {l2 = inform._l2guard, fw = inform._firewall, stderr = io.stderr}
+			io.stderr = {write = function() end}
+			local calls = {}
+			inform._l2guard = {reconcile = function(spec, names) calls[#calls + 1] = {spec = spec, n = #names} end}
+			inform._firewall = {reconcile = function() end}
+			local ok, err = pcall(inform.handle_response, '{"_type":"setdefault"}',
+				sample_state({adopted = true, l2guard = {bpdu = true, tagdrop = true, ifnames = {"x"}}}),
+				{config = {}})
+			inform._l2guard, inform._firewall, io.stderr = orig.l2, orig.fw, orig.stderr
+			assert_true(ok, tostring(err))
+			assert_eq(#calls, 1, "reconciled once")
+			assert_nil(calls[1].spec, "with nothing to enforce, which only deletes the table")
 		end
 	},
 	{

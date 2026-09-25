@@ -938,6 +938,25 @@ reflected. Two details worth keeping:
 A disabled WLAN is still provisioned, just with `disabled=1`, so its configuration survives
 a re-enable.
 
+### `ebtables.*` — L2 hardening
+
+Carried by every full push (the yesrab/openUF fork's capture, 2026-09-15): literal
+ebtables fragments, which the stock firmware replays against its `ath<n>` VAPs.
+
+```
+ebtables.status=enabled
+ebtables.add_vlan.status=disabled
+ebtables.<n>.cmd=-t nat -A PREROUTING --in-interface ath0 -d BGA -j DROP     # per VAP
+ebtables.<n>.cmd=-t nat -A POSTROUTING --out-interface ath0 -d BGA -j DROP   # per VAP
+ebtables.<n>.cmd=-t broute -A BROUTING -i ath1 -p 802_1Q -j DROP             # the tagged SSID's VAP
+ebtables.<n>.cmd=-t broute -A BROUTING --vlan-id 10 -p 802_1Q -j DROP        # bridge-wide
+```
+
+The `ath<n>` names are the stock firmware's, and they do not map onto OpenWrt netdevs. So
+`l2guard.lua` keeps only the two ideas (BPDU drop, tag drop) and applies them to the live
+AP VAPs. A rule of any other shape is logged verbatim and not applied.
+`ebtables.add_vlan.status` is not read.
+
 ### `system.timezone` / `ntpclient.*` / `cron.*` — system settings
 
 Carried by every full push, and not read by openUF until 2026-09-25. The yesrab/openUF

@@ -1678,6 +1678,32 @@ local function wireless_status()
 	return status
 end
 
+-- The live netdev of every AP-mode VAP on the device, from netifd's status
+-- (radio order, then interface order). A station or mesh interface -- a
+-- wireless backhaul -- is not a VAP and is left out: l2guard's tag drop on an
+-- uplink would cut the AP off. Empty when wireless is not up or ubus cannot
+-- be asked; callers treat that as "nothing to protect yet".
+function M.ap_ifnames()
+	local status = wireless_status()
+	local out = {}
+	if type(status) ~= "table" then return out end
+	local radios = {}
+	for r in pairs(status) do radios[#radios + 1] = r end
+	table.sort(radios)
+	for _, r in ipairs(radios) do
+		local entry = status[r]
+		local ifaces = type(entry) == "table" and entry.interfaces or nil
+		for _, i in ipairs(type(ifaces) == "table" and ifaces or {}) do
+			local mode = type(i) == "table" and type(i.config) == "table" and i.config.mode or nil
+			if type(i) == "table" and type(i.ifname) == "string" and i.ifname ~= ""
+					and (mode == nil or mode == "ap") then
+				out[#out + 1] = i.ifname
+			end
+		end
+	end
+	return out
+end
+
 function M.get_ifname_for_radio(radio)
 	if not radio then return nil end
 	local status = wireless_status()

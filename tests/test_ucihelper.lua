@@ -3167,4 +3167,25 @@ return {
 			end)
 		end
 	},
+	{
+		name = "ucihelper: ap_ifnames lists AP-mode VAP netdevs in radio order and skips sta/mesh backhauls",
+		fn = function()
+			local orig = ucihelper._popen
+			ucihelper._popen = function()
+				return '{"radio1":{"up":true,"interfaces":[{"section":"a","ifname":"phy1-ap0","config":{"mode":"ap","ssid":"x"}},'
+					.. '{"section":"b","ifname":"phy1-sta0","config":{"mode":"sta","ssid":"up"}}]},'
+					.. '"radio0":{"up":true,"interfaces":[{"section":"c","ifname":"phy0-ap0","config":{"ssid":"x"}},'
+					.. '{"section":"d","ifname":"phy0-mesh0","config":{"mode":"mesh","mesh_id":"m"}},'
+					.. '{"section":"e","config":{"mode":"ap","ssid":"pending"}}]}}'
+			end
+			ucihelper.end_pass()
+			local ok, names = pcall(ucihelper.ap_ifnames)
+			ucihelper._popen = orig
+			assert_true(ok, tostring(names))
+			assert_eq(table.concat(names, ","), "phy0-ap0,phy1-ap0", "AP VAPs only, radio0 first; an interface without an ifname yet is skipped")
+			ucihelper._popen = function() return "" end
+			assert_eq(#ucihelper.ap_ifnames(), 0, "no ubus answer -> empty")
+			ucihelper._popen = orig
+		end
+	},
 }
