@@ -2854,10 +2854,13 @@ return {
 		fn = function()
 			local calls = {}
 			local orig = inform._run_cmd
+			local orig_shadow = inform.SHADOW_FILE
+			inform.SHADOW_FILE = "/nonexistent/openuf-test-shadow"
 			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
 			inform._sync_bootstrap_account(true, "ubnt")
 			inform._run_cmd = orig
-			assert_eq(#calls, 1, "one command issued")
+			inform.SHADOW_FILE = orig_shadow
+			assert_eq(#calls, 1, "one command issued when the shadow file cannot be read")
 			assert_contains(calls[1], "passwd -l", "lock command issued")
 			assert_contains(calls[1], "ubnt", "targets ubnt")
 		end
@@ -2867,11 +2870,45 @@ return {
 		fn = function()
 			local calls = {}
 			local orig = inform._run_cmd
+			local orig_shadow = inform.SHADOW_FILE
+			inform.SHADOW_FILE = "/nonexistent/openuf-test-shadow"
 			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
 			inform._sync_bootstrap_account(false, "ubnt")
 			inform._run_cmd = orig
+			inform.SHADOW_FILE = orig_shadow
 			assert_eq(#calls, 1, "one command issued")
 			assert_contains(calls[1], "passwd -u", "unlock command issued")
+		end
+	},
+	{
+		name = "inform: _sync_bootstrap_account skips passwd when the account is already in the wanted state",
+		fn = function()
+			-- BusyBox passwd logs "already locked" to auth.err on a repeat
+			-- lock, and this runs on every config push.
+			local shadow = "root:$1$abc:19000:0:99999:7:::\n"
+				.. "ubnt:!$1$xyz:19000:0:99999:7:::\n"
+				.. "guest:$1$def:19000:0:99999:7:::\n"
+			local calls = {}
+			local orig_run, orig_read = inform._run_cmd, inform._read_file
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+			inform._read_file = function(path)
+				if path == inform.SHADOW_FILE then return shadow end
+				return orig_read(path)
+			end
+			inform._sync_bootstrap_account(true, "ubnt")    -- locked, wants locked
+			local after_locked = #calls
+			inform._sync_bootstrap_account(false, "guest")  -- unlocked, wants unlocked
+			local after_unlocked = #calls
+			inform._sync_bootstrap_account(false, "ubnt")   -- locked, wants unlocked
+			inform._sync_bootstrap_account(true, "guest")   -- unlocked, wants locked
+			inform._sync_bootstrap_account(true, "nobody")  -- not in the file: act anyway
+			inform._run_cmd, inform._read_file = orig_run, orig_read
+			assert_eq(after_locked, 0, "no passwd -l on an already-locked account")
+			assert_eq(after_unlocked, 0, "no passwd -u on an already-unlocked account")
+			assert_eq(#calls, 3, "the three real transitions still run")
+			assert_contains(calls[1], "passwd -u 'ubnt'", "unlocks the locked account")
+			assert_contains(calls[2], "passwd -l 'guest'", "locks the unlocked account")
+			assert_contains(calls[3], "passwd -l 'nobody'", "an unknown user is acted on")
 		end
 	},
 	{

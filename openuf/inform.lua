@@ -220,17 +220,36 @@ function M._state_mtime(path)
 	return M._read_file(path)
 end
 
+-- Whether `user`'s password is locked, read off /etc/shadow (`passwd -l`
+-- prefixes the hash with "!"). nil when the file or the user cannot be read,
+-- which the caller treats as "unknown, act anyway".
+M.SHADOW_FILE = "/etc/shadow"
+function M._account_locked(user)
+	local shadow = M._read_file(M.SHADOW_FILE)
+	if not shadow then return nil end
+	for line in shadow:gmatch("[^\n]+") do
+		local name, hash = line:match("^([^:]+):([^:]*):")
+		if name == user then return hash:sub(1, 1) == "!" end
+	end
+	return nil
+end
+
 -- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
 -- bootstrap_adopt_user and USAGE.md's SSH prerequisite section) to match
 -- the device's current adopted state. No-op if user is nil/false (feature
--- not enabled). Idempotent -- locking an already-locked account (or
--- unlocking an already-unlocked one) is a harmless no-op on BusyBox/shadow
--- passwd, so callers never need to track prior state themselves.
+-- not enabled). Reads the current state first: BusyBox passwd is harmless on
+-- an already-locked account but not silent -- it logs "password for <user>
+-- is already locked" to auth.err, and this runs on every config push, so an
+-- adopted AP's log filled with it. When the state cannot be read the command
+-- is issued regardless.
 function M._sync_bootstrap_account(adopted, user)
 	if not user then return end
+	local locked = M._account_locked(user)
 	if adopted then
+		if locked == true then return end
 		M._run_cmd("passwd -l '" .. user .. "'")
 	else
+		if locked == false then return end
 		M._run_cmd("passwd -u '" .. user .. "'")
 	end
 end
