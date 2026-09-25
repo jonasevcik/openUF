@@ -3714,13 +3714,15 @@ M.SCAN_REQUEST_FILE    = "/tmp/openuf-scan-request"
 M.SCAN_REQUEST_MAX_AGE = 600
 
 -- One blocking off-channel sweep on an AP netdev: `iw dev <if> scan
--- ap-force`. `ap-force` is not optional: the netdev is a beaconing AP, and
--- mac80211 refuses a scan there with EOPNOTSUPP unless the request carries
--- NL80211_SCAN_FLAG_AP -- a plain `scan` returns at once having swept
--- nothing, and since _popen drops stderr that looked exactly like success.
--- The scan output itself is discarded (callers read the kernel's caches:
--- `scan dump`, `survey dump`); only iw's exit status is kept. Returns true
--- when the sweep ran; logs and returns false when iw refused it.
+-- ap-force`. On both our boards (OpenWrt 25.12, mac80211 6.18 backports:
+-- ath9k/ath10k on the Archer C5, mt76 on the AX3000T) a plain `scan` sweeps
+-- exactly the same channels as `ap-force` -- compared on the live APs,
+-- 2026-09-25. `ap-force` (NL80211_SCAN_FLAG_AP) is kept as a free guard for
+-- a driver/kernel that does refuse a scan on a beaconing AP. What matters
+-- more is the exit status: _popen drops stderr, so a refused scan used to be
+-- indistinguishable from a successful one. The scan output itself is
+-- discarded (callers read the kernel's caches: `scan dump`, `survey dump`).
+-- Returns true when the sweep ran; logs and returns false when iw refused.
 function M._force_scan(ufuci, ifname, who)
 	local out = ufuci._popen("iw dev " .. ifname
 		.. " scan ap-force >/dev/null 2>&1 && echo scan-ok")

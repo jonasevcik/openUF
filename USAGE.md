@@ -988,9 +988,10 @@ root. The pushed `cron.<n>.user` is ignored, since that account does not exist h
 `syswrapper.sh 11k-scan` does not scan by itself. It leaves a dated request in
 `/tmp/openuf-scan-request`, and the inform daemon consumes it on its next heartbeat. It
 runs `iw dev <if> scan ap-force` on every reported radio right before building the
-payload, so that inform's `scan_table` carries the fresh results. `ap-force` is
-required because mac80211 refuses a plain scan on a beaconing AP interface. A radio
-where iw still refuses logs `iw refused to scan <if>`, and the count leaves it out. A request older than ten minutes
+payload, so that inform's `scan_table` carries the fresh results. (`ap-force` sweeps
+the same channels as a plain scan on both tested boards, and it guards against a
+driver that refuses to scan on a beaconing AP.) A radio where iw refuses logs
+`iw refused to scan <if>`, and the count leaves it out. A request older than ten minutes
 (say, one left behind by a stopped daemon) is discarded rather than fired at boot.
 You can run it by hand to trigger a scan:
 
