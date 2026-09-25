@@ -234,6 +234,25 @@ function M._account_locked(user)
 	return nil
 end
 
+-- The controller's heartbeat interval. Every `noop` carries `interval`, the
+-- cadence the controller wants (PROTOCOL-VALIDATION.md, "Response _types");
+-- real firmware adopts it, and openUF used to run a fixed 10 s and throw the
+-- field away. Clamped, because pre-adoption responses arrive in plain HTTP
+-- under the well-known key: a forged noop must not be able to make the device
+-- hammer the controller or go quiet for an hour. nil (no field, or not a
+-- number) means "back to the device's own cadence".
+M.INTERVAL_MIN = 5
+M.INTERVAL_MAX = 300
+M._controller_interval = nil
+
+function M._sane_interval(v)
+	v = tonumber(v)
+	if not v or v ~= v then return nil end
+	if v < M.INTERVAL_MIN then return M.INTERVAL_MIN end
+	if v > M.INTERVAL_MAX then return M.INTERVAL_MAX end
+	return math.floor(v)
+end
+
 -- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
 -- bootstrap_adopt_user and USAGE.md's SSH prerequisite section) to match
 -- the device's current adopted state. No-op if user is nil/false (feature
@@ -2634,6 +2653,7 @@ function M.handle_response(json_str, st, cfg)
 	local _type = resp._type
 
 	if _type == "noop" then
+		M._controller_interval = M._sane_interval(resp.interval)
 		return false
 	end
 
@@ -3576,7 +3596,10 @@ end
 -- beyond a traceback. A bad cycle now costs one heartbeat and one log line,
 -- and the next cycle gets another go.
 function M._tick(st, cfg, ufhw, ctx)
-	ctx.interval = ctx.interval or 10
+	-- base_interval is the device's own cadence; interval is what the loop
+	-- actually waits, which the controller's noop may have moved.
+	ctx.base_interval = ctx.base_interval or ctx.interval or 10
+	ctx.interval = ctx.interval or ctx.base_interval
 	ctx.backoff  = ctx.backoff  or ctx.interval
 
 	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
@@ -3605,7 +3628,11 @@ function M._tick(st, cfg, ufhw, ctx)
 	if not body then
 		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
 		M._warn_http_400(err, st, cfg)
-		ctx.backoff = math.min(ctx.backoff * 2, 60)
+		-- Doubles from the CURRENT cadence, capped at 60 s -- or at the
+		-- controller's own interval when that is longer, since a failure
+		-- must never make the device poll faster than it was asked to.
+		ctx.backoff = math.min(math.max(ctx.backoff, ctx.interval) * 2,
+			math.max(60, ctx.interval))
 		return ctx.backoff
 	end
 	ctx.backoff = ctx.interval
@@ -3622,6 +3649,12 @@ function M._tick(st, cfg, ufhw, ctx)
 		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
 		return ctx.interval
 	end
+	-- The controller's requested cadence, or the device's own when the last
+	-- noop named none. The backoff was reset to the old cadence above, before
+	-- this response could move it; follow it here too, or the first failure
+	-- after a drop would double from the stale, longer value.
+	ctx.interval = M._controller_interval or ctx.base_interval
+	ctx.backoff  = ctx.interval
 	if applied then
 		-- A config push runs `wifi reload`, which takes every hostapd object
 		-- the RRM collector subscribed to away with it and kills the

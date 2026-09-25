@@ -3068,6 +3068,83 @@ return {
 		end
 	},
 	{
+		name = "inform: _sane_interval clamps the controller's interval",
+		fn = function()
+			assert_eq(inform._sane_interval(10), 10, "a normal value passes through")
+			assert_eq(inform._sane_interval("30"), 30, "a numeric string is accepted")
+			assert_eq(inform._sane_interval(12.7), 12, "fractions are floored")
+			assert_eq(inform._sane_interval(0), inform.INTERVAL_MIN, "too fast is clamped up")
+			assert_eq(inform._sane_interval(-4), inform.INTERVAL_MIN, "negative too")
+			assert_eq(inform._sane_interval(86400), inform.INTERVAL_MAX, "too slow is clamped down")
+			assert_eq(inform._sane_interval(math.huge), inform.INTERVAL_MAX, "infinity too")
+			assert_eq(inform._sane_interval(nil), nil, "absent means default")
+			assert_eq(inform._sane_interval("soon"), nil, "garbage means default")
+			assert_eq(inform._sane_interval(0/0), nil, "NaN means default")
+		end
+	},
+	{
+		name = "inform: handle_response records a noop's interval, and a noop without one resets it",
+		fn = function()
+			inform._controller_interval = nil
+			inform.handle_response('{"_type":"noop","interval":30}', sample_state(), {config = {}})
+			assert_eq(inform._controller_interval, 30, "interval adopted")
+			inform.handle_response('{"_type":"noop","interval":1}', sample_state(), {config = {}})
+			assert_eq(inform._controller_interval, inform.INTERVAL_MIN, "and clamped")
+			inform.handle_response('{"_type":"noop"}', sample_state(), {config = {}})
+			assert_eq(inform._controller_interval, nil, "a noop without one goes back to the default")
+		end
+	},
+	{
+		name = "inform: _tick waits the controller's interval, and backoff never polls faster",
+		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			io.stderr = {write = function() end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.http_post = function() return "body" end
+
+			local ctx = {interval = 10, backoff = 10}
+			local st = {inform_url = "http://unifi:8080/inform"}
+
+			inform.handle_response = function() inform._controller_interval = 90; return false end
+			local wait_slow = inform._tick(st, nil, nil, ctx)
+
+			inform.http_post = function() return nil, "connection refused" end
+			local fail1 = inform._tick(st, nil, nil, ctx)
+			local fail2 = inform._tick(st, nil, nil, ctx)
+
+			inform.http_post = function() return "body" end
+			inform.handle_response = function() inform._controller_interval = nil; return false end
+			local wait_default = inform._tick(st, nil, nil, ctx)
+
+			inform.http_post = function() return nil, "connection refused" end
+			local fail3 = inform._tick(st, nil, nil, ctx)
+
+			io.stderr = orig.stderr
+			inform._controller_interval = nil
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm
+
+			assert_eq(wait_slow, 90, "the controller's interval is what the loop waits")
+			assert_eq(fail1, 90, "a failure at a 90 s cadence is capped at 90, not 60")
+			assert_eq(fail2, 90, "and stays there")
+			assert_eq(wait_default, 10, "a noop without an interval goes back to the device's own")
+			assert_eq(fail3, 20, "and backoff doubles from that again")
+		end
+	},
+	{
 		name = "inform: a missing UCI binding is announced, not silently survived",
 		fn = function()
 			-- libuci-lua is what require("uci") comes from; `lua` does not

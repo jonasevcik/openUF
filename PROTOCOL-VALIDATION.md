@@ -580,7 +580,7 @@ The complete set, per `InformServlet`: `noop`, `setparam`, `cmd`, `upgrade`, `re
 
 | `_type` | Shape | Notes |
 |---|---|---|
-| `noop` | `{"_type":"noop","interval":…}` | Steady state. |
+| `noop` | `{"_type":"noop","interval":…}` | Steady state. `interval` is the heartbeat cadence in seconds the controller wants; openUF waits that long before the next inform, clamped to 5–300 s (pre-adoption noops are unauthenticated), and goes back to its own 10 s when a noop carries none. |
 | `setparam` | `{"_type":"setparam","mgmt_cfg":"…","system_cfg":"…","server_time_in_utc":"…"}` | Both configs are flat `key=value` blobs. See [system_cfg](#system_cfg-the-real-config-channel). |
 | `cmd` | `{"_type":"cmd","cmd":"…","mac":"…","device_id":"…",…}` | See command table below. |
 | `upgrade` | `{"_type":"upgrade","version":"6.8.2.15592","md5sum":"…","url":"http://fw-download.ubnt.com/…"}` | Fire-and-forget, sent exactly once; no retry, no confirmation expected. |
