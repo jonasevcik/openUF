@@ -1817,8 +1817,11 @@ openUF had nothing equivalent, so on a two-AP site **all six** sibling BSSes wer
 true` and AirView flagged one as *"a third-party access point broadcasting your network's
 SSID"* (only the row whose OUI resolved to a vendor name showed the warning). openUF now beacons
 its own vendor IE on every VAP — `dd 0d 02:6f:55 6f:55:46 01 <identity MAC>` via hostapd's
-`vendor_elements` — reads it back from `iw scan dump -u` (iw prints unparsed vendor elements
-only under `-u`), and tags matching entries `is_unifi` + `serialno`. The OUI is deliberately not
+`vendor_elements` — reads it back from the kernel's scan cache over nl80211 (ucode's
+`nl80211` module, which OpenWrt's wifi scripts are built on), and tags matching entries
+`is_unifi` + `serialno`. Not from `iw`: OpenWrt's default iw build strips the printer for
+unknown vendor elements, so the element never appears in `iw scan dump` output, `-u` or not —
+verified live on both boards, where the same cache read over nl80211 held it. The OUI is deliberately not
 Ubiquiti's `00:27:22`: a real UniFi AP would parse our layout as its own. 802.11k-reported
 entries are left untagged — a beacon report carries no SSID, so they can never be flagged.
 

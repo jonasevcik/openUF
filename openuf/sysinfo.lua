@@ -392,18 +392,45 @@ function M.peer_ie_hex(mac)
 		.. M.PEER_IE_VER .. hex
 end
 
--- The identity MAC out of one line of `iw scan dump -u`, or nil. iw prints a
--- vendor element it has no parser for only under -u, as
---   "\tVendor specific: OUI 02:6f:55, data: 6f 55 46 01 xx xx xx xx xx xx"
-function M.peer_mac_from_line(line)
-	local data = line:match("^\tVendor specific: OUI "
-		.. M.PEER_IE_OUI .. ", data:%s*([%x ]+)$")
-	if not data then return nil end
-	local hex = data:gsub("%s", ""):lower()
-	local head = M.PEER_IE_MAGIC .. M.PEER_IE_VER
-	if #hex ~= #head + 12 or hex:sub(1, #head) ~= head then return nil end
-	local m = hex:sub(#head + 1)
-	return (m:gsub("(%x%x)", "%1:"):sub(1, 17))
+-- Reading it back cannot go through `iw`: OpenWrt's default iw build strips
+-- the printer for vendor elements it does not know, so ours never appears in
+-- `iw scan dump` output, with or without -u. Checked live 2026-09-26 on both
+-- boards (iw 6.17): not one "Vendor specific" line across a dozen neighbours,
+-- while the same kernel scan cache, read over nl80211, held our element.
+-- ucode's nl80211 module is what OpenWrt's own wifi scripts are built on, so
+-- it is present wherever those are. The script prints "<bssid> <mac>" per
+-- sibling BSS and nothing else; any failure (no ucode, no module) is simply
+-- no siblings.
+local function ucode_bytes(hex)
+	return (hex:gsub("(%x%x)", "\\x%1"))
+end
+
+function M.peer_scan_cmd(ifname)
+	if type(ifname) ~= "string" or not ifname:match("^[%w%.%-_]+$") then return nil end
+	local head = ucode_bytes(M.PEER_IE_OUI:gsub(":", "") .. M.PEER_IE_MAGIC .. M.PEER_IE_VER)
+	local script = 'let nl=require("nl80211");'
+		.. 'let r=nl.request(nl.const.NL80211_CMD_GET_SCAN,nl.const.NLM_F_DUMP,{dev:"' .. ifname .. '"});'
+		.. 'for(let x in (r||[])){let b=x.bss;if(!b)continue;'
+		.. 'for(let l in [b.information_elements||[],b.beacon_ies||[]]){let hit=null;'
+		.. 'for(let e in l){let d=e.data;'
+		.. 'if(e.type==221&&length(d)==13&&substr(d,0,7)=="' .. head .. '"){'
+		.. 'let m=[];for(let i=7;i<13;i++)push(m,sprintf("%02x",ord(d,i)));'
+		.. 'hit=join(":",m);break;}}'
+		.. 'if(hit){print(b.bssid," ",hit,"\\n");break;}}}'
+	return "ucode -e '" .. script .. "' 2>/dev/null"
+end
+
+-- {bssid = identity MAC} for every BSS in ifname's scan cache that carries
+-- the sibling-AP element.
+function M.peer_macs(ifname)
+	local cmd = M.peer_scan_cmd(ifname)
+	if not cmd then return {} end
+	local peers = {}
+	for bssid, mac in (M._run_cmd(cmd) or ""):gmatch(
+			"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)") do
+		peers[bssid:lower()] = mac:lower()
+	end
+	return peers
 end
 
 -- Returns a table of neighboring wireless networks visible to ifname, by
@@ -431,11 +458,7 @@ end
 -- must be a small, genuinely-fresh number, not whatever we last computed.
 function M.scan_table(ifname)
 	if not ifname then return {} end
-	-- -u: iw prints a vendor element it has no parser for only when asked
-	-- to, and the sibling-AP element (peer_mac_from_line) is one of those.
-	-- The extra lines it brings ("Unknown IE (n): ...") match none of the
-	-- patterns below.
-	local output = M._run_cmd("iw dev " .. ifname .. " scan dump -u")
+	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
 	-- For the [boottime] form of "last seen" below: /proc/uptime and the
 	-- driver's stamp are both on the CLOCK_BOOTTIME axis.
 	local now_up = M.uptime()
@@ -542,11 +565,13 @@ function M.scan_table(ifname)
 			if line:find("capability:.*Privacy") then seen_privacy = true end
 			if line:find("^\tRSN:") then seen_rsn = true end
 			if line:find("^\tWPA:") then seen_wpa = true end
-			local peer = M.peer_mac_from_line(line)
-			if peer then cur.peer_mac = peer end
 		end
 	end
 	flush()
+	if #nets > 0 then
+		local peers = M.peer_macs(ifname)
+		for _, n in ipairs(nets) do n.peer_mac = peers[n.bssid:lower()] end
+	end
 	return nets
 end
 

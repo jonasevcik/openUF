@@ -804,40 +804,41 @@ return {
 		end
 	},
 	{
-		name = "sysinfo: scan_table() reads a sibling openUF AP's identity MAC from its vendor IE",
+		name = "sysinfo: scan_table() tags a sibling openUF AP from the nl80211 reader",
 		fn = function()
-			-- `iw scan dump -u` shape, taken from the AX3000T (iw 6.17):
-			-- unknown-IE and MS/WiFi lines only appear under -u, and so does
-			-- a vendor element iw has no parser for -- ours.
-			local seen_cmd
-			with_fixtures({}, {["scan dump"] = fixture("iw_scan_dump_peer_ie.txt")}, function()
-				local orig = sysinfo._run_cmd
-				sysinfo._run_cmd = function(cmd) seen_cmd = cmd; return orig(cmd) end
+			-- OpenWrt's iw build never prints our vendor element (checked live
+			-- on both boards), so the tag comes from peer_macs' ucode/nl80211
+			-- read, joined on the BSSID.
+			with_fixtures({}, {
+				["scan dump"] = fixture("iw_scan_dump.txt"),
+				["ucode -e"]  = "AA:BB:CC:DD:EE:01 00:00:5E:00:53:20\n",
+			}, function()
 				local nets = sysinfo.scan_table("wlan0")
-				assert_eq(#nets, 3, "three BSSes")
-				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20",
-					"our OUI + magic + version: the sibling's identity MAC")
-				assert_eq(nets[1].essid, "SiteNet", "-u's extra lines leave the SSID alone")
-				assert_eq(nets[1].security, "wpa2", "...and the security")
-				assert_eq(nets[1].signal, -54, "...and the signal")
-				assert_eq(nets[2].peer_mac, nil,
-					"Ubiquiti's OUI with our layout, or our OUI with the wrong magic, is not a sibling")
-				assert_eq(nets[3].peer_mac, nil, "a truncated MAC is not a sibling")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20", "the sibling's identity MAC, case-folded")
+				assert_eq(nets[2].peer_mac, nil, "a BSS the reader did not name is not a sibling")
+				assert_eq(nets[1].essid, "NeighborNet", "the iw-parsed fields are untouched")
 			end)
-			assert_true(seen_cmd and seen_cmd:find("scan dump -u", 1, true) ~= nil,
-				"iw prints unparsed vendor elements only under -u")
+			with_fixtures({}, {["scan dump"] = fixture("iw_scan_dump.txt")}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 2, "no ucode on the box: the scan still reports")
+				assert_eq(nets[1].peer_mac, nil, "...with no siblings")
+			end)
 		end
 	},
 	{
-		name = "sysinfo: peer_ie_hex() round-trips through peer_mac_from_line()",
+		name = "sysinfo: peer_scan_cmd() matches exactly the element peer_ie_hex() builds",
 		fn = function()
 			local hex = sysinfo.peer_ie_hex("00:00:5E:00:53:20")
 			assert_eq(hex, "dd0d026f556f55460100005e005320", "hostapd vendor_elements value")
-			-- Rebuild the line iw prints for that element: OUI, then the
-			-- body bytes space-separated.
-			local body = hex:sub(11):gsub("(%x%x)", " %1")
-			local line = "\tVendor specific: OUI 02:6f:55, data:" .. body
-			assert_eq(sysinfo.peer_mac_from_line(line), "00:00:5e:00:53:20", "round trip")
+			-- The reader compares the element body's first 7 bytes (OUI,
+			-- magic, version) and takes the 6 after them. Pin that prefix to
+			-- the builder's, byte for byte, so the two cannot drift.
+			local cmd = sysinfo.peer_scan_cmd("phy0-ap0")
+			local want = hex:sub(5, 18):gsub("(%x%x)", "\\x%1")
+			assert_true(cmd:find('"' .. want .. '"', 1, true) ~= nil, "prefix matches the builder")
+			assert_true(cmd:find("length(d)==13", 1, true) ~= nil, "body length is 0x0d")
+			assert_true(cmd:find('dev:"phy0-ap0"', 1, true) ~= nil, "asks about the right interface")
+			assert_eq(sysinfo.peer_scan_cmd("x'; reboot; '"), nil, "an interface name cannot break out of the quoting")
 			assert_eq(sysinfo.peer_ie_hex(nil), nil, "no identity, no IE")
 			assert_eq(sysinfo.peer_ie_hex("not-a-mac"), nil, "garbage, no IE")
 		end

@@ -22,8 +22,8 @@ end
 -- with_wired: when true, mac_table()'s bridge fdb/arp/dhcp-lease sources
 -- return real fixture data (2 wired hosts) instead of empty.
 -- with_scan: when true, scan_table()'s `iw scan dump` source returns real
--- fixture data (2 neighboring networks) instead of empty; a string names the
--- fixture to use instead.
+-- fixture data (2 neighboring networks) instead of empty; "peer" also has the
+-- first one identified as a sibling openUF AP.
 -- with_radio_caps: when true, radio_caps()'s `iw dev ... info` / `iw phy ...
 -- info` sources return a real 5GHz (VHT+HE+DFS+160MHz) fixture instead of
 -- empty.
@@ -60,7 +60,10 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 			return fixture("bridge_fdb_dump.txt")
 		end
 		if with_scan and cmd:find("scan dump") then
-			return fixture(type(with_scan) == "string" and with_scan or "iw_scan_dump.txt")
+			return fixture("iw_scan_dump.txt")
+		end
+		if with_scan == "peer" and cmd:find("ucode -e", 1, true) then
+			return "aa:bb:cc:dd:ee:01 00:00:5e:00:53:20\n"
 		end
 		if with_radio_caps and cmd:find("dev wlan0 info") then
 			return fixture("iw_dev_info.txt")
@@ -1331,7 +1334,7 @@ return {
 			-- a scanned BSSID against the site's vap_tables: an entry without
 			-- is_unifi whose SSID is one of the site's is a rogue, full stop.
 			-- is_unifi + serialno resolves to the adopted device instead.
-			local d = build({with_uci = true, with_scan = "iw_scan_dump_peer_ie.txt"})
+			local d = build({with_uci = true, with_scan = "peer"})
 			local st = d.scan_radio_table[1].scan_table
 			assert_eq(st[1].is_unifi, true, "the sibling is a UniFi AP")
 			assert_eq(st[1].serialno, "00:00:5e:00:53:20", "resolved by its identity MAC, not its BSSID")
