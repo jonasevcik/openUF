@@ -1802,6 +1802,26 @@ broadcasts the **same essid as one of the site's own configured networks** (an e
 raising `EVT_AP_DetectRogueAP`). Ordinary neighbours correctly have `is_rogue: false` and still
 appear in the Environment list.
 
+**The controller never checks a scanned BSSID against its own devices' `vap_table`s**
+(10.6.101, `com.ubnt.service.aS.rhAW`, the scan-ingest loop; the only vap_table lookup in that
+class feeds the wireless-uplink candidate list). Whether a BSS is "ours" is the **reporting AP's**
+call, made per entry:
+
+| Entry fields | Controller outcome |
+|---|---|
+| `is_unifi: true`, `serialno: <device MAC>` (or, without `serialno`, a BSSID in a Ubiquiti OUI it can map back) | Device looked up in the site. If adopted: recorded as a UniFi neighbour, **not** stored as a rogue — the row leaves the Environment list. Otherwise: rogue check below, but skipped when the MAC is a known device |
+| no `is_unifi` | `is_rogue = essid ∈ site SSIDs` |
+
+Real UniFi APs learn `is_unifi`/`serialno` from a Ubiquiti vendor IE in each other's beacons.
+openUF had nothing equivalent, so on a two-AP site **all six** sibling BSSes were `is_rogue:
+true` and AirView flagged one as *"a third-party access point broadcasting your network's
+SSID"* (only the row whose OUI resolved to a vendor name showed the warning). openUF now beacons
+its own vendor IE on every VAP — `dd 0d 02:6f:55 6f:55:46 01 <identity MAC>` via hostapd's
+`vendor_elements` — reads it back from `iw scan dump -u` (iw prints unparsed vendor elements
+only under `-u`), and tags matching entries `is_unifi` + `serialno`. The OUI is deliberately not
+Ubiquiti's `00:27:22`: a real UniFi AP would parse our layout as its own. 802.11k-reported
+entries are left untagged — a beacon report carries no SSID, so they can never be flagged.
+
 ### `lldp_table[]` entry
 
 Field names from the real DTO (`OXMua`): `chassis_descr`, `chassis_id`, `local_port_name`,

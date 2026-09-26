@@ -828,6 +828,15 @@ because `iw` 6.17 — what both boards run — prints no summary line for either
   `n ms ago`. Those used to fall back to 0 — "seen this instant" — which keeps a long-gone
   AP in the view, since the controller drops anything with age ≥ 30 as stale.
 
+**Sibling openUF APs are not rogues.** The controller takes the reporting AP's word for
+which scanned BSSes belong to the site — it never checks its own devices' BSSIDs — so without
+help every other openUF AP broadcasting your SSID showed up as *"a third-party access point
+broadcasting your network's SSID"*. Each openUF VAP therefore beacons a small vendor element
+carrying its device MAC (hostapd `vendor_elements`, which OpenWrt 25.12's wifi scripts pass through), and a scan that
+hears it reports that BSS as a UniFi AP of the site; it then leaves the Environment list, as
+a real UniFi AP's would. Only openUF APs recognise each other this way — a mixed site's
+genuine UniFi APs are still reported as third-party by openUF and vice versa.
+
 openUF closes that gap the way Ubiquiti's Channel AI describes — *"neighbor reports and
 automated RRM scans"* — rather than by scanning. Every `rrm_request_interval` seconds
 (default 600) it asks **one** 802.11k-capable client for an active beacon measurement: the

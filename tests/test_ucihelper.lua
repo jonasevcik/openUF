@@ -1495,6 +1495,26 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config beacons the sibling-AP IE on every VAP, removes it without one",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil, {peer_ie = "dd0d026f556f55460100005e005320"})
+				assert_eq(db.wireless.openuf_radio0_corp.vendor_elements,
+					"dd0d026f556f55460100005e005320", "IE written verbatim")
+				ucihelper.apply_config(resp, nil, {})
+				assert_eq(db.wireless.openuf_radio0_corp.vendor_elements, nil,
+					"unknown identity: no stale IE left announcing an old one")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes proxy_arp from vap.proxy_arp",
 		fn = function()
 			with_ucihelper(function(db)

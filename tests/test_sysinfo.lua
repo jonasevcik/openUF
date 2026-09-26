@@ -804,6 +804,45 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: scan_table() reads a sibling openUF AP's identity MAC from its vendor IE",
+		fn = function()
+			-- `iw scan dump -u` shape, taken from the AX3000T (iw 6.17):
+			-- unknown-IE and MS/WiFi lines only appear under -u, and so does
+			-- a vendor element iw has no parser for -- ours.
+			local seen_cmd
+			with_fixtures({}, {["scan dump"] = fixture("iw_scan_dump_peer_ie.txt")}, function()
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd) seen_cmd = cmd; return orig(cmd) end
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 3, "three BSSes")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20",
+					"our OUI + magic + version: the sibling's identity MAC")
+				assert_eq(nets[1].essid, "SiteNet", "-u's extra lines leave the SSID alone")
+				assert_eq(nets[1].security, "wpa2", "...and the security")
+				assert_eq(nets[1].signal, -54, "...and the signal")
+				assert_eq(nets[2].peer_mac, nil,
+					"Ubiquiti's OUI with our layout, or our OUI with the wrong magic, is not a sibling")
+				assert_eq(nets[3].peer_mac, nil, "a truncated MAC is not a sibling")
+			end)
+			assert_true(seen_cmd and seen_cmd:find("scan dump -u", 1, true) ~= nil,
+				"iw prints unparsed vendor elements only under -u")
+		end
+	},
+	{
+		name = "sysinfo: peer_ie_hex() round-trips through peer_mac_from_line()",
+		fn = function()
+			local hex = sysinfo.peer_ie_hex("00:00:5E:00:53:20")
+			assert_eq(hex, "dd0d026f556f55460100005e005320", "hostapd vendor_elements value")
+			-- Rebuild the line iw prints for that element: OUI, then the
+			-- body bytes space-separated.
+			local body = hex:sub(11):gsub("(%x%x)", " %1")
+			local line = "\tVendor specific: OUI 02:6f:55, data:" .. body
+			assert_eq(sysinfo.peer_mac_from_line(line), "00:00:5e:00:53:20", "round trip")
+			assert_eq(sysinfo.peer_ie_hex(nil), nil, "no identity, no IE")
+			assert_eq(sysinfo.peer_ie_hex("not-a-mac"), nil, "garbage, no IE")
+		end
+	},
+	{
 		name = "sysinfo: scan_table() derives width from the operation elements on iw 6.17",
 		fn = function()
 			-- The fixture is trimmed from real `iw dev ... scan` output taken

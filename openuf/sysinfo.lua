@@ -362,13 +362,58 @@ function M.sta_table(ifname)
 	return clients
 end
 
+-- Sibling-AP recognition. The controller decides whether a scanned BSS is
+-- one of its own from the REPORTING AP's word alone, never from the site's
+-- vap_tables (decompiled 10.6.101, com.ubnt.service.aS.rhAW): a scan entry
+-- tagged is_unifi=true is resolved to a device by its serialno and, if that
+-- device is adopted in the site, recorded as a UniFi neighbour; an untagged
+-- one is a rogue whenever its SSID is one of the site's. Real UniFi APs learn
+-- the tag from a Ubiquiti vendor IE in each other's beacons. openUF had no
+-- such IE, so every openUF AP showed up in AirView as a third-party AP
+-- impersonating the network -- seen live, all six sibling BSSes at home had
+-- is_rogue=true while the vap_tables the controller held were correct.
+--
+-- So every openUF VAP beacons this IE, carrying its device's identity MAC:
+--   dd 0d | 02 6f 55 (OUI) | 6f 55 46 ("oUF") | 01 (version) | 6-byte MAC
+-- The OUI is deliberately NOT Ubiquiti's 00:27:22 -- a real UniFi AP parsing
+-- our layout as theirs would read garbage -- and the magic makes a collision
+-- with any real user of 02:6f:55 harmless in both directions.
+M.PEER_IE_OUI   = "02:6f:55"
+M.PEER_IE_MAGIC = "6f5546"
+M.PEER_IE_VER   = "01"
+
+-- The hostapd vendor_elements value (the whole element as hex) announcing
+-- mac ("xx:xx:xx:xx:xx:xx"), or nil when mac is not a MAC.
+function M.peer_ie_hex(mac)
+	if type(mac) ~= "string" then return nil end
+	local hex = mac:lower():gsub(":", "")
+	if not hex:match("^%x+$") or #hex ~= 12 then return nil end
+	return "dd0d" .. M.PEER_IE_OUI:gsub(":", "") .. M.PEER_IE_MAGIC
+		.. M.PEER_IE_VER .. hex
+end
+
+-- The identity MAC out of one line of `iw scan dump -u`, or nil. iw prints a
+-- vendor element it has no parser for only under -u, as
+--   "\tVendor specific: OUI 02:6f:55, data: 6f 55 46 01 xx xx xx xx xx xx"
+function M.peer_mac_from_line(line)
+	local data = line:match("^\tVendor specific: OUI "
+		.. M.PEER_IE_OUI .. ", data:%s*([%x ]+)$")
+	if not data then return nil end
+	local hex = data:gsub("%s", ""):lower()
+	local head = M.PEER_IE_MAGIC .. M.PEER_IE_VER
+	if #hex ~= #head + 12 or hex:sub(1, #head) ~= head then return nil end
+	local m = hex:sub(#head + 1)
+	return (m:gsub("(%x%x)", "%1:"):sub(1, 17))
+end
+
 -- Returns a table of neighboring wireless networks visible to ifname, by
 -- parsing `iw dev <ifname> scan dump` -- the kernel's already-cached BSS
 -- list from cfg80211, not a fresh scan (that's what the spectrum-scan cmd
 -- handler's separate `iw dev <ifname> scan` call triggers; reading the
 -- cache here is cheap and non-disruptive enough to do on every inform,
 -- unlike a real scan).
--- Each entry: {bssid, essid, freq, channel, signal, security, age, bw}
+-- Each entry: {bssid, essid, freq, channel, signal, security, age, bw,
+-- peer_mac} -- peer_mac only for a sibling openUF AP (see peer_ie_hex).
 -- `bw` is channel width in MHz. The controller's Environment tab's "Ch. Width"
 -- column reads this field directly and renders nothing at all when it's
 -- missing (confirmed live 2026-07-14) -- default to 20 (legacy-safe, valid
@@ -386,7 +431,11 @@ end
 -- must be a small, genuinely-fresh number, not whatever we last computed.
 function M.scan_table(ifname)
 	if not ifname then return {} end
-	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
+	-- -u: iw prints a vendor element it has no parser for only when asked
+	-- to, and the sibling-AP element (peer_mac_from_line) is one of those.
+	-- The extra lines it brings ("Unknown IE (n): ...") match none of the
+	-- patterns below.
+	local output = M._run_cmd("iw dev " .. ifname .. " scan dump -u")
 	-- For the [boottime] form of "last seen" below: /proc/uptime and the
 	-- driver's stamp are both on the CLOCK_BOOTTIME axis.
 	local now_up = M.uptime()
@@ -493,6 +542,8 @@ function M.scan_table(ifname)
 			if line:find("capability:.*Privacy") then seen_privacy = true end
 			if line:find("^\tRSN:") then seen_rsn = true end
 			if line:find("^\tWPA:") then seen_wpa = true end
+			local peer = M.peer_mac_from_line(line)
+			if peer then cur.peer_mac = peer end
 		end
 	end
 	flush()

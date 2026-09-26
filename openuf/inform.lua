@@ -1004,6 +1004,16 @@ function M.build_json(st, cfg, ufhw)
 							security   = net.security,
 							essid      = net.essid,
 						}
+						-- A sibling openUF AP, identified by the IE it beacons
+						-- (sysinfo.peer_ie_hex). is_unifi + serialno is what
+						-- the controller resolves to an adopted device; without
+						-- them every BSS of ours carrying a site SSID was
+						-- listed as an impersonating third-party AP.
+						if net.peer_mac then
+							local e = scan_table[#scan_table]
+							e.is_unifi = true
+							e.serialno = net.peer_mac
+						end
 					end
 					-- 802.11k enrichment: BSSes a CLIENT went off-channel
 					-- and saw, which this radio never could from its own
@@ -2900,7 +2910,8 @@ function M.handle_response(json_str, st, cfg)
 					pcall(ufuci.apply_config,
 						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
 						cfg, {band_steering_active = steering_active,
-							device_name = device_name, keep_vlans = port_vlans})
+							device_name = device_name, keep_vlans = port_vlans,
+							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac)})
 				end
 			end
 

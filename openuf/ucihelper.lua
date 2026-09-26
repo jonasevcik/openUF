@@ -1057,7 +1057,9 @@ end
 --       leaves each vap's own setting in effect. opts.device_name is the
 --       controller-assigned device name, used as the WPS Device Name value
 --       when a vap has advertise_ap_name enabled ("Show Access Point Name in
---       Beacon"); defaults to "openUF" if nil.
+--       Beacon"); defaults to "openUF" if nil. opts.peer_ie is the
+--       vendor_elements hex every VAP beacons so sibling openUF APs can tell
+--       it is not a rogue (sysinfo.peer_ie_hex); nil removes it.
 -- Drive the two kernel-resident features from one normalized list of
 -- {ifname, bcfilt_enabled, bcfilt_macs, down_kbps, up_kbps} entries, so the
 -- setparam path and the startup reapply below cannot drift apart.
@@ -1316,6 +1318,12 @@ function M.apply_config(resp, cfg, opts)
 				-- hostapd_common_add_bss_config declaration list.
 				extra.isolate = vap.l2_isolation and "1" or "0"
 			end
+			-- Sibling-AP recognition: the vendor element that tells the other
+			-- openUF APs' scans this BSS is ours (see sysinfo.peer_ie_hex --
+			-- without it the controller lists it as a rogue impersonating the
+			-- network). Removed when the identity MAC is unknown rather than
+			-- left announcing a stale one.
+			extra.vendor_elements = (opts and opts.peer_ie) or M.DELETE
 			if vap.hide_ssid ~= nil then
 				-- "Hide WiFi Name": leave the SSID out of beacons (clients must
 				-- know the name to associate). OpenWrt's wifi-iface option is
