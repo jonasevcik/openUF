@@ -1528,6 +1528,11 @@ the real code had 0 `handle_response failed` and logged the `equal` warning once
 - Restoring the WLAN toggle and setting the device to Off left the default interval
   (WLAN toggle on) and `bandsteering.status=disabled`.
 
+**Third-party hardware, 2026-09-28** (yesrab fork, `40ed2ce`, their mt7986/mt76 board, a real
+UCG Ultra): with the device setting Off, the first push carried `bandsteering.status=disabled`,
+and openUF restarted usteer with the old threshold removed. Same result as on the C5, on a
+MediaTek board.
+
 **Still unobserved:** an actual 2.4 → 5 GHz steer caused by the device setting alone. No
 client that supports BSS Transition was on the C5 at the time. Its two 5 GHz clients have
 the BTM bit clear, and usteer only steers clients that have it.
@@ -1573,6 +1578,13 @@ per-phy files seeded by the AP entrypoint): the device reported `wifi_caps` `0x2
 `state.json` got `"atf_enabled":false`. After both files were reset to `3` and inform was
 restarted, the startup reapply wrote `0` again. Toggling back pushed `enabled`, and both
 went to `3`. `handle_response failed` = 0 throughout.
+
+**Off on third-party hardware, 2026-09-28** (the yesrab/openUF fork, reported in their
+PROTOCOL-VALIDATION.md at `40ed2ce`; their mt7986 board with mt76 radios, a real UCG Ultra,
+running this code). The first push after their deploy carried `atf.status=enabled`,
+`atf.mode=disabled`, because the controller had held the setting off from before the bit was
+claimed. Both phys' `airtime_flags` then read back empty, i.e. `0`. This is their evidence.
+Off has not been pushed to either of our APs.
 
 Hardware, 2026-09-27 (both APs on fd30306, real UCG Ultra): both devices reported
 `wifi_caps` 44 (0x2C), and the controller had **`atf_enabled: false`** stored for both. That
@@ -2209,6 +2221,9 @@ unknown vendor elements, so the element never appears in `iw scan dump` output, 
 verified live on both boards, where the same cache read over nl80211 held it. The OUI is deliberately not
 Ubiquiti's `00:27:22`: a real UniFi AP would parse our layout as its own. 802.11k-reported
 entries are left untagged — a beacon report carries no SSID, so they can never be flagged.
+The yesrab fork saw the same on their mt7986 board (2026-09-28, `40ed2ce`): after a forced
+re-push, `vendor_elements` was in both hostapd configs and on all three VAPs. They had no second
+AP on the build, so no `is_unifi` tag from it.
 
 ### `lldp_table[]` entry
 
