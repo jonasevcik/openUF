@@ -156,7 +156,11 @@ The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi ident
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk;
 #    on 24.10 and earlier the same names go through `opkg install`)
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny
+# A stock image ships wpad-basic-*, which a controller-pushed WLAN takes down.
+# Swap it for the full build of the same library in one transaction (on
+# opkg: opkg remove wpad-basic-mbedtls && opkg install wpad-mbedtls):
+apk add wpad-mbedtls '!wpad-basic-mbedtls'
 
 # 2. Download and install the latest release (no git client or scp needed)
 mkdir openuf-install && cd openuf-install
@@ -180,11 +184,13 @@ entirely and delivers the adoption key over the inform channel.
 
 Step 1 is optional: `install.sh install` installs every dependency that is
 missing, including `usteer` and a full `wpad` build — both required for BSS
-Transition (802.11v) and Band Steering to work at all. Any full build counts
-(`wpad`, `wpad-wolfssl`, `wpad-openssl`, `wpad-mbedtls`), and an existing one is
-left in place. `wpad-basic-*` builds lack 802.11v support entirely and will error
-with "unknown configuration item 'bss_transition'"; if you've manually installed
-a basic build, replace it with `apk add wpad-wolfssl` first.
+Transition (802.11v) and Band Steering to work at all. A full build is
+recognised by the hostapd binary itself, so any one counts and is left in place.
+A `wpad-basic-*` build (what stock images ship) is replaced by the full build of
+the same crypto library, in one transaction on apk, so a failed download leaves
+the basic one working. It has to be: the controller sends `bss_transition` with
+every WLAN, and a basic hostapd stops at "unknown configuration item
+'bss_transition'" with the radio down.
 
 `install.sh install` also registers `/etc/openuf/` and `/opt/openuf/conf.lua` with
 `sysupgrade`, so an adopted AP stays adopted across a firmware upgrade — stock

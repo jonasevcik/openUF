@@ -31,15 +31,118 @@ if command -v apk >/dev/null 2>&1; then
 	PKG_CMD="apk add"
 	pkg_installed() { apk info -e "$1" >/dev/null 2>&1; }
 	pkg_add()       { apk add "$@"; }
+	# pkg_replace <old> <new>: one transaction. The `!old` world constraint
+	# makes apk drop the conflicting package as part of installing the new
+	# one, and a failed resolve or fetch (offline, stale index) changes
+	# nothing -- the old build stays and the radios keep working.
+	pkg_replace()   { apk add "$2" "!$1"; }
 elif command -v opkg >/dev/null 2>&1; then
 	PKG_CMD="opkg install"
 	pkg_installed() { opkg list-installed "$1" 2>/dev/null | grep -q "^$1 "; }
 	pkg_add()       { opkg install "$@"; }
+	# opkg has no atomic replace and refuses the new build while the old one
+	# is installed (they conflict). Download it first, as proof the index
+	# and the network work, before removing anything: `opkg download` exits
+	# 0 even for a package that does not exist, so the file is the check.
+	# A failed install after the removal puts the old build back.
+	pkg_replace()   {
+		_dl=/tmp/openuf-wpad.$$
+		rm -rf "$_dl"; mkdir -p "$_dl"
+		(cd "$_dl" && opkg download "$2" >/dev/null 2>&1)
+		if ! ls "$_dl"/"$2"_*.ipk >/dev/null 2>&1; then
+			rm -rf "$_dl"
+			echo "could not download $2" >&2
+			return 1
+		fi
+		rm -rf "$_dl"
+		opkg remove "$1" >/dev/null 2>&1
+		opkg install "$2" && return 0
+		opkg install "$1" >/dev/null 2>&1 \
+			|| echo "ERROR: $1 was removed and could not be put back: the radios have NO hostapd. Install one now: opkg install $1" >&2
+		return 1
+	}
 else
 	PKG_CMD="<no package manager found>"
 	pkg_installed() { return 1; }
 	pkg_add()       { return 1; }
+	pkg_replace()   { return 1; }
 fi
+
+# ── Full wpad (hostapd) build ───────────────────────────────────────────────
+# Not optional. The controller sends aaa.<n>.bss_transition with every WLAN,
+# so ucihelper.lua always writes bss_transition ("1" or "0"), and the
+# wifi-scripts emit it whenever it is set. wpad-basic-* is built without
+# CONFIG_WNM: hostapd stops at "unknown configuration item 'bss_transition'"
+# and the radio comes up with no WiFi at all (checked on OpenWrt 24.10.8 and
+# 25.12.0, 2026-10-01).
+#
+# Full or basic is read off the binary, not the package name: a hand-built
+# hostapd or a variant missing from the list below still counts. The marker
+# is wnm_sleep_mode, a WNM configuration item. NOT bss_transition: a basic
+# binary carries bss_transition_query_rx and friends (ubus/event names), so a
+# grep for it matches basic builds too.
+HOSTAPD_BIN=${OPENUF_HOSTAPD:-/usr/sbin/hostapd}
+
+hostapd_full() { grep -q wnm_sleep_mode "$HOSTAPD_BIN" 2>/dev/null; }
+
+WPAD_VARIANTS="wpad-basic-mbedtls wpad-basic-wolfssl wpad-basic-openssl wpad-basic wpad-mini
+hostapd-basic-mbedtls hostapd-basic-wolfssl hostapd-basic-openssl hostapd-basic hostapd-mini
+wpad-mbedtls wpad-wolfssl wpad-openssl wpad wpad-mesh-mbedtls wpad-mesh-wolfssl wpad-mesh-openssl
+hostapd-mbedtls hostapd-wolfssl hostapd-openssl hostapd"
+
+# The installed hostapd/wpad package, or nothing (status 1).
+wpad_installed() {
+	for _p in $WPAD_VARIANTS; do
+		if pkg_installed "$_p"; then printf '%s' "$_p"; return 0; fi
+	done
+	return 1
+}
+
+# The full build to put in place of $1: the same crypto library, so no second
+# TLS library lands on the flash, and hostapd-* for a hostapd-* device (no
+# supplicant). A name without a library (wpad-basic, wpad-mini: hostapd's
+# internal crypto) gets openssl, which lua-openssl already puts on every
+# openUF device.
+full_wpad_for() {
+	case "$1" in
+		*-mbedtls) _lib=mbedtls ;;
+		*-wolfssl) _lib=wolfssl ;;
+		*)         _lib=openssl ;;
+	esac
+	case "$1" in
+		hostapd*) printf 'hostapd-%s' "$_lib" ;;
+		*)        printf 'wpad-%s' "$_lib" ;;
+	esac
+}
+
+ensure_full_wpad() {
+	hostapd_full && return 0
+	_cur=$(wpad_installed) || _cur=""
+	_want=$(full_wpad_for "$_cur")
+	if [ -n "$_cur" ]; then
+		echo "Replacing $_cur with $_want: a basic hostapd rejects the bss_transition option every controller WLAN carries ..."
+		pkg_replace "$_cur" "$_want" || {
+			echo "WARNING: could not replace $_cur with $_want. openUF will not start until a full build is installed: $PKG_CMD $_want"
+			return 1
+		}
+	else
+		echo "Installing $_want (no hostapd/wpad package found) ..."
+		pkg_add "$_want" || {
+			echo "WARNING: could not install $_want. openUF will not start until a full build is installed."
+			return 1
+		}
+	fi
+	# The package scripts swap the daemon, but netifd configured the radios
+	# against the old one; `wifi up` alone does not re-exec hostapd.
+	[ -x /etc/init.d/wpad ] && /etc/init.d/wpad restart >/dev/null 2>&1
+	command -v wifi >/dev/null 2>&1 && wifi up >/dev/null 2>&1
+	hostapd_full && return 0
+	echo "WARNING: $_want is installed but $HOSTAPD_BIN still has no 802.11v support."
+	return 1
+}
+
+# The tests source this file for the functions above and stop here.
+[ -n "${OPENUF_INSTALL_SOURCE_ONLY:-}" ] && return 0
 
 # ── Options ─────────────────────────────────────────────────────────────────
 # The action comes first, flags after it. An unknown flag is an error rather
@@ -285,27 +388,10 @@ case "$ACTION" in
 			https*) try_optional luasec "TLS for the https:// inform URL" ;;
 		esac
 
-		# A full wpad build. BSS Transition and Band Steering need real
-		# 802.11k/v support: wpad-basic-* lacks bss_transition entirely and
-		# errors with "unknown configuration item 'bss_transition'". Any full
-		# build provides it -- checking only for wolfssl/openssl would miss a
-		# device already shipping wpad-mbedtls (the OpenWrt 25.12 ath79
-		# default) and needlessly swap out a working hostapd, bouncing every
-		# SSID on the device for no gain.
-		HAVE_WPAD=0
-		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
-			if pkg_installed "$pkg"; then
-				HAVE_WPAD=1
-				break
-			fi
-		done
-		if [ "$HAVE_WPAD" = "0" ]; then
-			echo "Installing a full wpad build (BSS Transition / Band Steering) ..."
-			pkg_add wpad-wolfssl \
-				|| pkg_add wpad-openssl \
-				|| pkg_add wpad-mbedtls \
-				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
-		fi
+		# A full wpad build (see ensure_full_wpad at the top). A device that
+		# already has one -- wpad-mbedtls is the 25.12 default on many
+		# targets -- is left alone, so no SSID bounces for nothing.
+		ensure_full_wpad
 
 		# Enable and start services
 		"$INIT_SCRIPT" enable 2>/dev/null

@@ -8,7 +8,11 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny
+# A stock image ships wpad-basic-*, which a controller-pushed WLAN takes down.
+# Swap it for the full build of the same library in one transaction (on
+# opkg: opkg remove wpad-basic-mbedtls && opkg install wpad-mbedtls):
+apk add wpad-mbedtls '!wpad-basic-mbedtls'
 ```
 
 On OpenWrt 24.10 and earlier the package manager is `opkg install` rather than
@@ -33,13 +37,17 @@ the device has.
 | `kmod-sched-act-police` | The **upload** half of WiFi Speed Limit only. `police` is a tc *action*, a separate module from the ingress qdisc and absent from a stock filogic image. Without it the download cap applies and the upload cap does not — openUF logs which interface `tc` rejected and names this package rather than reporting the whole limit as applied |
 | `coreutils-stat` | `stat` — only if your build has no `stat` applet (some do not). `inform.lua` uses `stat -c %Y` to notice an out-of-process `state.json` write, i.e. an SSH `set-adopt` or a manual `reset-inform`; without it those are ignored until restart. Enabling busybox's own `stat` applet is smaller |
 | `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua`. Roaming Assistant needs it too, for its view of which AP hears a client how loudly |
-| `wpad-wolfssl` (or `wpad-openssl`, `wpad-mbedtls`, `wpad`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. Any of the full builds will do; `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
+| `wpad-mbedtls` (or `wpad-openssl`, `wpad-wolfssl`, `wpad`, `wpad-mesh-*`, `hostapd-*`) | Full hostapd build — **required, not optional.** The controller sends `aaa.<n>.bss_transition` with every WLAN, so openUF always writes `bss_transition`, and `wpad-basic-*` (built without `CONFIG_WNM`) stops at "unknown configuration item 'bss_transition'" with the radio down. Any full build will do. It conflicts with the basic one, so a plain `apk add` of it fails: swap with `apk add wpad-mbedtls '!wpad-basic-mbedtls'` |
 
 `install.sh install` installs all of the above automatically when missing, so a
-manual `apk add` is only needed if you're not using the installer. It treats any
-full `wpad` build as sufficient and leaves an existing one alone — notably
-`wpad-mbedtls`, which is what OpenWrt 25.12 ships on ath79 — rather than swapping
-it for `wpad-wolfssl` and bouncing every SSID on the device for no gain.
+manual `apk add` is only needed if you're not using the installer. It reads the
+hostapd binary, not the package name: a full build has the `wnm_sleep_mode`
+option compiled in (a grep for `bss_transition` is no test, since a basic binary
+carries `bss_transition_query_rx` and similar event names). A full build is left
+alone, so no SSID bounces for nothing. A basic one is replaced by the full build
+of the same crypto library: on apk in one transaction that changes nothing if it
+fails, on opkg only after the new package has downloaded, with the basic build put
+back if the install still fails. Then `wpad` is restarted so hostapd re-executes.
 
 > **AES-GCM is required for adoption.** UniFi Network Application 10.4.57 will
 > not finish provisioning a device until it has received a genuine
@@ -1145,7 +1153,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device, or reinstall with `--bootstrap-adopt` |
 | Device stays stuck at "Adopting" forever | No AES-GCM backend — `lua-openssl` missing or built without AEAD support. The CLI `openssl-util` fallback is CBC-only and will not work (see § 1) |
 | Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
-| hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed — replace it with `apk add wpad-wolfssl` |
+| hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed. Re-run `sh install.sh install`, or swap it by hand: `apk add wpad-mbedtls '!wpad-basic-mbedtls'` (opkg: `opkg remove wpad-basic-mbedtls && opkg install wpad-mbedtls`), then `/etc/init.d/wpad restart` |
 | An Enhanced Open WLAN is missing from the AP, or a transition one is plain open | The radio does not claim `radio_caps2` bit `0x8`. Check `hostapd -vowe; echo $?` (must print 0; `wpad-basic-*` or `-mini` builds may lack OWE) and that `/usr/share/ucode/wifi/hostapd.uc` exists (OpenWrt 24.10+). Force Provision after fixing it |
 | A WLAN with Private Pre-Shared Keys is missing, or a key does not work | Missing: openUF does not claim `wifi_caps` bit `0x100000` (the controller logs "PPSK is not supported … will be skipped"). `grep -c vlanid= /usr/share/ucode/wifi/ap.uc` and `grep -c "from wpa_psk_file" /usr/sbin/hostapd` must both be non-zero. A VLAN key does not work: `uci show wireless | grep psk` should list it, `cat /var/run/hostapd-<ifname>.psk` should have its `vlanid=` line, and `logread | grep "from wpa_psk_file"` shows the VLAN hostapd assigned. openUF logs a key it left out because the VLAN had no network |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
