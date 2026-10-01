@@ -46,6 +46,11 @@ Put every verification step into a tier and name the tier:
    - The lab has real `nft`/`tc`: execute generated commands against a dummy netdev
      (`ip link add openuf-test0 type dummy`) and check each rc. Also re-run for idempotency.
    - Local UI creds: `admin` / `openufopenuf` / `admin@openuf.local`.
+   - Installer / package-manager behaviour (install.sh, wpad swaps, conflicts):
+     `docker run --rm openwrt/rootfs:x86-64-25.12.0` (apk) and `:x86-64-24.10.8` (opkg)
+     have real feeds and real hostapd binaries. Run `mkdir -p /var/lock /var/run` and
+     `apk update` first; source install.sh with `OPENUF_INSTALL_SOURCE_ONLY=1` to call
+     its functions. No procd or radios, so they don't prove that hostapd runs.
 3. **Real hardware**: only claims about radios, hostapd, regdomain, switch ASICs
    and DSA can be settled here. See `CLAUDE.local.md` if present.
 
