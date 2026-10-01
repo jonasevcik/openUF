@@ -24,6 +24,20 @@ start_service() {
 	# from $OPENUF_DIR. Anything unexpected (missing lua, unreadable conf)
 	# leaves the value empty and the broadcaster starts -- fail open, since
 	# that is the documented default.
+	#
+	# A full hostapd build first. The controller sends bss_transition with
+	# every WLAN and a wpad-basic-* build rejects it as an unknown option,
+	# taking the radio down: adopted, and no WiFi. Not starting leaves the
+	# device's own WiFi working. wnm_sleep_mode is compiled in only with
+	# WNM; bss_transition is no test (a basic binary has bss_transition_*
+	# event names). install.sh's ensure_full_wpad does the swap.
+	if ! grep -q wnm_sleep_mode /usr/sbin/hostapd 2>/dev/null; then
+		msg="not starting: /usr/sbin/hostapd has no 802.11v (a wpad-basic build, or none). Re-run install.sh, or: apk add wpad-mbedtls '!wpad-basic-mbedtls'"
+		echo "openuf: $msg" >&2
+		logger -t openuf -p daemon.err "$msg" 2>/dev/null
+		return 1
+	fi
+
 	l2=$(cd "$OPENUF_DIR" 2>/dev/null && lua -e 'dofile("conf.lua")
 		print((config and config.l2_announce == false) and "off" or "on")' 2>/dev/null)
 	if [ "$l2" != "off" ]; then
