@@ -1029,6 +1029,25 @@ flag back only when it has gone missing. Each correction is logged as
 `l2guard: re-asserted hairpin_mode on <ifname>`. That line means the race happened. It is
 not an openUF fault.
 
+### usteer's AP-to-AP sync stays off the air
+
+usteerd tells the other APs what it sees by broadcasting its whole station table every
+second to `255.255.255.255:16720` (or `ff02::4150` with usteer's `ipv6` option). It also
+sends a short update for every MAC it has not seen before. The table lists every device
+heard in a probe request over the last 120 s, so phones passing by make up most of it.
+On a live two-AP site that came to 7 KB per message: five IP fragments, each copied by
+Multicast Enhancement into one unicast frame per client. Every client received about
+16 KB/s that only the other AP needs, which kept dozing phones awake and cost a weak
+client about 1.5 % of the radio's airtime.
+
+While openUF runs usteerd (`usteer.local.openuf_active=1`), `usteer.lua` installs the
+`bridge openuf_usteer` table. Its postrouting chain drops these datagrams where they
+leave through a VAP, whether this AP or the other one sent them. The later fragments carry no
+UDP header, so they are matched as non-first fragments of a UDP broadcast. The other AP still
+receives everything over the wired uplink. The table is rebuilt once a minute when the
+VAP list changes, and removed when usteerd is stopped. It needs `kmod-nft-bridge`.
+Check it with `nft list table bridge openuf_usteer`.
+
 ### Controller-managed system settings (timezone, NTP, nightly scan)
 
 Every full `system_cfg` push also carries three blocks, which `sysconf.lua` applies:
@@ -1180,6 +1199,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | A WLAN Schedule has no effect: the SSID stays up outside its schedule | Expected: WLAN Schedule is not implemented (README capability table). Turn the WLAN off in the controller instead |
 | A client shows poor WiFi Experience | The score is the worst of three terms, all read from `iw dev <ifname> station get <mac>`. **Downlink airtime**: Δ`tx duration` per Δ`tx packets` against the ideal (110 µs per frame plus the payload at the client's ceiling rate). Anything well over ~130 µs for small frames on 2.4 GHz means frames are being re-sent: a weak or noisy link, or a power-saving client that dozes through them. **Uplink** (only while the client sends ≥ 20 frames between heartbeats, since `rx bitrate` is the last frame's rate): `rx bitrate` against the client's ceiling (its streams, width and top MCS from `hostapd_cli -i <ifname> all_sta`, capped by the AP's own, one MCS below the top). **Coverage**: `signal` minus the radio's noise (`iw dev <ifname> survey dump`, the `[in use]` entry, taken as at least −95 dBm): under 20 dB is below Excellent, under ~17 dB below Good. Retry and failure counters are not used, since they mean different things per driver (see PROTOCOL-VALIDATION.md). Without `tx duration` the tx rate against the ceiling stands in, and a client with a legacy rate or no hostapd record is scored on SNR alone |
 | Clients on the same radio can't reach each other (a Cast/Google Home stereo pair or speaker group falls apart, AirPlay or printers vanish) while other clients are fine | The WLAN has Proxy ARP or Multicast Enhancement on, so OpenWrt forces `ap_isolate=1`, and the radio's bridge port lost its hairpin flag in a reconfigure (§ Hairpin). `cat /sys/class/net/<ifname>/brport/hairpin_mode` must be `1` on every BSS whose `/var/run/hostapd-phy*.conf` block has `ap_isolate=1`. openUF restores it within a minute and logs `re-asserted hairpin_mode`. On an older openUF, run `echo 1 >` on that file and on `proxyarp_wifi` |
+| Idle clients score low on WiFi Experience, and every client receives the same ~16 KB/s even when nothing is using it | usteerd's broadcast sync, copied to each client by Multicast Enhancement (§ usteer's AP-to-AP sync). Compare a client's `tx bytes` in `iw dev <ifname> station dump` over 30 s across clients. `nft list table bridge openuf_usteer` must show three drop rules while usteerd runs. On an older openUF, the traffic reaches every client |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | `inform: parse error: ... inflate: truncated stream` | A compressed controller response arrived incomplete. One heartbeat is lost and the next retries, so an occasional line is harmless; a steady stream of them points at the link to the controller (an MTU or proxy problem), not at the device |

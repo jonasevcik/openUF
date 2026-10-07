@@ -3318,6 +3318,7 @@ function M.handle_response(json_str, st, cfg)
 					local steering_active, roam_assist_active =
 						M._steering_flags(vap_table, sys_raw)
 					M._usteer.set_enabled(steering_active, cfg, roam_assist_active)
+					M._usteer_filter_next = 0   -- re-check the sync filter next tick
 					pcall(ufuci.apply_config,
 						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
 						cfg, {band_steering_active = steering_active,
@@ -4171,6 +4172,31 @@ function M._hairpin_resync()
 	return M._l2guard.reconcile_hairpin()
 end
 
+-- Once a minute: keep usteer's AP-to-AP broadcasts off the VAPs
+-- (usteer.reconcile_filter) while openUF runs the daemon, rebuilding only when
+-- that or the VAP list changed. An empty live list while wanted is "wireless
+-- not answering yet" and leaves the table alone. Returns true when it rebuilt.
+M.USTEER_FILTER_INTERVAL = 60
+M._usteer_filter_next = 0
+M._usteer_filter_built = nil
+function M._usteer_filter_resync()
+	local u = M._usteer
+	if not (u and u.reconcile_filter and u.filter_wanted) then return false end
+	local now = M._time()
+	if now < M._usteer_filter_next then return false end
+	M._usteer_filter_next = now + M.USTEER_FILTER_INTERVAL
+	local names = {}
+	if u.filter_wanted() then
+		names = M._l2guard_live_ifnames()
+		if #names == 0 then return false end
+	end
+	local key = table.concat(names, " ")
+	if key == M._usteer_filter_built then return false end
+	u.reconcile_filter(names)
+	M._usteer_filter_built = key
+	return true
+end
+
 -- ─── The controller's scheduled neighbour scan ──────────────────────────────
 
 -- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
@@ -4270,6 +4296,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._maybe_service_scan_request, cfg)
 	pcall(M._l2guard_resync, st)
 	pcall(M._hairpin_resync)
+	pcall(M._usteer_filter_resync)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal

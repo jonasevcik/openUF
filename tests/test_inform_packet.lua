@@ -3689,6 +3689,39 @@ return {
 		end
 	},
 	{
+		name = "inform: _usteer_filter_resync rebuilds once a minute only when wanted-ness or the VAPs change",
+		fn = function()
+			local orig = {u = inform._usteer, time = inform._time, live = inform._l2guard_live_ifnames}
+			local builds, wanted, live = {}, true, {"phy0-ap0"}
+			inform._usteer = {
+				filter_wanted = function() return wanted end,
+				reconcile_filter = function(names) builds[#builds + 1] = table.concat(names, " ") end,
+			}
+			inform._l2guard_live_ifnames = function() return live end
+			local now = 9000
+			inform._time = function() return now end
+			inform._usteer_filter_next, inform._usteer_filter_built = 0, nil
+			local r = {}
+			local function step(dt) now = now + dt; r[#r + 1] = inform._usteer_filter_resync() end
+			step(0)                        -- 1 builds
+			step(10)                       -- 2 rate-limited
+			step(60)                       -- 3 unchanged: no rebuild
+			live = {"phy0-ap0", "phy1-ap0"}
+			step(60)                       -- 4 VAP added: rebuild
+			live = {}
+			step(60)                       -- 5 wireless not answering: leave it
+			live = {"phy0-ap0", "phy1-ap0"}
+			wanted = false
+			step(60)                       -- 6 usteer stopped: remove
+			step(60)                       -- 7 still stopped: nothing
+			inform._usteer, inform._time, inform._l2guard_live_ifnames = orig.u, orig.time, orig.live
+			inform._usteer_filter_next, inform._usteer_filter_built = 0, nil
+			assert_eq(table.concat(builds, "|"), "phy0-ap0|phy0-ap0 phy1-ap0|", "built, extended, removed")
+			assert_true(r[1] and not r[2] and not r[3] and r[4] and not r[5] and r[6] and not r[7],
+				"returns whether it rebuilt")
+		end
+	},
+	{
 		name = "inform: a factory reset, from the controller or reset-inform, forgets the controller's leftovers",
 		fn = function()
 			local orig = {l2 = inform._l2guard, fw = inform._firewall, sc = inform._sysconf,
