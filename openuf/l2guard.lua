@@ -166,4 +166,109 @@ function M.reconcile(spec, ifnames)
 	return n
 end
 
+-- ─── Hairpin on force-isolated BSSes ─────────────────────────────────────────
+--
+-- OpenWrt forces ap_isolate=1 on any BSS with multicast_to_unicast or
+-- proxy_arp (/usr/share/ucode/wifi/ap.uc), whatever UCI `isolate` says --
+-- i.e. whenever the controller's Multicast Enhancement or Proxy ARP is on.
+-- Station-to-station traffic then has to hairpin through the bridge, and
+-- hostapd's x_snoop sets brport/hairpin_mode (and proxyarp_wifi for
+-- proxy_arp) once, at BSS setup. A reconfigure that re-enslaves the port
+-- after that leaves it with the kernel's defaults (both 0), and every frame
+-- between two clients of that BSS -- unicast and mDNS alike -- is dropped
+-- without a trace. Seen live 2026-10-07 on the Archer C5's ath10k BSS: a
+-- Google Home stereo pair on the same radio could no longer find each
+-- other, for eleven days, while every other BSS on both APs was fine.
+-- Nothing in OpenWrt re-checks the flags, so this does.
+
+M._list_hostapd_confs = function()
+	local p = io.popen("ls /var/run/hostapd-phy*.conf 2>/dev/null")
+	if not p then return {} end
+	local out = {}
+	for line in p:lines() do out[#out + 1] = line end
+	p:close()
+	return out
+end
+
+M._read = function(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
+M._write = function(path, value)
+	local f = io.open(path, "w")
+	if not f then return false end
+	local ok = f:write(value)
+	f:close()
+	return ok ~= nil
+end
+
+-- One entry per BSS of a hostapd config: `interface=` opens the first,
+-- each `bss=` the next.
+function M.parse_hostapd_bsses(text)
+	local out, cur = {}, nil
+	for line in ((text or "") .. "\n"):gmatch("([^\n]*)\n") do
+		local k, v = line:match("^([%w_]+)=(.*)$")
+		if k == "interface" or k == "bss" then
+			cur = {ifname = v}
+			out[#out + 1] = cur
+		elseif cur and k then
+			cur[k] = v
+		end
+	end
+	return out
+end
+
+-- The brport flags each force-isolated, bridged BSS needs: hairpin_mode
+-- always, proxyarp_wifi only with proxy_arp (hostapd sets it for nothing
+-- else).
+function M.hairpin_wants(bsses)
+	local wants = {}
+	for _, b in ipairs(bsses or {}) do
+		local mc, pa = b.multicast_to_unicast == "1", b.proxy_arp == "1"
+		if b.ap_isolate == "1" and (mc or pa) and (b.bridge or "") ~= "" then
+			if valid_ifname(b.ifname) then
+				wants[#wants + 1] = {ifname = b.ifname, proxyarp = pa}
+			else
+				io.stderr:write("l2guard: ignoring odd interface name " .. ("%q"):format(tostring(b.ifname)) .. "\n")
+			end
+		end
+	end
+	return wants
+end
+
+-- Re-assert the flags wherever they have gone missing. Writes only a flag
+-- that reads back other than 1, and says so: a correction is the OpenWrt
+-- race having happened, which should stay visible. Returns the number of
+-- flags rewritten.
+function M.reconcile_hairpin()
+	local bsses = {}
+	for _, path in ipairs(M._list_hostapd_confs()) do
+		for _, b in ipairs(M.parse_hostapd_bsses(M._read(path))) do bsses[#bsses + 1] = b end
+	end
+	local fixed = 0
+	for _, w in ipairs(M.hairpin_wants(bsses)) do
+		local base = "/sys/class/net/" .. w.ifname .. "/brport/"
+		local flags = {"hairpin_mode"}
+		if w.proxyarp then flags[2] = "proxyarp_wifi" end
+		for _, flag in ipairs(flags) do
+			local cur = M._read(base .. flag)
+			-- nil: the port is not enslaved (yet) -- nothing to fix.
+			if cur and cur:match("^%s*(%d+)") ~= "1" then
+				if M._write(base .. flag, "1") then
+					fixed = fixed + 1
+					io.stderr:write("openuf: l2guard: re-asserted " .. flag .. " on " .. w.ifname
+						.. " (ap_isolate is forced on; clients of this BSS could not reach each other)\n")
+				else
+					io.stderr:write("openuf: l2guard: could not set " .. flag .. " on " .. w.ifname .. "\n")
+				end
+			end
+		end
+	end
+	return fixed
+end
+
 return M

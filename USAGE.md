@@ -1014,6 +1014,21 @@ Needs **`kmod-nft-bridge`**: `iifname`/`oifname` in the bridge family live in
 nft list table bridge openuf_l2guard
 ```
 
+### Hairpin on SSIDs with Proxy ARP or Multicast Enhancement
+
+OpenWrt forces `ap_isolate=1` on any BSS with `proxy_arp` or `multicast_to_unicast`
+(`/usr/share/ucode/wifi/ap.uc`), whatever UCI `isolate` says. Two clients of that BSS
+then reach each other only by hairpinning through the bridge. hostapd turns
+`brport/hairpin_mode` on (and `proxyarp_wifi` for Proxy ARP) when it sets up the BSS.
+A later reconfigure that re-adds the port to the bridge resets both flags to 0, and
+nothing in OpenWrt sets them again. Same-radio clients are then cut off from each other
+without any log line.
+
+`l2guard.lua` checks every BSS in `/var/run/hostapd-phy*.conf` once a minute and writes a
+flag back only when it has gone missing. Each correction is logged as
+`l2guard: re-asserted hairpin_mode on <ifname>`. That line means the race happened. It is
+not an openUF fault.
+
 ### Controller-managed system settings (timezone, NTP, nightly scan)
 
 Every full `system_cfg` push also carries three blocks, which `sysconf.lua` applies:
@@ -1164,6 +1179,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Roaming Assistant never moves a weak client | Expected when no other AP hears it clearly better. Check `ubus call usteer get_client_info '{"address":"<mac>"}'`: another AP (`<ip>#hostapd.*`) on the same SSID and band needs a signal at or above the threshold and at least `roam_assist_diff_db` stronger. No remote entries at all means the usteer instances are not peering — both APs need usteer running on the same L2 network. `logread \| grep roamassist` shows every action |
 | A WLAN Schedule has no effect: the SSID stays up outside its schedule | Expected: WLAN Schedule is not implemented (README capability table). Turn the WLAN off in the controller instead |
 | A client shows poor WiFi Experience | The score is the worst of three terms, all read from `iw dev <ifname> station get <mac>`. **Downlink airtime**: Δ`tx duration` per Δ`tx packets` against the ideal (110 µs per frame plus the payload at the client's ceiling rate). Anything well over ~130 µs for small frames on 2.4 GHz means frames are being re-sent: a weak or noisy link, or a power-saving client that dozes through them. **Uplink** (only while the client sends ≥ 20 frames between heartbeats, since `rx bitrate` is the last frame's rate): `rx bitrate` against the client's ceiling (its streams, width and top MCS from `hostapd_cli -i <ifname> all_sta`, capped by the AP's own, one MCS below the top). **Coverage**: `signal` minus the radio's noise (`iw dev <ifname> survey dump`, the `[in use]` entry, taken as at least −95 dBm): under 20 dB is below Excellent, under ~17 dB below Good. Retry and failure counters are not used, since they mean different things per driver (see PROTOCOL-VALIDATION.md). Without `tx duration` the tx rate against the ceiling stands in, and a client with a legacy rate or no hostapd record is scored on SNR alone |
+| Clients on the same radio can't reach each other (a Cast/Google Home stereo pair or speaker group falls apart, AirPlay or printers vanish) while other clients are fine | The WLAN has Proxy ARP or Multicast Enhancement on, so OpenWrt forces `ap_isolate=1`, and the radio's bridge port lost its hairpin flag in a reconfigure (§ Hairpin). `cat /sys/class/net/<ifname>/brport/hairpin_mode` must be `1` on every BSS whose `/var/run/hostapd-phy*.conf` block has `ap_isolate=1`. openUF restores it within a minute and logs `re-asserted hairpin_mode`. On an older openUF, run `echo 1 >` on that file and on `proxyarp_wifi` |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | `inform: parse error: ... inflate: truncated stream` | A compressed controller response arrived incomplete. One heartbeat is lost and the next retries, so an occasional line is harmless; a steady stream of them points at the link to the controller (an MTU or proxy problem), not at the device |

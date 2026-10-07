@@ -3664,6 +3664,31 @@ return {
 		end
 	},
 	{
+		name = "inform: _hairpin_resync checks once a minute, whether or not the ebtables block was pushed",
+		fn = function()
+			local orig = {l2 = inform._l2guard, time = inform._time}
+			local calls = 0
+			inform._l2guard = {reconcile_hairpin = function() calls = calls + 1; return 1 end}
+			local now = 5000
+			inform._time = function() return now end
+			inform._hairpin_next = 0
+			local first = inform._hairpin_resync()
+			now = now + 10
+			local too_soon = inform._hairpin_resync()
+			now = now + 60
+			inform._hairpin_resync()
+			inform._l2guard = {}
+			now = now + 60
+			local absent = inform._hairpin_resync()
+			inform._l2guard, inform._time = orig.l2, orig.time
+			inform._hairpin_next = 0
+			assert_eq(first, 1, "first tick checks")
+			assert_eq(too_soon, 0, "rate-limited")
+			assert_eq(calls, 2, "checked again after a minute")
+			assert_eq(absent, 0, "a module without it is tolerated")
+		end
+	},
+	{
 		name = "inform: a factory reset, from the controller or reset-inform, forgets the controller's leftovers",
 		fn = function()
 			local orig = {l2 = inform._l2guard, fw = inform._firewall, sc = inform._sysconf,

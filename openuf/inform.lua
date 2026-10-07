@@ -4157,6 +4157,20 @@ function M._l2guard_resync(st)
 	return true
 end
 
+-- Once a minute, independent of the ebtables block: a force-isolated BSS
+-- whose bridge port lost its hairpin flag (l2guard.reconcile_hairpin) cuts
+-- its clients off from each other, and the reconfigure that causes it can
+-- land at any time, not just after a push. Returns the number of flags fixed.
+M.HAIRPIN_CHECK_INTERVAL = 60
+M._hairpin_next = 0
+function M._hairpin_resync()
+	if not (M._l2guard and M._l2guard.reconcile_hairpin) then return 0 end
+	local now = M._time()
+	if now < M._hairpin_next then return 0 end
+	M._hairpin_next = now + M.HAIRPIN_CHECK_INTERVAL
+	return M._l2guard.reconcile_hairpin()
+end
+
 -- ─── The controller's scheduled neighbour scan ──────────────────────────────
 
 -- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
@@ -4255,6 +4269,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- build_json so the fresh scan dump is what this inform reports.
 	pcall(M._maybe_service_scan_request, cfg)
 	pcall(M._l2guard_resync, st)
+	pcall(M._hairpin_resync)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
