@@ -1018,6 +1018,7 @@ return {
 							"\tsignal:  \t" .. s.signal .. " dBm\n" ..
 							"\ttx packets:\t" .. s.tx_packets .. "\n" ..
 							"\ttx bytes:\t" .. s.tx_bytes .. "\n" ..
+							(s.tx_retries and ("\ttx retries:\t" .. s.tx_retries .. "\n") or "") ..
 							"\trx packets:\t" .. s.rx_packets .. "\n" ..
 							"\ttx bitrate:\t" .. (s.tx_rate or "65.0 MBit/s MCS 7") .. "\n"
 						if s.tx_duration then
@@ -1039,17 +1040,21 @@ return {
 				return d.vap_table[1].sta_table[1].satisfaction
 			end
 			-- A client sending pkts frames of bytes_per each costing us_per of
-			-- airtime per inform, answering at rx_rate; signal/noise fixed.
+			-- airtime per inform, resend re-sends per frame (the driver's tx
+			-- retries), answering at rx_rate; signal/noise fixed.
 			local function client(o)
 				local c = {signal = o.signal, noise = o.noise, rx_rate = o.rx_rate,
 					tx_packets = o.start or 5000, tx_bytes = (o.start or 5000) * o.bytes_per,
-					tx_duration = (o.start or 5000) * o.us_per, rx_packets = 100}
+					tx_duration = (o.start or 5000) * o.us_per, rx_packets = 100,
+					tx_retries = 0}
 				return function(pkts)
+					c.tx_rate = o.tx_rate
 					local r = inform_once(c)
 					pkts = pkts or 34
 					c.tx_packets = c.tx_packets + pkts
 					c.tx_bytes = c.tx_bytes + pkts * o.bytes_per
 					c.tx_duration = c.tx_duration + pkts * o.us_per
+					c.tx_retries = c.tx_retries + math.floor(pkts * (o.resend or 0) + 0.5)
 					c.rx_packets = c.rx_packets + (o.rx_per or 25)
 					return r, c
 				end
@@ -1061,25 +1066,25 @@ return {
 			-- its neighbours) and 8-18 % ping loss. a73aa3b scored it 93.
 			fresh()
 			local dishwasher = client{signal = -71, noise = -83, rx_rate = MCS3,
-				bytes_per = 97, us_per = 503}
+				bytes_per = 97, us_per = 503, resend = 0.888}
 			assert_eq(dishwasher(), 42, "first inform: no window yet, SNR 12 dB -> 42")
 			assert_eq(dishwasher(), 24, "airtime (110 + 97*8/58.5) / 503 = 24 %: Poor")
 
 			fresh()
 			local roomba = client{signal = -62, noise = -83, rx_rate = MCS3,
-				bytes_per = 97, us_per = 127}
+				bytes_per = 97, us_per = 127, resend = 0.015}
 			roomba()
 			assert_eq(roomba(), 72, "the Roomba: clean airtime, SNR 21; uplink MCS 3 of 6 binds: 50 + 44/2")
 
 			fresh()
 			local clean = client{signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 953, us_per = 222}
+				bytes_per = 953, us_per = 222, resend = 0.004}
 			clean()
 			assert_eq(clean(), 94, "a clean client at -61 dBm: only SNR 22 dB costs anything")
 
 			fresh()
 			local mini = client{signal = -36, noise = -83, rx_rate = MCS7,
-				bytes_per = 129, us_per = 171}
+				bytes_per = 129, us_per = 171, resend = 0.477}
 			mini()
 			assert_eq(mini(), 74, "power-save re-sends cost airtime: (110 + 17.6) / 171")
 
@@ -1089,14 +1094,14 @@ return {
 			local degrading = client(o)
 			degrading()
 			assert_eq(degrading(), 94, "clean")
-			o.us_per = 503
+			o.us_per, o.resend = 503, 0.888
 			degrading()
 			assert_eq(degrading(), 89, "one bad window: 100 + 0.2*(240.3/503*100 - 100)")
 
 			-- A quiet client's window carries over until it holds 20 frames.
 			fresh()
 			dishwasher = client{signal = -71, noise = -83, rx_rate = MCS7,
-				bytes_per = 97, us_per = 503}
+				bytes_per = 97, us_per = 503, resend = 0.888}
 			dishwasher(10)
 			assert_eq(dishwasher(10), 42, "10 frames: no airtime sample yet")
 			assert_eq(dishwasher(10), 24, "20 frames: sampled")
@@ -1108,9 +1113,64 @@ return {
 			c()
 			assert_eq(c(), 94, "clean before the reassociation")
 			local bad = client{signal = -61, noise = -83, rx_rate = MCS7,
-				bytes_per = 97, us_per = 503, start = 1}
+				bytes_per = 97, us_per = 503, resend = 0.888, start = 1}
 			bad()
 			assert_eq(bad(), 84, "the reset window samples at once: 100 + 0.2*(24.5-100)")
+
+			-- A window on a clean link is not judged: its airtime is fixed
+			-- per-frame cost and counter artefacts. Hardware 2026-10-08: an
+			-- HT sensor at 255 us per 180-byte frame, 7 % re-sends, 0 % ping
+			-- loss, scored 46 when it was judged.
+			fresh()
+			local sensor = {signal = -61, noise = -83, rx_rate = MCS7,
+				bytes_per = 180, us_per = 255, resend = 0.07}
+			local light = client(sensor)
+			for _ = 1, 5 do light(40) end
+			assert_eq(light(40), 94, "light and clean: not judged, SNR 22 binds")
+			-- Nor when busy: mt76 charged a clean VHT laptop more tx
+			-- airtime than its radio spent transmitting.
+			fresh()
+			local busy = client(sensor)
+			busy(4000)
+			assert_eq(busy(4000), 94, "busy and clean: not judged either")
+			-- Re-sending (20 per 100 frames): judged.
+			fresh()
+			sensor.resend = 0.2
+			local resending = client(sensor)
+			resending(40)
+			assert_eq(resending(40), 52, "20 % re-sends: (110 + 180*8/58.5) / 255 = 52 %")
+			fresh()
+			sensor.resend = 0.18
+			local below = client(sensor)
+			below(40)
+			assert_eq(below(40), 94, "18 % re-sends: not judged")
+
+			-- A clean window counts as 100, so a link that recovers climbs
+			-- back through the same smoothing.
+			fresh()
+			local o2 = {signal = -61, noise = -83, rx_rate = MCS7,
+				bytes_per = 97, us_per = 503, resend = 0.888}
+			local recovers = client(o2)
+			recovers()
+			assert_eq(recovers(), 24, "lossy window judged")
+			-- The frames sent after that inform are still lossy: judged at
+			-- the next one.
+			o2.us_per, o2.resend = 127, 0.015
+			recovers()
+			assert_eq(recovers(), 39, "first clean window: 24.5 + 0.2*(100 - 24.5)")
+			for _ = 1, 8 do recovers() end
+			assert_eq(recovers(), 91, "ten clean windows: 100 - 75.5*0.8^10")
+
+			-- A clean window at a low tx rate isn't marked down: the rate
+			-- only stands in until the first window (hardware: ath10k
+			-- reports no re-sends, and a speaker at 263 of 351 Mbit/s fell
+			-- from 100 to 75 when clean windows counted as the rate).
+			fresh()
+			local slow = {signal = -61, noise = -83, rx_rate = MCS7, bytes_per = 180,
+				us_per = 255, resend = 0, tx_rate = "19.5 MBit/s MCS 2"}
+			local slowc = client(slow)
+			assert_eq(slowc(), 33, "no window yet: MCS 2 of 6 stands in")
+			assert_eq(slowc(), 94, "a clean window: 100, so SNR 22 binds")
 
 			-- No airtime from the driver: the tx rate against the ceiling stands in.
 			fresh()

@@ -150,6 +150,15 @@ M.RATE_EWMA_ALPHA = 0.2
 -- * the downlink airtime term is sampled once a window holds this many
 --   frames, so a quiet client's few frames aren't a verdict;
 M.SAT_AIRTIME_MIN_PKTS = 20
+-- * ...and its airtime is judged only when the driver re-sent at least
+--   this many frames per 100 in it; a cleaner window counts as 100 (SNR
+--   and the uplink rate still judge a weak link). On a clean link the
+--   airtime is fixed per-frame
+--   cost and counter artefacts: on hardware an HT sensor at 7 % re-sends
+--   and 0 % ping loss took ~250 us per frame, and mt76 charged a VHT laptop
+--   (0.5 % re-sends, 0 % loss) 711 ms of tx airtime in a minute in which
+--   the whole radio sent for 478 ms. Both scored Poor;
+M.SAT_AIRTIME_RESEND_PCT = 20
 -- * the uplink rate is sampled only in an inform in which the client sent
 --   this many frames: iw's rx bitrate is the LAST frame's rate, and a
 --   near-idle client's odd frame (seen on hardware: a speaker sending 1-15
@@ -502,9 +511,11 @@ end
 --    (airtime_pct()). Every retry costs airtime whatever a driver calls it,
 --    so this sees a failing link that rate control doesn't: on hardware a
 --    -71 dBm client held MCS 7 while 89 % of attempts failed, lost 8-18 %
---    of pings and took 4x the airtime per frame of its neighbours. Until a
---    station has an airtime sample (or on a driver without tx duration)
---    the tx rate against its ceiling stands in (rate_pct()).
+--    of pings and took 4x the airtime per frame of its neighbours. Only a
+--    window in which frames are being re-sent is judged on airtime
+--    (M.SAT_AIRTIME_RESEND_PCT), and a clean one counts as 100. Until a
+--    station's first window (or on a driver without tx duration) the tx
+--    rate against its ceiling stands in (rate_pct()).
 --  * ul: the uplink rate against the ceiling, at half weight (50-100): the
 --    AP can't see the client's own retries, only the rate it settles on.
 --    Judged only while the client really sends (M.SAT_UPLINK_MIN_PKTS).
@@ -1352,21 +1363,30 @@ function M.build_json(st, cfg, ufhw)
 					ul_ewma = ewma(ul_ewma, rate_pct(sta.rx_generation, sta.rx_mcs,
 						sta.rx_nss, sta.rx_width, ceil_mbps))
 				end
-				-- Downlink airtime: a window from the base counters, sampled
-				-- once it holds SAT_AIRTIME_MIN_PKTS frames. A counter going
-				-- backwards (a new association) restarts it.
+				-- Downlink airtime: a window from the base counters, closed
+				-- once it holds SAT_AIRTIME_MIN_PKTS frames: its airtime if
+				-- re-sending (see SAT_AIRTIME_RESEND_PCT), else 100.
+				-- A counter going backwards (a new association) restarts it.
+				-- Re-sends: the larger of the retry and failed deltas, since
+				-- mt76 counts failed attempts in both and ath9k in retries.
 				local air_ewma = prev and prev.air_ewma
 				local air_pkts, air_bytes, air_dur = prev and prev.air_pkts,
 					prev and prev.air_bytes, prev and prev.air_dur
+				local air_resent = prev and prev.air_resent
 				local tp, tb, td = sta.tx_packets, sta.tx_bytes, sta.tx_duration
+				local resent = math.max(sta.tx_retries or 0, sta.tx_failed or 0)
 				if not (tp and tb and td) then
 					air_pkts, air_bytes, air_dur = nil, nil, nil
 				elseif not air_pkts or tp < air_pkts or tb < air_bytes or td < air_dur then
-					air_pkts, air_bytes, air_dur = tp, tb, td
+					air_pkts, air_bytes, air_dur, air_resent = tp, tb, td, resent
 				elseif tp - air_pkts >= M.SAT_AIRTIME_MIN_PKTS then
-					air_ewma = ewma(air_ewma, airtime_pct(tp - air_pkts, tb - air_bytes,
-						td - air_dur, ceil_mbps))
-					air_pkts, air_bytes, air_dur = tp, tb, td
+					if (resent - air_resent) * 100 >= M.SAT_AIRTIME_RESEND_PCT * (tp - air_pkts) then
+						air_ewma = ewma(air_ewma, airtime_pct(tp - air_pkts, tb - air_bytes,
+							td - air_dur, ceil_mbps))
+					else
+						air_ewma = ewma(air_ewma, 100)
+					end
+					air_pkts, air_bytes, air_dur, air_resent = tp, tb, td, resent
 				end
 				-- Coverage: SNR, noise floored at SAT_NOISE_FLOOR_MIN.
 				local noise = noise_by_radio[vap.radio_name]
@@ -1385,6 +1405,7 @@ function M.build_json(st, cfg, ufhw)
 					air_pkts   = air_pkts,
 					air_bytes  = air_bytes,
 					air_dur    = air_dur,
+					air_resent = air_resent,
 					snr_ewma   = snr_ewma,
 				}
 				local satisfaction_now = estimate_satisfaction(sta.signal and snr_ewma,
