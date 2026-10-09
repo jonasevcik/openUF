@@ -160,8 +160,15 @@ M.SAT_AIRTIME_MIN_PKTS = 20
 --   the whole radio sent for 478 ms. Both scored Poor;
 M.SAT_AIRTIME_RESEND_PCT = 20
 -- * the ideal fixed cost of one frame on air (preamble, SIFS, ACK, backoff),
---   measured as ~110 us for small frames of clean 2.4 GHz clients;
+--   measured as ~110 us for small frames of clean 2.4 GHz clients. It is
+--   the floor: a re-sending window is judged against the station's own
+--   fixed cost per frame, the median of its last few clean windows. Some
+--   clients cost far more on a clean link: on hardware a 2.4 GHz IoT client at
+--   MCS 7 took 200-440 us per ~100-byte frame with 0-4 % re-sends (3300 us
+--   in two windows, some frames at 1 Mbit/s), so its few windows that
+--   crossed the re-send gate by chance scored 30-50 against 110 us;
 M.SAT_FRAME_OVERHEAD_US = 110
+M.SAT_BASELINE_WINDOWS = 5
 -- * the noise floor is taken as at least this: drivers report floors no
 --   receiver achieves (ath10k -106, ath9k -107), which would inflate SNR.
 M.SAT_NOISE_FLOOR_MIN = -95
@@ -501,8 +508,9 @@ end
 -- It is the worse of two terms, after the split commercial controllers
 -- use (Aruba/Aerohive client health, Mist's coverage/throughput SLEs):
 --  * dl: downlink airtime efficiency -- the airtime this client's frames
---    would take at its ceiling rate (sta_ceiling_mbps()) plus a fixed
---    per-frame cost, as a share of the airtime mac80211 says they took
+--    would take at its ceiling rate (sta_ceiling_mbps()) plus its own
+--    per-frame cost on a clean link (at least M.SAT_FRAME_OVERHEAD_US), as
+--    a share of the airtime mac80211 says they took
 --    (airtime_pct()). Every retry costs airtime whatever a driver calls it,
 --    so this sees a failing link that rate control doesn't: on hardware a
 --    -71 dBm client held MCS 7 while 89 % of attempts failed, lost 8-18 %
@@ -593,13 +601,13 @@ local function rate_pct(gen, mcs, nss, width, ceil_mbps)
 end
 
 -- Downlink airtime efficiency over one window of pkts frames and bytes
--- bytes that took dur_us of airtime: the ideal airtime (a fixed cost per
+-- bytes that took dur_us of airtime: the ideal airtime (overhead_us per
 -- frame plus the payload at ceil_mbps) as a percentage of the actual,
 -- capped at 100. Aggregated traffic beats the per-frame cost and caps out,
 -- so the term only bites on links that spend airtime they shouldn't.
-local function airtime_pct(pkts, bytes, dur_us, ceil_mbps)
+local function airtime_pct(pkts, bytes, dur_us, ceil_mbps, overhead_us)
 	if not ceil_mbps or dur_us <= 0 then return nil end
-	local ideal = pkts * M.SAT_FRAME_OVERHEAD_US + bytes * 8 / ceil_mbps
+	local ideal = pkts * overhead_us + bytes * 8 / ceil_mbps
 	local pct = ideal * 100 / dur_us
 	if pct > 100 then pct = 100 end
 	return pct
@@ -1359,7 +1367,13 @@ function M.build_json(st, cfg, ufhw)
 				-- A counter going backwards (a new association) restarts it.
 				-- Re-sends: the larger of the retry and failed deltas, since
 				-- mt76 counts failed attempts in both and ath9k in retries.
+				-- A re-sending window's ideal is the station's own fixed cost
+				-- per frame on a clean link (air_base: the last clean windows'
+				-- airtime less their payload, per frame, floored at
+				-- SAT_FRAME_OVERHEAD_US; their median, so one odd window
+				-- doesn't move it), so it is judged on what the re-sends cost.
 				local air_ewma = prev and prev.air_ewma
+				local air_base = prev and prev.air_base or {}
 				local air_pkts, air_bytes, air_dur = prev and prev.air_pkts,
 					prev and prev.air_bytes, prev and prev.air_dur
 				local air_resent = prev and prev.air_resent
@@ -1370,11 +1384,24 @@ function M.build_json(st, cfg, ufhw)
 				elseif not air_pkts or tp < air_pkts or tb < air_bytes or td < air_dur then
 					air_pkts, air_bytes, air_dur, air_resent = tp, tb, td, resent
 				elseif tp - air_pkts >= M.SAT_AIRTIME_MIN_PKTS then
-					if (resent - air_resent) * 100 >= M.SAT_AIRTIME_RESEND_PCT * (tp - air_pkts) then
-						air_ewma = ewma(air_ewma, airtime_pct(tp - air_pkts, tb - air_bytes,
-							td - air_dur, ceil_mbps))
+					local pkts, bytes, dur = tp - air_pkts, tb - air_bytes, td - air_dur
+					if (resent - air_resent) * 100 >= M.SAT_AIRTIME_RESEND_PCT * pkts then
+						local sorted = {}
+						for i, v in ipairs(air_base) do sorted[i] = v end
+						table.sort(sorted)
+						air_ewma = ewma(air_ewma, airtime_pct(pkts, bytes, dur, ceil_mbps,
+							sorted[math.floor((#sorted + 1) / 2)] or M.SAT_FRAME_OVERHEAD_US))
 					else
 						air_ewma = ewma(air_ewma, 100)
+						if ceil_mbps then
+							local ov = (dur - bytes * 8 / ceil_mbps) / pkts
+							if ov < M.SAT_FRAME_OVERHEAD_US then ov = M.SAT_FRAME_OVERHEAD_US end
+							local base = {ov}
+							for i = 1, math.min(#air_base, M.SAT_BASELINE_WINDOWS - 1) do
+								base[i + 1] = air_base[i]
+							end
+							air_base = base
+						end
 					end
 					air_pkts, air_bytes, air_dur, air_resent = tp, tb, td, resent
 				end
@@ -1394,6 +1421,7 @@ function M.build_json(st, cfg, ufhw)
 					air_bytes  = air_bytes,
 					air_dur    = air_dur,
 					air_resent = air_resent,
+					air_base   = air_base,
 					snr_ewma   = snr_ewma,
 				}
 				local satisfaction_now = estimate_satisfaction(sta.signal and snr_ewma,

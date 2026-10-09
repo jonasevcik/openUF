@@ -1172,6 +1172,51 @@ return {
 			assert_eq(slowc(), 33, "no window yet: MCS 2 of 6 stands in")
 			assert_eq(slowc(), 94, "a clean window: 100, so SNR 22 binds")
 
+			-- A re-sending window is judged against the station's own clean
+			-- cost per frame. Hardware 2026-10-09: a 2.4 GHz IoT client at
+			-- MCS 7 took ~330 us per ~100-byte frame with no re-sends, and
+			-- its windows that crossed the gate by chance scored 30-50.
+			fresh()
+			local iot = {signal = -50, noise = -83, rx_rate = MCS7,
+				bytes_per = 100, us_per = 330, resend = 0}
+			local slowclean = client(iot)
+			for _ = 1, 6 do slowclean() end
+			iot.us_per, iot.resend = 440, 0.25
+			slowclean()
+			assert_eq(slowclean(), 95, "baseline 330 - 13.7: (316.3 + 13.7) / 440 = 75 %, smoothed: 95")
+			-- One odd clean window doesn't move the baseline (median of 5).
+			fresh()
+			iot.us_per, iot.resend = 330, 0
+			local odd = client(iot)
+			for i = 1, 6 do
+				iot.us_per = (i == 6) and 3300 or 330
+				odd()
+			end
+			iot.us_per, iot.resend = 440, 0.25
+			odd()
+			assert_eq(odd(), 95, "the latest clean window took 3300 us per frame: same verdict")
+			-- A cheap clean link doesn't excuse a lossy one: the dishwasher's
+			-- clean frames cost ~127 us, its lossy ones 503.
+			fresh()
+			local dw = {signal = -50, noise = -83, rx_rate = MCS7,
+				bytes_per = 97, us_per = 127, resend = 0}
+			local lossy = client(dw)
+			for _ = 1, 6 do lossy() end
+			dw.us_per, dw.resend = 503, 0.888
+			for _ = 1, 10 do lossy() end
+			assert_eq(lossy(), 33, "baseline 113.7: (113.7 + 13.3) / 503 = 25 %; 10 windows: 25.2 + 74.8*0.8^10")
+			-- The baseline is the last 5 clean windows, so an expensive past
+			-- (here 8 windows at 330 us) doesn't excuse today's losses.
+			fresh()
+			dw.us_per, dw.resend = 330, 0
+			local moved = client(dw)
+			for _ = 1, 8 do moved() end
+			dw.us_per = 127
+			for _ = 1, 6 do moved() end
+			dw.us_per, dw.resend = 503, 0.888
+			for _ = 1, 10 do moved() end
+			assert_eq(moved(), 33, "only the 5 latest clean windows (127 us) count")
+
 			-- No airtime from the driver: the tx rate against the ceiling stands in.
 			fresh()
 			local noair = {signal = -50, noise = -83, rx_rate = MCS7, tx_packets = 10,
