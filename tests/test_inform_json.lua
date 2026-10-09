@@ -992,7 +992,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: satisfaction takes the worst of downlink airtime, uplink rate and SNR",
+		name = "inform json: satisfaction takes the worse of downlink airtime and SNR",
 		fn = function()
 			-- Per-frame figures measured on hardware 2026-09-27 (office 2.4 GHz,
 			-- noise -83 dBm), replayed inform by inform through the counters.
@@ -1074,7 +1074,7 @@ return {
 			local roomba = client{signal = -62, noise = -83, rx_rate = MCS3,
 				bytes_per = 97, us_per = 127, resend = 0.015}
 			roomba()
-			assert_eq(roomba(), 72, "the Roomba: clean airtime, SNR 21; uplink MCS 3 of 6 binds: 50 + 44/2")
+			assert_eq(roomba(), 92, "the Roomba: clean airtime, SNR 21 binds; its uplink MCS 3 isn't scored")
 
 			fresh()
 			local clean = client{signal = -61, noise = -83, rx_rate = MCS7,
@@ -1187,21 +1187,13 @@ return {
 			n.noise = nil
 			assert_eq(inform_once(n), 60, "no survey: -95 assumed")
 
-			-- A near-idle uplink isn't judged: iw's rx rate is the last frame's.
+			-- The uplink rate isn't scored. Hardware 2026-10-09: a phone on a
+			-- clean link sent at a low MCS, busily, and scored Poor on it.
 			fresh()
-			local idle = client{signal = -61, noise = -83, rx_rate = "19.5 MBit/s MCS 2",
-				bytes_per = 953, us_per = 222, rx_per = 19}
-			idle()
-			idle()
-			assert_eq(idle(), 94, "19 frames per inform: uplink term skipped")
-
-			-- A legacy uplink rate (a null frame at 1 Mbit/s) is not a verdict.
-			fresh()
-			local legacy = client{signal = -50, noise = -83, rx_rate = "1.0 MBit/s",
-				bytes_per = 953, us_per = 222}
-			legacy()
-			legacy()
-			assert_eq(legacy(), 100, "legacy rx rate: uplink term skipped")
+			local phone = client{signal = -50, noise = -83, rx_rate = "19.5 MBit/s MCS 2",
+				bytes_per = 953, us_per = 222, rx_per = 200}
+			for _ = 1, 5 do phone() end
+			assert_eq(phone(), 100, "uplink MCS 2 of 6, 200 frames per inform: not scored")
 
 			-- SNR is smoothed: one 2 dB dip doesn't drop an Excellent client.
 			fresh()

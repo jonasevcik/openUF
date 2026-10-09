@@ -2012,6 +2012,41 @@ driver re-sent ≥ 20 frames per 100 in it. A cleaner window counts as 100. All 
 - **Living room:** a new client at −43 dBm went from 27 to 100.
 - Every other client was the same or higher.
 
+**The uplink rate is not scored (hardware, 2026-10-09).** After the change above, the uplink
+term was the binding term only for phones. On the controller, a Pixel 9 sat at 55–56 for two hours at
+−72 dBm, where SNR alone gives 90. A read-only sample of every client's `rx bitrate` (every 10 s
+for 3 minutes, both APs, with frame counts and sizes) showed:
+
+| client | AP, band | signal | SNR | uplink MCS |
+|---|---|---|---|---|
+| Pixel 9 | office, 5 GHz HE (mt76) | −62 dBm | 30 dB | HE 3, 2 streams, 80 MHz (288 Mbit/s); scored 63 |
+| laptop (HE) | office, 5 GHz HE | −60 dBm | 32 dB | HE 8–9 |
+| Pixel 9 | living room, 5 GHz VHT (ath10k) | −55 dBm | 40 dB | VHT 6–8; scored 75–84 |
+| speaker | living room, 5 GHz VHT | −61 dBm | 34 dB | VHT 9 |
+| realme phone | living room, 5 GHz VHT | −68 dBm | 26 dB | legacy 6 Mbit/s or HT 130 Mbit/s; scored 66 from one sample |
+| 2.4 GHz clients | office, HT 20 MHz (noise −77 dBm) | −34 to −70 dBm | 43 → 7 dB | MCS 7 down to 2–3, falling with SNR |
+
+- **Phones:** they send 2–5 MCS below a neighbour at the same signal while their downlink is
+  clean (no re-send window). That is the phone's rate choice, not a failing link.
+- **2.4 GHz:** the uplink rate falls with SNR, so it re-measures what the coverage term already
+  scores. The vacuum it was added for (uplink MCS 3) is now SNR-bound at ~60, as is the dishwasher.
+- **The input:** `rx bitrate` is the last frame's rate. Even in a window of ≥ 20 frames, a 6 Mbit/s
+  legacy frame or a 20 MHz HT frame often decides the sample.
+- **Coverage elsewhere:** a weak uplink shows in SNR, since `signal` is the client's own signal as
+  heard by the AP. Interference at the client shows in the downlink re-sends.
+
+So the score is the worse of downlink airtime and SNR. Read-only replay over 3 minutes against the
+deployed build:
+
+- **Living room:** the Pixel 9 went from 75–84 to 100, the realme from 75–83 to 82–100 (its dip
+  came from a judged re-send window), and a Pixel 3 from 90–91 to 91–99.
+- **Office:** the HE laptop went from 94 to 100. The other clients stayed within ±4, sampling jitter
+  between the two concurrent probe processes. Removing a term from a minimum can only raise the score.
+
+Both ath10k and mt76 report a per-station `rx duration`, which would average the uplink over all
+frames instead of the last one. It would still mark the phones down, since they really do send
+at those rates, so it is not used.
+
 ### `port_table[]` entry
 
 Processed only when `Device.isSwitch()` is true for the reported model —
@@ -2272,7 +2307,7 @@ them for measured values.
 | `sta_table[].capacity` | Negotiated `tx_bitrate` (Mbps, floored) as a proxy for "available bandwidth to this client" |
 | `sta_table[].throughput` | Delta-sampled byte rate (bytes/sec); `0` on first sample for a given MAC |
 | `sta_table[].linkscore`, `.multicast` | `0` placeholders — **no local source and no public reference found for either.** Neither `paultyng/go-unifi`'s `User` model nor `unpoller/unifi`'s `clients.go` has them at all. Still needs live-capture verification. |
-| `sta_table[].satisfaction` | `estimate_satisfaction()`: the worst of three terms, following the uplink/downlink/coverage split of commercial controllers (Aruba/Aerohive client health = ideal ÷ actual airtime; Mist coverage and throughput SLEs; Meraki/Cisco SNR thresholds). **Downlink** = the airtime this client's frames would take (110 µs each plus the payload at its ceiling rate) ÷ the `tx duration` they actually took, one window per ≥ 20 frames, capped at 100, judged only in a window in which the driver re-sent ≥ 20 frames per 100 (the larger of the `tx retries`/`tx failed` deltas). A cleaner window counts as 100: see *Airtime on a clean link*. The ceiling is the stream count, width and top MCS the client associated with (`hostapd_cli all_sta`: `ht_mcs_bitmask`, `rx_vht_mcs_map`, `ht_caps_info`/`vht_caps_info` width bits, `[HE]` flag), capped by the AP's own streams and live channel width, one MCS below the top. Until a first airtime window, or on a driver without `tx duration`, the tx rate ÷ that ceiling stands in. **Uplink** = 50 + half the rx rate ÷ the same ceiling, only in an inform in which the client sent ≥ 20 frames: `rx bitrate` is the last frame's rate, and after the first deploy a −61 dBm 5 GHz speaker sending 1–15 frames per 10 s (mostly VHT MCS 9, some MCS 2) fell from 91 to 85 on it, while the docked vacuum's 73 rested on one frame per ~20 s. **Coverage** = SNR against the radio's in-use survey noise (floored at −95 dBm: ath9k/ath10k report −107/−106), 5 dB → 0, 20 dB → 90, 25 dB → 100. Each term is smoothed (EWMA α 0.2). The constants are judgements, not UniFi calibration. Replaying the *Per-station airtime* table: dishwasher 24 (Poor; was 93), docked vacuum ~92 (its uplink is too sparse to judge while docked), laptop 94, Mini 74 (Good; was 97–99, since its power-save re-sends cost airtime — accepted). ath10k airtime semantics are ⚠️ unknown (see above). Before this, the score was the worse of the tx rate ÷ ceiling and signal (−85 → 0, −70 → 100), which missed the dishwasher. Signal alone was the score before (−85 → 0, −50 → 100): a 1SS HT20 client at MCS 7 of 7 with 0.8 % retries read Poor at −61 dBm. A retry ratio was scored next (ed8b12b) and removed here: see *Per-driver tx counters* below. Read-only replay of the new code on both APs (2026-09-27, 9 clients) scored every client at or above the deployed build; the ceiling one below the top stops a −48 dBm client alternating VHT MCS 8/9 from crossing the Good/Excellent line each sample. HE ceilings (MCS 0–11 assumed, streams/width from HT/VHT caps) are ⚠️ unconfirmed: no HE client was associated. `wifi_tx_attempts`/`wifi_tx_retries_percentage` stay the lifetime iw values. |
+| `sta_table[].satisfaction` | `estimate_satisfaction()`: the worse of two terms, following the downlink/coverage split of commercial controllers (Aruba/Aerohive client health = ideal ÷ actual airtime; Mist coverage and throughput SLEs; Meraki/Cisco SNR thresholds). **Downlink** = the airtime this client's frames would take (110 µs each plus the payload at its ceiling rate) ÷ the `tx duration` they actually took, one window per ≥ 20 frames, capped at 100, judged only in a window in which the driver re-sent ≥ 20 frames per 100 (the larger of the `tx retries`/`tx failed` deltas). A cleaner window counts as 100: see *Airtime on a clean link*. The ceiling is the stream count, width and top MCS the client associated with (`hostapd_cli all_sta`: `ht_mcs_bitmask`, `rx_vht_mcs_map`, `ht_caps_info`/`vht_caps_info` width bits, `[HE]` flag), capped by the AP's own streams and live channel width, one MCS below the top. Until a first airtime window, or on a driver without `tx duration`, the tx rate ÷ that ceiling stands in. The uplink rate is not scored: see *The uplink rate is not scored* (it was 50 + half the rx rate ÷ the ceiling from c59dbe5 to 2026-10-09). **Coverage** = SNR against the radio's in-use survey noise (floored at −95 dBm: ath9k/ath10k report −107/−106), 5 dB → 0, 20 dB → 90, 25 dB → 100. Each term is smoothed (EWMA α 0.2). The constants are judgements, not UniFi calibration. Replaying the *Per-station airtime* table: dishwasher 24 (Poor; was 93), docked vacuum ~92 (its uplink is too sparse to judge while docked), laptop 94, Mini 74 (Good; was 97–99, since its power-save re-sends cost airtime — accepted). ath10k airtime semantics are ⚠️ unknown (see above). Before this, the score was the worse of the tx rate ÷ ceiling and signal (−85 → 0, −70 → 100), which missed the dishwasher. Signal alone was the score before (−85 → 0, −50 → 100): a 1SS HT20 client at MCS 7 of 7 with 0.8 % retries read Poor at −61 dBm. A retry ratio was scored next (ed8b12b) and removed here: see *Per-driver tx counters* below. Read-only replay of the new code on both APs (2026-09-27, 9 clients) scored every client at or above the deployed build; the ceiling one below the top stops a −48 dBm client alternating VHT MCS 8/9 from crossing the Good/Excellent line each sample. HE ceilings (MCS 0–11 assumed, streams/width from HT/VHT caps) are ⚠️ unconfirmed: no HE client was associated. `wifi_tx_attempts`/`wifi_tx_retries_percentage` stay the lifetime iw values. |
 | `spectrum_table[].width` | The radio's configured `htmode` (e.g. `HT40` → 40) as a uniform approximation — no live-scan source gives per-channel width |
 | `spectrum_table[].interference` | Noise-floor dBm passed through; `iw survey dump` has no interference metric of its own. Falls back to the pre-sweep reading for any frequency whose post-scan noise comes back `0` (see [the first real-hardware run](#the-first-real-hardware-run)) |
 | `radio_table[].builtin_antenna` = `true`, `.builtin_ant_gain` = `3` (dBi) | **Constants — no software source exists for either.** Not inert: the controller adds the gain to TX power to display EIRP, so a board with different antennas reports a wrong EIRP. Change them in `ucihelper.RADIO_DEFAULTS` if your hardware differs. |

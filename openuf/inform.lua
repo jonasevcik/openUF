@@ -152,18 +152,13 @@ M.RATE_EWMA_ALPHA = 0.2
 M.SAT_AIRTIME_MIN_PKTS = 20
 -- * ...and its airtime is judged only when the driver re-sent at least
 --   this many frames per 100 in it; a cleaner window counts as 100 (SNR
---   and the uplink rate still judge a weak link). On a clean link the
+--   still judges a weak link). On a clean link the
 --   airtime is fixed per-frame
 --   cost and counter artefacts: on hardware an HT sensor at 7 % re-sends
 --   and 0 % ping loss took ~250 us per frame, and mt76 charged a VHT laptop
 --   (0.5 % re-sends, 0 % loss) 711 ms of tx airtime in a minute in which
 --   the whole radio sent for 478 ms. Both scored Poor;
 M.SAT_AIRTIME_RESEND_PCT = 20
--- * the uplink rate is sampled only in an inform in which the client sent
---   this many frames: iw's rx bitrate is the LAST frame's rate, and a
---   near-idle client's odd frame (seen on hardware: a speaker sending 1-15
---   frames per 10 s, some at VHT MCS 2 among MCS 9) isn't its uplink;
-M.SAT_UPLINK_MIN_PKTS = 20
 -- * the ideal fixed cost of one frame on air (preamble, SIFS, ACK, backoff),
 --   measured as ~110 us for small frames of clean 2.4 GHz clients;
 M.SAT_FRAME_OVERHEAD_US = 110
@@ -503,7 +498,7 @@ end
 -- populated verbatim from whatever the AP sent in that sta_table entry).
 -- The UI buckets it >=90 Excellent, >=70 Good, else Poor.
 --
--- It is the worst of three terms, after the split commercial controllers
+-- It is the worse of two terms, after the split commercial controllers
 -- use (Aruba/Aerohive client health, Mist's coverage/throughput SLEs):
 --  * dl: downlink airtime efficiency -- the airtime this client's frames
 --    would take at its ceiling rate (sta_ceiling_mbps()) plus a fixed
@@ -516,20 +511,24 @@ end
 --    (M.SAT_AIRTIME_RESEND_PCT), and a clean one counts as 100. Until a
 --    station's first window (or on a driver without tx duration) the tx
 --    rate against its ceiling stands in (rate_pct()).
---  * ul: the uplink rate against the ceiling, at half weight (50-100): the
---    AP can't see the client's own retries, only the rate it settles on.
---    Judged only while the client really sends (M.SAT_UPLINK_MIN_PKTS).
 --  * cov: SNR against the radio's noise floor, 5 dB -> 0, 20 dB -> 90,
 --    25 dB -> 100 (Cisco's data-grade guideline is 20 dB; Meraki counts
 --    <=15 dB as poor), smoothed per station so 1 dB of jitter doesn't flip
 --    the bucket.
 -- Power-save clients score lower on dl: frames sent while they doze are
 -- re-sent, and that airtime is lost to everyone on the radio.
--- The iw retry/failed counters aren't used: they mean different things per
--- driver (mt76's tx failed counts failed attempts and can exceed packets;
--- ath10k's is always 0), and neither tracked ping loss on hardware (see
--- PROTOCOL-VALIDATION.md).
--- snr: dB (nil when signal is unknown), dl/ul: 0-100 or nil (unknown: the
+-- The iw retry/failed counters only gate dl and are never scored: they mean
+-- different things per driver (mt76's tx failed counts failed attempts and
+-- can exceed packets; ath10k's is always 0), and neither tracked ping loss
+-- on hardware (see PROTOCOL-VALIDATION.md).
+-- The uplink rate isn't scored. iw's rx bitrate is the last frame's (6 Mbit/s
+-- legacy and 20 MHz frames turn up among a phone's 80 MHz ones), a weak
+-- uplink already shows in the SNR (the signal is the client's, as heard by
+-- the AP), and interference at the client shows in dl's re-sends. What it
+-- alone saw on hardware was phones choosing low rates on clean links: a
+-- Pixel at -62 dBm sent HE MCS 3 on two streams (288 Mbit/s) where a laptop
+-- at -60 sent MCS 9, and scored Poor with SNR 30 and a clean downlink.
+-- snr: dB (nil when signal is unknown), dl: 0-100 or nil (unknown: the
 -- term is skipped). Returns an integer 0-100, or nil without snr.
 local function snr_score(snr)
 	if snr <= 5 then return 0 end
@@ -538,11 +537,10 @@ local function snr_score(snr)
 	return 100
 end
 
-local function estimate_satisfaction(snr, dl, ul)
+local function estimate_satisfaction(snr, dl)
 	if not snr then return nil end
 	local score = snr_score(snr)
 	if dl and dl < score then score = dl end
-	if ul and 50 + ul / 2 < score then score = 50 + ul / 2 end
 	if score < 0 then score = 0 end
 	return math.floor(score)
 end
@@ -1355,14 +1353,6 @@ function M.build_json(st, cfg, ufhw)
 					live and live.nss, width_by_radio[vap.radio_name])
 				local rate_ewma = ewma(prev and prev.rate_ewma, rate_pct(sta.tx_generation,
 					sta.tx_mcs, sta.tx_nss, sta.tx_width, ceil_mbps))
-				-- Uplink: only while the client sends enough frames for the
-				-- last one's rate to stand for its uplink.
-				local ul_ewma = prev and prev.ul_ewma
-				if prev and prev.rx_packets
-					and (sta.rx_packets or 0) - prev.rx_packets >= M.SAT_UPLINK_MIN_PKTS then
-					ul_ewma = ewma(ul_ewma, rate_pct(sta.rx_generation, sta.rx_mcs,
-						sta.rx_nss, sta.rx_width, ceil_mbps))
-				end
 				-- Downlink airtime: a window from the base counters, closed
 				-- once it holds SAT_AIRTIME_MIN_PKTS frames: its airtime if
 				-- re-sending (see SAT_AIRTIME_RESEND_PCT), else 100.
@@ -1397,10 +1387,8 @@ function M.build_json(st, cfg, ufhw)
 				M._sta_stats_cache[sta.mac] = {
 					rx_bytes   = sta.rx_bytes or 0,
 					tx_bytes   = sta.tx_bytes or 0,
-					rx_packets = sta.rx_packets,
 					time       = now,
 					rate_ewma  = rate_ewma,
-					ul_ewma    = ul_ewma,
 					air_ewma   = air_ewma,
 					air_pkts   = air_pkts,
 					air_bytes  = air_bytes,
@@ -1409,7 +1397,7 @@ function M.build_json(st, cfg, ufhw)
 					snr_ewma   = snr_ewma,
 				}
 				local satisfaction_now = estimate_satisfaction(sta.signal and snr_ewma,
-					air_ewma or rate_ewma, ul_ewma)
+					air_ewma or rate_ewma)
 				if satisfaction_now then
 					sat_sum, sat_count = sat_sum + satisfaction_now, sat_count + 1
 					sat_sum_all, sat_count_all = sat_sum_all + satisfaction_now, sat_count_all + 1
