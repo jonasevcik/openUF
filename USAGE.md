@@ -250,6 +250,7 @@ uap = {
 ```lua
 config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
+    unifi_ft_interop = false,    -- 802.11r with genuine UniFi APs, see § 6
     inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
     state_file  = "/etc/openuf/state.json",
     l2_announce = true,          -- see below
@@ -595,8 +596,39 @@ WLAN, the same one UniFi firmware uses for its own inter-AP FT traffic, so every
 the WLAN agrees with no coordination. If the push carries no `iapp_key` (`iapp_enabled` off),
 OpenWrt falls back to deriving the key from `md5(mobility_domain/psk)`. That one works too,
 but anyone who knows the passphrase can compute it. Fast transitions between openUF and real
-UniFi APs are not possible: those learn their peers through a Ubiquiti-only hostapd
-extension (PROTOCOL-VALIDATION.md, "802.11r key holders").
+UniFi APs need `unifi_ft_interop`, below.
+
+**Fast roaming with genuine UniFi APs (`unifi_ft_interop`).** Stock hostapd and UniFi's
+hostapd use the same FT key hierarchy and the same AES-SIV protected RRB payloads, but UniFi
+frames RRB differently: it inserts the source and destination AP addresses (12 bytes) after
+the RRB type (PROTOCOL-VALIDATION.md, "802.11r with genuine UniFi APs"). The
+[rrb-unifi](https://github.com/d-malinowski/unifi-openwrt-roaming) translator converts between
+the two framings on a veth pair; nothing on the UniFi AP is changed. With
+`unifi_ft_interop = true` in `conf.lua`, every FT WLAN gets what a UniFi peer needs:
+
+| UCI option | Off (default) | On |
+|---|---|---|
+| `mobility_domain` | openUF's own hash of the SSID | UniFi firmware's: first two bytes of SHA1("salt" .. SSID zero-padded to 32 bytes) |
+| `ft_psk_generate_local` | unset (OpenWrt: 1 for PSK) | `0`, so the key holders below are written |
+| `nasid` (R0KH-ID) | unset | this BSS's BSSID without colons, UniFi's convention |
+| `r0kh` / `r1kh` | wildcards keyed with `iapp_key` | one entry per UniFi peer BSS from `/etc/config/rrb-unifi` (`list ft_peer '<bssid>,<r0kh-id>'`), plus the wildcards |
+| `hostapd_bss_options` | unset | `ft_iface=vft0`, the translator's veth end, only when that netdev exists |
+| `reassociation_deadline` | 3000 | OpenWrt's default |
+
+Setup, after the translator is installed (`rrb-unifi-setup install`): turn on Fast Roaming for
+the WLAN in UniFi, set `unifi_ft_interop = true`, restart openUF, then run
+`rrb-unifi-setup collect <user>@<unifi-ap>` and `rrb-unifi-setup peers` to write the UniFi
+BSSes into the `ft_peer` list, and Force Provision the openUF AP. `rrb-unifi-setup verify`
+compares both sides, openUF's sections included. `pmk_r1_push` only pushes to listed peers
+(wildcards are skipped), so a UniFi AP missing from `ft_peer` can still pull keys from openUF,
+but gets none pushed.
+
+Troubleshooting: openUF logs `ftinterop:` lines to the system log when something is missing.
+`ft_iface not present` means the translator's veth is not up: the WLAN works, but FT to UniFi
+APs does not. `the controller sent no iapp_key` means the push carried no FT key (Fast Roaming
+off for the WLAN). `no ft_peer` means `rrb-unifi-setup peers` has not been run. Only WPA2-PSK
+with FT-PSK is verified against a UniFi AP so far; FT-SAE should take the same path but is
+untested.
 
 **How to tell whether a transition was actually fast**, since nothing in the controller
 shows it — force one and read the target AP's log:

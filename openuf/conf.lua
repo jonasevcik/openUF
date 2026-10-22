@@ -37,6 +37,15 @@ config = {
 	-- stamps each SSID it disables, so switching back to false re-enables
 	-- exactly those and leaves ones you disabled yourself alone.
 	use_only_unifi_wlan = true,
+	-- 802.11r fast roaming with genuine UniFi APs (ftinterop.lua). Needs the
+	-- rrb-unifi translator, which converts between OpenWrt's and UniFi's
+	-- inter-AP key-exchange framing, and its /etc/config/rrb-unifi peer list.
+	-- When on, every FT WLAN uses UniFi's mobility domain,
+	-- ft_psk_generate_local=0, nas_identifier = BSSID, explicit key holders
+	-- for the listed UniFi peers, and hostapd's ft_iface on the translator's
+	-- veth. Off: openUF's own mobility domain, which keeps clients from ever
+	-- trying a fast transition to a UniFi AP.
+	unifi_ft_interop = false,
 
 	-- URL the inform loop posts to.  Overwritten at runtime when the controller
 	-- sends a new URL or when syswrapper.sh set-inform is called.

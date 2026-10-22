@@ -100,6 +100,7 @@ end
 
 local function get_bcfilter() return get_sibling("bcfilter", M._bcfilter) end
 local function get_minrssi()  return get_sibling("minrssi",  M._minrssi)  end
+local function get_ftinterop() return get_sibling("ftinterop", M._ftinterop) end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
 -- The real controller's radio_table schema requires this "radio" field
@@ -829,6 +830,15 @@ local function mac_of(ifname)
 	return mac and mac:lower() or nil
 end
 
+-- The BSSID a VAP has right now: its live netdev's address, resolved the
+-- same way the per-VAP features resolve it (find_vap_iface). Asked during
+-- apply_config, before the reload, so a VAP being rebuilt still answers
+-- with the netdev it is about to get back. nil when the radio has no live
+-- interface for it.
+function M.vap_bssid(radio, ssid)
+	return mac_of(M.get_ifname_for_vap(radio, ssid))
+end
+
 -- The bridge a netdev is enslaved to, or nil when it carries its own address.
 local function master_of(ifname)
 	return util.master_of(ifname, M._read_file)
@@ -1349,6 +1359,18 @@ function M.apply_config(resp, cfg, opts)
 					extra.r0kh = { "ff:ff:ff:ff:ff:ff,*," .. vap.iapp_key }
 					extra.r1kh = { "00:00:00:00:00:00,00:00:00:00:00:00,"
 						.. vap.iapp_key }
+				end
+				-- conf.lua unifi_ft_interop: fast roaming with genuine UniFi
+				-- APs through the rrb-unifi translator (ftinterop.lua).
+				if cfg and cfg.config and cfg.config.unifi_ft_interop then
+					local fti = get_ftinterop()
+					if fti then
+						fti.apply(extra, vap, M.vap_bssid(vap.radio, vap.ssid),
+							get_uci().cursor(), M.DELETE)
+					else
+						io.stderr:write("openuf: unifi_ft_interop is on but "
+							.. "ftinterop.lua is missing\n")
+					end
 				end
 			end
 			if opts and (opts.band_steering_active or opts.roam_assist_active) then

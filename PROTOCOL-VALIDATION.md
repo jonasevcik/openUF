@@ -2487,7 +2487,55 @@ use the controller's key. Without a key, the md5 fallback still applies.
 
 The mobility domain deliberately keeps openUF's own hash, not UniFi's. Stock hostapd can't
 speak the learned-peer RRB messages, so FT between openUF and a real UAP can't work. A shared
-mobility domain would only make clients try it.
+mobility domain would only make clients try it. (That holds without a translator. With one,
+FT to a real UAP works: see "802.11r with genuine UniFi APs", which `unifi_ft_interop` opts into.)
+
+### 802.11r with genuine UniFi APs
+
+Setup: a U7 Lite (UniFi 8.7.11, kernel 5.4) and a BT Home Hub 5A (OpenWrt 24.10.4, later
+25.12.6, `wpad-mbedtls`) on one WPA2-PSK + FT-PSK WLAN, PMF off, a phone walking between them.
+Before any change, FT failed in both directions: the phone stuck to one AP or fell back to a
+full 4-way handshake.
+
+**RRB framing (packet captures on both APs).** The messages are the same, but UniFi's are
+exactly 12 bytes longer (96/142 vs 84/130 bytes):
+
+```
+stock hostapd: 00 13 74 00 01 | type | auth_len (LE16) | auth TLVs | AES-SIV(enc TLVs)
+UniFi:         00 13 74 00 01 | type | src AP (6) | dst AP (6) | auth_len | auth TLVs | AES-SIV(...)
+```
+
+UniFi sends RRB from its Ethernet MAC rather than the BSSID, so it names both APs in the
+payload. **The crypto is identical:** every captured frame from both APs decrypted offline
+with the same key, derived as hostapd's `rkh_derive_key()` does
+(`HMAC-SHA256(iapp_key, "FT OLDKEY\0" || 0x01)`; AES-SIV AD = [src BSSID, auth TLVs, type]).
+So inserting or stripping the 12 bytes is the whole protocol difference. The translator does
+that between a veth (hostapd's `ft_iface`) and the bridge.
+
+**Mobility domain.** UniFi firmware derives it as the first two bytes of
+SHA1("salt" .. SSID zero-padded to 32 bytes). ✅ The formula reproduces the
+`mobility_domain` in the U7's own hostapd config for the test SSID. openUF's own derivation
+gives a different value, so a client never even tries FT across the two.
+
+**Key holders.** OpenWrt defaults `ft_psk_generate_local` to 1 for PSK and then writes no
+`r0kh`/`r1kh`, so a UAP pulling a PMK-R1 from it gets no answer. With 0, explicit entries for
+the UAP's BSSes keyed with `iapp_key` (the controller sends both APs the same one, confirmed
+by fingerprint), and `nas_identifier` = own BSSID (UniFi's R0KH-ID convention):
+
+- ✅ **Pull, UAP → OpenWrt:** phone associated on the U7, walks to the HH5A. The translator
+  log shows the sequence sync (types 4/5) and the pull request/response (1/2), then
+  `AP-STA-CONNECTED … auth_alg=ft` with no 4-way handshake, on both radios.
+- ✅ **Push, OpenWrt → UAP:** phone associated on the HH5A. The HH5A pushes (type 3) to both
+  U7 BSSes, the U7 accepts it; the walk to the U7 then shows `auth_algo: ft` in its log,
+  associated in 10-20 ms.
+
+**Through openUF** (`unifi_ft_interop = true`, the HH5A adopted into a UCG Ultra): the running
+hostapd config openUF writes carries exactly the FT options of the hand-made config above
+(same mobility domain, key holders, `nasid`, `ft_iface`). ✅ U7 → HH5A: `auth_alg=ft` in the
+HH5A's log. ✅ HH5A → U7: WiFiman on the phone reports "AP roaming". One full reconnect
+(`auth_alg=open` + 4-way) followed a disconnect the user noticed; no FT attempt was logged
+for it, so it is not a failed fast transition, but its cause is not established. FT-SAE
+against a UAP is not tested.
 
 ### 802.11r was configured, advertised, and not working
 
