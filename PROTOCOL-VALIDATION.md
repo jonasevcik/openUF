@@ -4409,6 +4409,12 @@ ARM64 U6/U7 (incl. U6-IW) stays opaque; nothing below is claimed for it. Method:
 - **`sae.psk.<n>`** (emitter `XWWFgnDBrNRLQZ`, wlanconf `sae_psk` list of `{psk, mac, vlan, id}`): entry `mac=ff:ff:ff:ff:ff:ff` is the WLAN's own key
   (WPA3-only: sent here instead of `wpa.psk`); others are station-bound (`mac` absent = any), `vlan` ≥ 1, `dynamic_vlan` 2 if `sae_psk_vlan_required`.
   Firmware writes `sae_password=<key>[|mac=][|vlanid=][|id=]`. openUF: feature matrix row 28.
+- **Closed, no code needed:** capability bits are per-board data in `ubnthal.ko`, not readable for a U6-IW, and the controller-side sweep already
+  decides them; 4.3.28/6.8.2 `mcad` adds `default_url`, `selfrun_beacon`, `last_dns_fail_count`, `ipv6_ll_inform_url`, none of which the controller
+  sends or reads (jar string search); selfrun (3 fails, `mgmt.selfrun_guest_mode`) and `setdefault`/`restore-default` strings are unchanged from 4.0.15.
+- **Open: WiFi Experience.** 4.3.28+ `libubnt` has a new satisfaction model (`satisfaction_new_impl_enabled`, `satisfaction_experimental_enabled`,
+  `calc_satisfaction_mov`, per-band latency/rate profile tables, 14 reason bits up to `0x8000` in 6.8.2 against 8 in 4.0.15, `satisfaction_exp`/`_subscores_now`
+  in the AP report). openUF still ports the 4.0.15 formula. The controller reads `satisfaction`, `_now`, `_real`, `_reason`, `anomalies` only.
 - Per-feature results are in the feature matrix rows (27 = SAE tuning, 28 = SAE station keys).
 
 ## Open questions
