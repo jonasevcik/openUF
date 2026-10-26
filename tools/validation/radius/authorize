@@ -1,0 +1,21 @@
+# Test users for the openUF validation lab (FreeRADIUS `files` module,
+# mounted over /etc/raddb/mods-config/files/authorize).
+#
+# All credentials here are lab placeholders.
+#
+# `openuf-test` is a plain user: an EAP exchange with it ends in Access-Accept
+# with no VLAN attributes, so the client lands on the WLAN's own network.
+openuf-test	Cleartext-Password := "openufpass"
+		Reply-Message := "openUF lab: accept, no VLAN"
+
+# `openuf-vlan` returns the RFC 3580 tunnel attributes that make hostapd's
+# `dynamic_vlan` meaningful: with `dynamic_vlan=1` or `2` the BSS puts this
+# user on VLAN 10 (the lab's IoT VLAN id) instead of the WLAN's own network.
+# Use it to tell "openUF wrote dynamic_vlan" apart from "the server sent one".
+openuf-vlan	Cleartext-Password := "openufpass"
+		Tunnel-Type := VLAN,
+		Tunnel-Medium-Type := IEEE-802,
+		Tunnel-Private-Group-Id := "10"
+
+# Anything else is rejected, so a failed authentication is unambiguous.
+DEFAULT		Auth-Type := Reject

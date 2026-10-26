@@ -983,6 +983,32 @@ function M.ppsk_supported()
 	return found
 end
 
+M._eap_supported_cache = nil
+
+-- Can this device run WPA-Enterprise (802.1X): hostapd as a RADIUS client,
+-- authenticating each station against the controller's RADIUS servers?
+--
+-- Deliberately NOT a capability bit and NOT a provisioning gate. The
+-- controller puts no capability gate on a WPA2-Enterprise WLAN (verified in
+-- 10.6.106's ubntconf/LsyaJoEysWb), so such a WLAN arrives whether or not
+-- openUF could honour it, and refusing it here would only hide the problem.
+-- This answers one question -- should apply_config warn? -- because a device
+-- running a basic wpad brings the BSS up and then authenticates nobody, with
+-- nothing logged anywhere. Both halves are needed: the generator must know the
+-- server options (ap.uc, iface_authentication_server) and the binary must
+-- carry the RADIUS client.
+function M.eap_supported()
+	if M._eap_supported_cache ~= nil then return M._eap_supported_cache end
+	local found = false
+	local gen = M._read_file("/usr/share/ucode/wifi/ap.uc")
+	if gen and gen:find("auth_server_addr", 1, true) then
+		found = M._run_cmd("grep -qF 'auth_server_addr' /usr/sbin/hostapd && echo yes")
+			:find("yes", 1, true) ~= nil
+	end
+	M._eap_supported_cache = found
+	return found
+end
+
 -- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for every
 -- radio on every heartbeat, although it describes the HARDWARE plus the
 -- regulatory domain and changes only with the latter. Cached per phy with a

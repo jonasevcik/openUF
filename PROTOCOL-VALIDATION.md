@@ -1429,6 +1429,96 @@ whole SAE block is the *per-device radio* capability check described in the WPA3
 openUF maps them to hostapd's `sae_anti_clogging_threshold` / `sae_sync` through `hostapd_bss_options` (feature 27).
 Neither is a wifi-iface UCI option; the radio-level `hostapd_options` is ignored for a BSS.
 
+### `aaa.<n>.radius.*` — WPA-Enterprise (802.1X)
+
+An earlier revision of this document, and of `inform.lua`, stated that "the wire protocol
+carries no RADIUS server, port or secret" and skipped every WPA-Enterprise WLAN on that
+basis. **That was wrong**, and the mistake has a clear cause: the capture it rested on was
+taken from a site with no RADIUS profile configured, where the block is simply absent —
+the recurring trap this document warns about, treating a block's absence as the
+discriminator.
+
+Emitter: `com/ubnt/service/config/VAZShipWTNxlo` (controller 10.6.106, CFR). Consumer on a
+genuine AP: the hostapd generator inside `sbin/ubntbox` (firmware-confirmed for U7LR 6.8.2),
+which writes `auth_server_addr`/`auth_server_port`/`auth_server_shared_secret`, the `acct`
+twins, `radius_acct_interim_interval`, `dynamic_vlan` and `nas_identifier` from exactly
+these keys. **The eligibility filter (`ubntconf/LsyaJoEysWb`) applies no device capability
+gate to a WPA2-Enterprise WLAN**, so a controller has always been pushing this to openUF.
+
+| Key | Meaning |
+|---|---|
+| `radius.auth.<k>.{ip,port,secret}` | Authentication servers, 1-based, in the RADIUS profile's order. Port defaults to 1812. |
+| `radius.acct.<k>.{ip,port,secret}` | Accounting servers, same shape. Port defaults to 1813. Present only with `accounting_enabled`. |
+| `radius.{auth,acct}.<k>.tls` | RadSec. The certificates themselves are **not** on the wire — only filenames of files transferred by another channel, so the server cannot be completed from the push alone. |
+| `interim_update.status` / `.interval` | Interim accounting updates; the interval is seconds (default 3600). |
+| `dynamic_vlan` | `0`/`1`/`2` from the profile's "RADIUS assigned VLAN" mode (off / optional / required). |
+| `nas_identifier` | The profile's NAS id, when set. |
+| `radius.das.*`, `radius.dad.*` | DAS/CoA (disconnect/change-of-authorization). Parsed by nothing; openUF derives no field from them. |
+| `radius.macacl.status` | RADIUS **MAC authentication**, a separate control. Already flagged as a decoy in the MAC-filter row of the feature matrix. |
+
+Captured verbatim in the lab on 2026-10-26 (controller 10.6.106, a `wpaeap` wlanconf with
+two auth servers, one acct server, interim updates at 900 s and `vlan_wlan_mode: required`;
+addresses scrubbed to the documentation range):
+
+```
+aaa.1.wpa=2
+aaa.1.wpa.key.1.mgmt=WPA-EAP
+aaa.1.wpa.psk=letmeinnow
+aaa.1.radius.auth.1.ip=192.0.2.10     aaa.1.radius.auth.1.port=1812
+aaa.1.radius.auth.1.secret=…          aaa.1.radius.auth.2.ip=192.0.2.11
+aaa.1.radius.auth.2.port=1812         aaa.1.radius.auth.2.secret=…
+aaa.1.radius.acct.1.ip=192.0.2.10     aaa.1.radius.acct.1.port=1813
+aaa.1.radius.acct.1.secret=…          aaa.1.interim_update.status=enabled
+aaa.1.interim_update.interval=900     aaa.1.dynamic_vlan=2
+aaa.1.radius.macacl.status=disabled   aaa.1.hs20.status=disabled
+wireless.1.security=none
+```
+
+Two decoys in that block, both now pinned by tests:
+
+- **`aaa.<n>.wpa.psk` is still sent on an EAP WLAN** — `letmeinnow`, a dummy the controller
+  fills in. Carrying it into UCI would give the BSS a passphrase it must not have, so
+  openUF forces `x_passphrase = nil` on an Enterprise WLAN and refuses to write a `key` for
+  any encryption outside an explicit pre-shared-key allow-set.
+- **`wireless.<n>.security=none` on the same push.** The discriminator is
+  `aaa.<n>.wpa.key.<k>.mgmt`, as it is for SAE.
+
+OpenWrt side, read on an Archer C5 (ath79, 25.12, `wpad-mbedtls`, hostapd v2.12-devel) on
+2026-10-26. On 25.12 `/lib/netifd/wireless/mac80211.sh` is itself a ucode script importing
+`wifi.iface`, so `/usr/share/ucode/wifi/` is the live generator and `hostapd.sh` is dead
+weight. Calling the generator's own `parse_encryption()`/`wpa_key_mgmt()` on the device:
+
+| UCI `encryption` | `auth_type` | `wpa` | pairwise | `wpa_key_mgmt` (with 802.11r) |
+|---|---|---|---|---|
+| `wpa2+ccmp` | `eap` | 2 | CCMP | `WPA-EAP` (`+ FT-EAP`) |
+| `wpa3` | `eap2` | 2 | CCMP | `WPA-EAP-SHA256` (`+ FT-EAP`) |
+| `wpa3-mixed` | `eap-eap2` | 2 | CCMP | `WPA-EAP-SHA256 FT-EAP WPA-EAP` |
+| `wpa3-192` | `eap192` | 2 | GCMP-256 | `WPA-EAP-SUITE-B-192` (`+ FT-EAP-SHA384`) |
+| `eap` | `eap` | **0** | — | — |
+
+That last row is the trap: `encryption=eap` sets the right `auth_type` and then matches no
+`config.wpa` wildcard, so the BSS comes up with `wpa=0` — an open network where an
+Enterprise one was asked for. openUF maps the four working values and never that one.
+
+`ap.uc`'s EAP branch writes `ieee8021x=1`, `eapol_version`, the key-mgmt list and (unless
+`eap_server` is set) calls `iface_authentication_server()`/`iface_accounting_server()`
+itself, so openUF writes none of those — only the server options, the interim interval, the
+NAS id and `dynamic_vlan`. It also sets `vlan_possible = 1`, which is what makes
+`dynamic_vlan` reach hostapd at all. `iface_ppsk()` is gated to non-EAP auth types, so an
+EAP VAP's `auth_server_addr` is not re-consumed by the PPSK path.
+
+Two schema limits, both stated as narrowings in USAGE.md rather than worked around:
+`auth_server_port`/`auth_server_shared_secret` are written **once** per server list, so a
+server with its own port or secret cannot be expressed and is dropped with a log; and
+openUF writes no `wifi-vlan` section for a RADIUS-assigned VLAN (the push enumerates none),
+so with `dynamic_vlan=2` hostapd refuses a station assigned a VLAN this AP has no network
+for. The schema's `auth_server`/`auth_port`/`auth_secret`/`acct_interval`/`nasid` are
+`"type": "alias"` entries; openUF writes the canonical names `ap.uc` reads literally.
+
+`radio_caps2` `0x4` (WPA3-Enterprise-192) stays **unclaimed** — see
+[Capability bitmasks](#capability-bitmasks). WPA3-Enterprise needs only the SAE bit `0x1`;
+WPA2-Enterprise needs no bit at all.
+
 ### `wireless.<n>.*` — per-SSID radio binding and behavior
 
 | Key | Meaning |
@@ -2851,7 +2941,10 @@ netdev's station dump, so station reporting, the blocker, the speed limit and l2
 netdevs netifd reports under `interfaces[].vlans[].ifname`; kicks and Roaming Assistant requests
 go to the VAP's own hostapd. UID IoT also passes this gate. It adds
 `aaa.<n>.wpa.psk_radius` = 0/1/2 (enum decompiled from 10.6.101, **not seen on the wire**, no UniFi
-Identity in the lab); openUF skips a WLAN with `2`, since the push names no RADIUS server for it.
+Identity in the lab); openUF still skips a WLAN with `2`. That is a *PSK-from-RADIUS* path
+(`ap.uc` sets `wpa_psk_radius=2` and `macaddr_acl=2` on a **PSK** auth type), not 802.1X, so
+the WPA-Enterprise support added on 2026-10-26 does not cover it — see
+[`aaa.<n>.radius.*`](#aaanradius--wpa-enterprise-8021x).
 
 Lab (full `down -v` reset, claim from code via probe strings in the AP's `ap.uc`/`hostapd`
 stubs): the device reported `wifi_caps` `0x10002c`, the push above arrived, and the lab's UCI held
@@ -2936,15 +3029,32 @@ blackout windows itself, the form the 4.0.15 firmware reads.
 
 Gated, and not to be claimed:
 - **No OpenWrt equivalent, or out of scope:**
-  - `radio_caps2` `0x4`: WPA3-Enterprise-192.
   - `radio_caps2` `0x400` and `wifi_caps2` `0x1`/`0x4000`/`0x8000`: MLO and Mesh-MLO.
   - `radio_caps` `0x20000`: `radio.<n>.hard_noisefloor.*` / sensitivity level, a QCA RX-sensitivity setting.
   - `wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`: vwire, mesh, meshv3, multi-vport and Element. `0x1` also gates
     `connectivity.status=enabled`, the firmware's uplink monitor (see [`connectivity.*`](#connectivity-ssids-on-uplink-loss-nothing-to-do-2026-10-10)).
-  - `wifi_caps` `0x2000` "open hostapd", `0x40` `bga_filter`, `0x4000000` low-performance mode.
+  - `wifi_caps` `0x2000` "open hostapd", `0x4000000` low-performance mode.
   - `wifi_caps2` `0x4` Green AP, `0x10` ACS-DFS, `0x80` quick scan, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear).
   - `fw_caps` `0x800000` Hotspot 2.0 (such a WLAN is skipped without it) and `0x20000000` RADIUS `filter_id`.
   - `fw2_caps` `0x80000` RadSec, `0x20` `port_table.mac_table_ipv6`, `0x80` device command retry.
+Two entries moved out of that list on 2026-10-26, after reading the 6.8.2 firmware's own
+hostapd generator and the 10.6.106 jar:
+
+- **`radio_caps2` `0x4` (WPA3-Enterprise-192) is not "no OpenWrt equivalent".** OpenWrt's
+  live ucode generator has `encryption=wpa3-192` → `auth_type=eap192` →
+  `wpa_key_mgmt=WPA-EAP-SUITE-B-192` with GCMP-256, read out of
+  `/usr/share/ucode/wifi/iface.uc` on an Archer C5 (25.12, `wpad-mbedtls`) on 2026-10-26.
+  openUF maps that value, but **still does not claim the bit**: without it the controller
+  never sends a 192-bit WLAN, so the mapping is inert and costs nothing, whereas claiming it
+  would assert a Suite-B path nothing has exercised.
+- **`wifi_caps` `0x40` (`bga_filter`) is implemented already, in the other encoding.** The
+  ebtables emitter (`ubntconf/YcZSaTCMOYFEMGE:201`) computes
+  `emit_bpdu_rules = !config.forward_bpdu && !hasWifiCapability(64)`, and `l2guard.lua`
+  parses exactly those rules (`-t nat -A PREROUTING --in-interface <dev> -d BGA -j DROP`
+  and its POSTROUTING twin). Claiming the bit would make the controller **stop** sending
+  them and send a single `bga_filter` key instead: no new capability, and a regression risk
+  if the new key were mis-parsed. Left unclaimed deliberately, not for want of an equivalent.
+
 - **Multicast Suppressor** (`wifi_caps2` `0x400000` → `wireless.<n>.multicast.suppressor`):
   could be enforced in nft like the Multicast/Broadcast Blocker, but it is the same feature
   class that breaks casting. Low priority.
@@ -3546,7 +3656,7 @@ tx_retry_burst_count`, each copied when present):
 | `ccq` | Copied; no UI reader | Not sent: mac80211 has no CCQ |
 | `dhcpend_time` | Copied; no UI reader | Not sent: no UI effect, and the firmware's unit (the struct field at 0x3c) is undecoded |
 | `tx_power` | Copied; the UI's `tx_power` readers are all per radio | Not sent: the per-station value's source is undecoded |
-| `1x_identity` | Client doc + `last_1x_identity` | n/a: openUF skips WPA-Enterprise WLANs |
+| `1x_identity` | Client doc + `last_1x_identity` | Not sent. openUF provisions WPA-Enterprise WLANs since 2026-10-26, but does not read back the EAP identity hostapd learned. It is available (`hostapd_cli -i <bss> sta <mac>` reports `dot1xAuthSessionUserName` on an authenticated station); unimplemented, not impossible. |
 | `vlan_id` | Not read (the client's `vlan` comes from the network) | Not sent |
 | `ack_rssi`, `tx_retry_burst_count`, `channel_width` | Read by 10.x; not in 4.0.15's list | Not sent: no reference firmware to match (current builds are encrypted) |
 
@@ -4374,7 +4484,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 25 | Band Steering / BSS Transition / DTIM | `wireless.<n>.no2ghz_oui` / `aaa.<n>.bss_transition` / `wireless.<n>.dtim_period` | ✅ All three confirmed live by individual before/after `system_cfg` diffs, and ✅ **a real client steered 2.4 → 5 GHz** on the AX3000T 2026-09-02. The whole exchange is in the AP's log: the station associates on `phy0-ap0` (2.4 GHz, ch 11) at 05:33:23, and 72 s later `phy0-ap0: BSS-TM-RESP <sta> status_code=0 target_bssid=00:00:5e:00:53:05` — accepted, naming the **5 GHz** BSSID — followed in the same second by `phy1-ap0: associated` and `phy0-ap0: Prune association`. `auth_alg=ft` on both, so the move used fast roaming. usteer had been up since boot and was never restarted, so this was its own unprompted decision. Two negative results worth keeping: usteer's per-BSS `roam_events` counters stayed at 0 through it, so they do not count BTM-driven band steers; and every client that was *not* steered had a concrete reason visible in `ubus call usteer get_clients` / `hostapd get_clients` — either no 5 GHz sighting at all, or `rrm: [0,0,0,0,0]` with the BSS-Transition bit clear in `extended_capabilities`. "Nothing moved" is not evidence of a broken steerer. |
 | 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ⚠️ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt side does not work and is not implemented.** openUF writes `wps_device_name` + `ap_setup_locked` (both valid wifi-iface options — confirmed present in the schema and in `/usr/share/ucode/wifi/`), but OpenWrt emits the WPS/WSC block that carries `device_name` only under `if (config.wps_possible && length(config.config_methods))` (`ap.uc:227`), and `config_methods` is populated solely from `wps_pushbutton`/`wps_label`. openUF sets neither, so WPS never activates and no WSC Device Name IE reaches a beacon. Verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T (filogic), both 25.12.5, same gate on both; no live BSS conf carries any WPS key. Turning WPS on to broadcast a name trades a real security surface for a cosmetic feature — deliberately not done. |
 | 27 | SAE tuning | `aaa.<n>.sae.anti_clogging` / `.sae.sync` / `.sae.has_groups` + `.sae.groups.<k>.group` | ✅ Hardware-confirmed 2026-10-26. Firmware 6.8.2 `ubntbox` writes `sae_anti_clogging_threshold=%d`, `sae_sync=%d`, `sae_groups=` (absent from 4.0.15, so the old "cannot be applied" verdict rested on the schema alone). They are no wifi-iface option; the per-BSS raw-line list is `hostapd_bss_options` (`ap.uc:612`), while `hostapd_options` is radio-level (`hostapd.uc:548`) and is silently ignored: a first attempt with it left hostapd without the lines. Temp WPA3-only WLAN (REST `sae_anti_clogging=7`, `sae_sync=9`) → both lines in every BSS on both APs; home WPA2/WPA3 WLAN got 5/5. Sent only for `sae`/`sae-mixed`. |
-| 28 | SAE station keys | `aaa.<n>.sae.psk.<k>.{psk,mac,vlan,id}` | ✅ Wire → UCI → hostapd confirmed 2026-10-26 on both APs, all radios (temp WPA3-only WLAN, REST `sae_psk` with an any-station key, a key bound to a MAC, a VLAN-10 key): `wifi-station` sections with the right `mac`/`vid`, hostapd `.sae` lines `<key>\|mac=<mac>[\|vlanid=10]`, `phy*-ap*-10` netdevs bridged into `br-openuf10`, all removed again on delete. ⚠️ No client joined. Joins the `psk_file` private keys (deduped); the `ff:..` entry is skipped. |
+| 27b | SAE station keys | `aaa.<n>.sae.psk.<k>.{psk,mac,vlan,id}` | ✅ Wire → UCI → hostapd confirmed 2026-10-26 on both APs, all radios (temp WPA3-only WLAN, REST `sae_psk` with an any-station key, a key bound to a MAC, a VLAN-10 key): `wifi-station` sections with the right `mac`/`vid`, hostapd `.sae` lines `<key>\|mac=<mac>[\|vlanid=10]`, `phy*-ap*-10` netdevs bridged into `br-openuf10`, all removed again on delete. ⚠️ No client joined. Joins the `psk_file` private keys (deduped); the `ff:..` entry is skipped. |
 | 28 | PMF (802.11w) / Multicast Enhancement | `aaa.<n>.pmf.status`/`.pmf.mode`; `wireless.<n>.mcast.enhance` | ✅ Confirmed live by `system_cfg` diff. PMF is what actually carries WPA2/WPA3 transition intent on this model. |
 | 29 | Channel width | `radio.<n>.ieee_mode` → `wifi-device.htmode` | ✅ Confirmed live both directions: `11nght20`↔`11nght40` follows the per-AP 2.4 GHz Channel Width control, and the pushed value reaches UCI (`radio0` `HT20`, `radio1` `HT40`). Previously parsed by nothing, so width never applied. |
 | 30 | IoT Optimization: Lock 2.4 GHz to Channel 6 | `radio.<n>.channel` (no dedicated key) | ✅ Confirmed live end-to-end: the toggle changes the 2.4 GHz radio's `channel` from `auto` to `6`, and UCI `radio0.channel` follows (verified 11 → 6, so it is not a coincidence of the default). |
@@ -4389,6 +4499,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 39 | Ports view Connection column on an **uplink** port | `port_table[]` with **no** `mac_table` field on `is_uplink` ports | ✅ Blank (or a retained stale value) is the CORRECT state, verified 2026-09-12. Reporting the one MAC on the other end of the cable is tempting — openUF knows it, since finding it is how the uplink socket is identified, and a real UniFi gateway visibly does it on its own uplink port — but it would invert the topology map: the controller files a known device seen alone on a port into this device's `downlink_table`, and the `isUplinkMac` guard against that is ANDed with `!is_uplink`, so it disables itself on exactly the port where it is needed. The gateway would hang beneath every AP that reported it. A real gateway escapes it only because the ISP's router is not an adopted device. Live proof of the correct shape: both APs' `downlink_table` empty, the gateway's holding both APs. The stale text persists because `last_connection` is never recomputed when a port sends no `mac_table` field (and only ever recomputed when a port reports exactly **one** MAC) — clear it with the Ports view's **Clear Last Seen Device**. |
 | 40 | Roaming Assistant | `wifi_caps2` bit `0x20` → `wireless.<n>.btm_disassoc.status`/`.threshold` | ✅ Wire format, gate and teardown confirmed live in the lab (10.4.57) and against a real UCG Ultra (Network 10.6), 2026-09-26: the keys arrive on the 5 GHz WLAN entry only, and switching off removes openUF's stamp on both APs. **Steering confirmed on real radios:** a client at −80 dBm on one AP, heard at −52 by the other, got a BTM request, answered `BSS-TM-RESP status_code=4` (refused), was disassociated 16 s later by openUF, and reassociated on the other AP within 1 s at −61 dBm. Its hostapd `extended_capabilities` did not advertise BSS Transition, yet it answered, so the capability bytes do not predict which clients reply. It stayed put for all 30 one-minute samples, with no further actions. The no-better-AP rule is unit-tested only: no qualifying client was present. |
 | 41 | Discovery requests (UniFi app, WiFiman Discovery, Device Discovery Tool) | UDP 10001 request `01 00 00 00` / `02 08 00 00`, reply `01 00` / `02 09` + announce TLVs from port 10001 | ✅ Wire format captured 2026-10-25 from a real UCG Ultra (see "Discovery requests (UDP 10001)"). AP always-listening and targeted `01 04` firmware-confirmed for UAP 4.0.15. openUF answers all three; lab-validated only (home APs run `l2_announce = false`), not seen in WiFiman's UI. |
+| 42 | WPA-Enterprise (802.1X / RADIUS) | `aaa.<n>.radius.{auth,acct}.<k>.{ip,port,secret,tls}`, `aaa.<n>.interim_update.{status,interval}`, `aaa.<n>.dynamic_vlan`, `aaa.<n>.nas_identifier` | ✅ Wire captured in the lab 2026-10-26 (10.6.106) and replayed end to end through the parser and `apply_config`; the mapped `encryption` values were run through the **device's own** ucode generator on an Archer C5 the same day and produce `wpa_key_mgmt=WPA-EAP`/`-SHA256`/`-SUITE-B-192`, plus FT-EAP with 802.11r. The previous verdict ("the wire carries no RADIUS server/port/secret") came from a capture taken with no RADIUS profile configured. ⚠️ No client has authenticated. See [`aaa.<n>.radius.*`](#aaanradius--wpa-enterprise-8021x). |
 
 ---
 

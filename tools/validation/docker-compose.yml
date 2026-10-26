@@ -107,6 +107,31 @@ services:
     networks:
       - validation
 
+  # RADIUS server for the WPA-Enterprise (802.1X) validation in README
+  # section 1c. It gives the controller's RADIUS profile a real, reachable
+  # authentication/accounting endpoint, so the pushed `aaa.<n>.radius.*` block
+  # is the one a real site would get.
+  #
+  # What it proves and what it does not: the lab AP has no radios and no
+  # hostapd, so nothing here authenticates a client. This container exists so
+  # the wire capture is realistic and so the same compose file can serve a
+  # later hardware test, where a real AP's hostapd is the RADIUS client.
+  #
+  # Behind a profile, like `ap2`, so the default workflow is unchanged:
+  #   docker compose -f tools/validation/docker-compose.yml --profile radius up -d radius
+  radius:
+    image: docker.io/freeradius/freeradius-server:3.2.3-alpine
+    container_name: openuf-validation-radius
+    profiles: ["radius"]
+    volumes:
+      - ./radius/clients.conf:/etc/raddb/clients.conf:ro
+      - ./radius/authorize:/etc/raddb/mods-config/files/authorize:ro
+    # -X is single-process debug mode: every Access-Request and its reply is
+    # printed to `docker logs`, which is the point of having it here.
+    command: ["radiusd", "-X", "-f"]
+    networks:
+      - validation
+
 networks:
   validation:
     driver: bridge

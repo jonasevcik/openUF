@@ -1606,6 +1606,47 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: eap_supported() needs both the server options and hostapd's RADIUS client",
+		fn = function()
+			-- Deliberately NOT a capability bit and not a provisioning gate:
+			-- the controller puts no gate on a WPA2-Enterprise WLAN, so one
+			-- arrives either way. This only decides whether openUF warns that
+			-- the BSS will authenticate nobody.
+			local orig_r, orig_c = sysinfo._read_file, sysinfo._run_cmd
+			local cmds
+			local function probe(gen, hostapd_yes)
+				sysinfo._eap_supported_cache = nil
+				cmds = {}
+				sysinfo._read_file = function(path)
+					if path == "/usr/share/ucode/wifi/ap.uc" then return gen end
+					return nil
+				end
+				sysinfo._run_cmd = function(cmd)
+					cmds[#cmds + 1] = cmd
+					return hostapd_yes and "yes\n" or ""
+				end
+				return sysinfo.eap_supported()
+			end
+			local ok, err = pcall(function()
+				-- 25.12's ap.uc, iface_authentication_server().
+				local gen = "append('auth_server_addr', server);"
+				assert_true(probe(gen, true), "generator + RADIUS-capable hostapd")
+				assert_true(cmds[1]:find("auth_server_addr", 1, true) ~= nil,
+					"asks the hostapd binary itself")
+				assert_false(probe(gen, false), "a basic wpad -> not supported")
+				assert_false(probe(nil, true), "no ucode generator -> not supported")
+				assert_eq(#cmds, 0, "and hostapd is not even searched")
+				assert_false(probe("let x = 'psk-sae';", true),
+					"a generator without the server options -> not supported")
+				sysinfo._read_file = function() error("probed twice") end
+				assert_false(sysinfo.eap_supported(), "cached")
+			end)
+			sysinfo._read_file, sysinfo._run_cmd = orig_r, orig_c
+			sysinfo._eap_supported_cache = nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "sysinfo: owe_supported() needs both hostapd's OWE build and the ucode generator",
 		fn = function()
 			-- Claimed as radio_caps2 0x8: the controller then pushes Enhanced

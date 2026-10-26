@@ -356,18 +356,60 @@ M.DELETE = setmetatable({}, {__tostring = function() return "<delete>" end})
 
 -- Map from UniFi security type strings to UCI encryption values.
 --
--- There is deliberately no "wpa-enterprise" entry. One existed, mapping to
--- "wpa2+ccmp", but no producer ever emitted that string -- and it could not
--- have worked anyway, since wlan_add() writes no auth_server/auth_secret and
--- the wire protocol carries no RADIUS configuration to write. Enterprise
--- WLANs are now rejected at parse time in inform.lua's
--- _parse_wifi_system_cfg() instead of being silently mis-provisioned.
+-- The four enterprise values were added 2026-10-26, when UAP firmware 6.8.2's
+-- hostapd generator and the controller's own AP config builder showed that the
+-- wire DOES carry the RADIUS servers (see inform.lua's _wire_radius). Until
+-- then there was deliberately no entry, on the belief that it could not work.
+--
+-- The encryption strings are verified against the LIVE generator on 25.12
+-- (/usr/share/ucode/wifi/, which is what runs -- /lib/netifd/wireless/mac80211.sh
+-- is itself a ucode script and /lib/netifd/hostapd.sh is dead weight).
+-- iface.uc takes auth_type from the first `+` token of `encryption`:
+--   wpa2+ccmp -> eap      (wpa=2, CCMP)        -> WPA-EAP
+--   wpa3      -> eap2                          -> WPA-EAP-SHA256
+--   wpa3-mixed-> eap-eap2                      -> WPA-EAP + WPA-EAP-SHA256
+--   wpa3-192  -> eap192   (GCMP-256)           -> WPA-EAP-SUITE-B-192
+-- `encryption=eap` would be wrong: auth_type would come out right, but no
+-- config.wpa wildcard matches it, so the BSS would get wpa=0.
+--
+-- ap.uc's EAP branch sets vlan_possible and calls its own
+-- iface_authentication_server()/iface_accounting_server(), so the server
+-- blocks need nothing beyond the options apply_config writes. It also leaves
+-- ft_psk_generate_local off for a non-psk auth_type, which is what FT-EAP
+-- needs, and hostapd adds FT-EAP/FT-EAP-SHA384 itself when ieee80211r=1 --
+-- so Enterprise fast roaming comes free from the existing 802.11r block.
 local SECURITY_MAP = {
-	["open"]       = "none",
-	["wpa2"]       = "psk2",
-	["wpa3"]       = "sae",
-	["wpa2/wpa3"]  = "sae-mixed",
-	["owe"]        = "owe",
+	["open"]                 = "none",
+	["wpa2"]                 = "psk2",
+	["wpa3"]                 = "sae",
+	["wpa2/wpa3"]            = "sae-mixed",
+	["owe"]                  = "owe",
+	["wpa2-enterprise"]      = "wpa2+ccmp",
+	["wpa3-enterprise"]      = "wpa3",
+	["wpa2/wpa3-enterprise"] = "wpa3-mixed",
+	["wpa3-enterprise-192"]  = "wpa3-192",
+}
+
+-- Append one raw per-BSS hostapd line to an `extra` table, creating the list
+-- on first use. Appending rather than assigning on purpose: hostapd_bss_options
+-- has more than one producer, and a bare `extra.hostapd_bss_options = {...}`
+-- from a second one would silently drop the first one's lines.
+local function add_bss_option(extra, line)
+	local t = extra.hostapd_bss_options
+	if type(t) ~= "table" then
+		t = {}
+		extra.hostapd_bss_options = t
+	end
+	t[#t + 1] = line
+end
+
+-- The encryption values that take a `key` (a passphrase or a 64-hex PMK). An
+-- allow-set rather than a "not none, not owe" test: an EAP BSS must never
+-- carry a passphrase, and a future encryption value must fail closed.
+local PASSPHRASE_ENC = {
+	["psk2"]       = true,
+	["sae"]        = true,
+	["sae-mixed"]  = true,
 }
 
 -- Deterministic 16-bit id from a string, formatted as 4 hex chars (802.11r
@@ -664,7 +706,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	if wlanconf_id then
 		cursor:set("wireless", section_name, "openuf_wlanconf_id", wlanconf_id)
 	end
-	if password and enc ~= "none" and enc ~= "owe" then
+	if password and PASSPHRASE_ENC[enc] then
 		cursor:set("wireless", section_name, "key", password)
 	end
 	-- 802.11r/k/v
@@ -1408,12 +1450,13 @@ function M.apply_config(resp, cfg, opts)
 			-- go in as raw lines (hostapd_bss_options: per-BSS raw lines, ucode generator).
 			if vap.security == "wpa3" or vap.security == "wpa2/wpa3" then
 				if vap.sae_groups then extra.sae_groups = vap.sae_groups end
-				local raw = {}
 				if vap.sae_anti_clogging then
-					raw[#raw + 1] = "sae_anti_clogging_threshold=" .. vap.sae_anti_clogging
+					add_bss_option(extra,
+						"sae_anti_clogging_threshold=" .. vap.sae_anti_clogging)
 				end
-				if vap.sae_sync then raw[#raw + 1] = "sae_sync=" .. vap.sae_sync end
-				if #raw > 0 then extra.hostapd_bss_options = raw end
+				if vap.sae_sync then
+					add_bss_option(extra, "sae_sync=" .. vap.sae_sync)
+				end
 			end
 			if vap.qbssload ~= nil then
 				-- "Force WiFi 4 Mode" (IoT Optimization) sends
@@ -1447,6 +1490,53 @@ function M.apply_config(resp, cfg, opts)
 				local w = 0
 				if vap.pmf_status == "enabled" then w = vap.pmf_mode or 1 end
 				extra.ieee80211w = tostring(w)
+			end
+			-- 802.1X / WPA-Enterprise. The CANONICAL option names, not the
+			-- aliases: /usr/share/schema/wireless.wifi-iface.json declares
+			-- auth_server/auth_port/auth_secret/acct_server/acct_port/
+			-- acct_secret/acct_interval/nasid as "type": "alias" for these, and
+			-- the ucode generator (ap.uc) names the canonical ones literally.
+			--
+			-- One port and one secret cover the WHOLE server list: ap.uc's
+			-- iface_authentication_server() re-appends the same
+			-- auth_server_port/auth_server_shared_secret after every
+			-- auth_server_addr, so a server with its own port or secret cannot
+			-- be expressed and is dropped with a named log line rather than
+			-- silently authenticated against the wrong secret.
+			--
+			-- Nothing here is invented: no ownip/dynamic_own_ip_addr,
+			-- eap_reauth_period, radius_request_cui, radius_das_*, eap_server,
+			-- ieee8021x or wpa_key_mgmt. The wire carries none of them, and a
+			-- consumer keyed on a producer that does not exist is this
+			-- codebase's recurring defect.
+			if vap.radius then
+				local function servers(list, kind, addr_opt, port_opt, secret_opt)
+					local first = list and list[1]
+					if not first then return end
+					local addrs = {first.ip}
+					for i = 2, #list do
+						local s = list[i]
+						if s.port == first.port and s.secret == first.secret then
+							addrs[#addrs + 1] = s.ip
+						else
+							io.stderr:write(("openuf: %s: RADIUS %s server %s has its "
+								.. "own port/secret, which OpenWrt's %s list cannot "
+								.. "express -- dropped\n")
+								:format(tostring(vap.ssid), kind, s.ip, addr_opt))
+						end
+					end
+					extra[addr_opt]   = addrs
+					extra[port_opt]   = first.port
+					extra[secret_opt] = first.secret
+				end
+				servers(vap.radius.auth, "authentication", "auth_server_addr",
+					"auth_server_port", "auth_server_shared_secret")
+				servers(vap.radius.acct, "accounting", "acct_server_addr",
+					"acct_server_port", "acct_server_shared_secret")
+				if vap.radius.interim_interval then
+					extra.radius_acct_interim_interval = vap.radius.interim_interval
+				end
+				if vap.radius.nas_id then extra.nas_identifier = vap.radius.nas_id end
 			end
 			if vap.owe_transition then
 				-- Enhanced Open transition mode: the ucode generator (24.10+,
@@ -1622,7 +1712,17 @@ function M.apply_config(resp, cfg, opts)
 			-- OpenWrt's ap.uc writes hostapd's VLAN options (vlan_no_bridge
 			-- above all: netifd, not hostapd, bridges the VLAN netdev) only
 			-- when it is set.
-			if vap.ppsk then extra.dynamic_vlan = "1" end
+			--
+			-- An 802.1X WLAN carries its own value (0/1/2, from the RADIUS
+			-- profile's "RADIUS assigned VLAN" mode). PPSK wins if the two ever
+			-- met -- they cannot, since EAP and PSK live on disjoint encryption
+			-- values, but "2" (required) alongside PPSK would reject every local
+			-- key that has no VLAN, so the harmless branch is the safe one.
+			if vap.ppsk then
+				extra.dynamic_vlan = "1"
+			elseif vap.radius and vap.radius.dynamic_vlan then
+				extra.dynamic_vlan = vap.radius.dynamic_vlan
+			end
 
 			-- conf.lua config.plugins: third-party edits to this VAP's
 			-- options, after everything built in (plugins.lua). Never

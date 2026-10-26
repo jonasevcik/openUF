@@ -2255,6 +2255,81 @@ local function _wire_sae_groups(a)
 	return #out > 0 and table.concat(out, " ") or nil
 end
 
+-- aaa.<n>.radius.* -- the 802.1X / WPA-Enterprise RADIUS configuration.
+--
+-- The controller DOES send this, contrary to what openUF assumed until
+-- 2026-10-26: the AP config builder (10.6.106
+-- com/ubnt/service/config/VAZShipWTNxlo) emits
+--   aaa.<n>.radius.auth.<k>.{ip,port,secret}   k = 1..4
+--   aaa.<n>.radius.acct.<k>.{ip,port,secret}   k = 1..4, accounting only
+--   aaa.<n>.interim_update.{status,interval}   interval defaults to 3600
+--   aaa.<n>.dynamic_vlan                       0 | 1 optional | 2 required
+--   aaa.<n>.nas_identifier
+-- and UAP firmware 6.8.2's own hostapd generator (ubntbox) turns them into
+-- auth_server_addr/port/shared_secret, acct_server_*,
+-- radius_acct_interim_interval, dynamic_vlan and nas_identifier. The
+-- eligibility filter (ubntconf/LsyaJoEysWb) puts NO device capability gate on
+-- a WPA2-Enterprise WLAN, so this arrives whether or not openUF asks for it.
+--
+-- Deliberately NOT read (and tested for, so nothing downstream keys on them):
+--   * radius.das.* / radius.dad.*  -- Dynamic Authorization (CoA/disconnect)
+--   * radius.macacl.*              -- RADIUS MAC authentication
+--   * radius.auth|acct.<k>.{ca_cert,client_cert,private_key,private_key_passwd}
+--     -- RadSec. The controller sends only FILENAMES, for files it transfers
+--     by another channel, so it cannot be completed here. A server flagged
+--     .tls is therefore dropped rather than contacted in the clear.
+--
+-- Returns a table, or nil plus a reason naming what was missing. Secrets are
+-- never written to any log line.
+local function _wire_radius(a)
+	local function servers(kind, default_port)
+		local idxs = {}
+		for k in pairs(a) do
+			local i = k:match("^radius%." .. kind .. "%.(%d+)%.ip$")
+			if i then idxs[#idxs + 1] = tonumber(i) end
+		end
+		table.sort(idxs)
+		local out = {}
+		for _, i in ipairs(idxs) do
+			local pfx = "radius." .. kind .. "." .. i .. "."
+			local ip, secret = a[pfx .. "ip"], a[pfx .. "secret"]
+			local port = _wire_posint(a[pfx .. "port"]) or default_port
+			local why
+			if _wire_bool(a[pfx .. "tls"]) then
+				why = "RadSec (tls) is not supported"
+			elseif not netconfig.is_ipv4(ip) then
+				why = "no usable IPv4 address"
+			elseif type(secret) ~= "string" or secret == "" or #secret > 64 then
+				why = "missing or oversized shared secret"
+			end
+			if why then
+				io.stderr:write(("inform: dropping RADIUS %s server %d -- %s\n")
+					:format(kind, i, why))
+			else
+				out[#out + 1] = {ip = ip, port = port, secret = secret}
+			end
+		end
+		return out
+	end
+
+	local auth = servers("auth", "1812")
+	if #auth == 0 then return nil, "no usable RADIUS authentication server" end
+
+	local dynamic_vlan = a.dynamic_vlan
+	if dynamic_vlan ~= "1" and dynamic_vlan ~= "2" then dynamic_vlan = nil end
+
+	return {
+		auth = auth,
+		acct = servers("acct", "1813"),
+		-- Only when the controller says so: absent means "do not send interim
+		-- accounting updates", not "use 3600".
+		interim_interval = _wire_bool(a["interim_update.status"])
+			and (_wire_posint(a["interim_update.interval"]) or "3600") or nil,
+		dynamic_vlan = dynamic_vlan,
+		nas_id = a.nas_identifier,
+	}
+end
+
 -- Tri-state read of a `status` key for the radio/VAP disable controls:
 --   nil       -> the key was absent; leave whatever UCI already has alone
 --   false     -> explicitly enabled
@@ -2533,29 +2608,40 @@ function M._parse_wifi_system_cfg(sys_raw)
 		local akm = akm_of(a)
 		local owe_transition = a.owe_devname ~= nil and owe_hidden_half[a.owe_devname] == true
 
-		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). openUF cannot provision it:
-		-- the wire carries no RADIUS server/port/secret -- aaa.<n>.wpa.psk is
-		-- simply absent -- and wlan_add() writes no auth_server/auth_secret.
-		-- Left to fall through, an Enterprise WLAN matched neither the SAE nor
-		-- the PSK branch and landed on security="wpa2", producing a psk2
-		-- section with a nil key: a VAP hostapd refuses to bring up, with
-		-- nothing logged anywhere. Skipping it loudly is strictly better -- a
-		-- missing WLAN an admin can diagnose beats a broken one that looks
-		-- provisioned.
+		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). Provisioned since 2026-10-26
+		-- from the aaa.<n>.radius.* block (see _wire_radius above). It is still
+		-- skipped when that block names no usable authentication server: left to
+		-- fall through, an Enterprise WLAN matches neither the SAE nor the PSK
+		-- branch and lands on security="wpa2", producing a psk2 section with a
+		-- nil key -- a VAP hostapd refuses to bring up, with nothing logged
+		-- anywhere. A missing WLAN an admin can diagnose beats a broken one that
+		-- looks provisioned.
 		local is_enterprise = akm:find("EAP", 1, true) ~= nil
-		if is_enterprise and w.ssid then
-			io.stderr:write(("inform: skipping WLAN %q -- WPA-Enterprise (%s) is not "
-				.. "supported; openUF has no RADIUS configuration on this wire protocol\n")
-				:format(w.ssid, (akm:gsub("^%s+", ""))))
+		local radius, radius_err
+		if is_enterprise then radius, radius_err = _wire_radius(a) end
+		if is_enterprise and not radius and w.ssid then
+			io.stderr:write(("inform: skipping WLAN %q -- WPA-Enterprise (%s): %s\n")
+				:format(w.ssid, (akm:gsub("^%s+", "")), radius_err))
+		end
+		-- Warn-only. There is no capability bit to gate 802.1X on, so this must
+		-- not change what gets provisioned: a basic wpad brings the BSS up and
+		-- then authenticates nobody, logging nothing of its own.
+		if radius and w.ssid and M._sysinfo and M._sysinfo.eap_supported
+				and not M._sysinfo.eap_supported() then
+			io.stderr:write(("inform: WLAN %q is WPA-Enterprise, but this hostapd has "
+				.. "no RADIUS client (a full wpad is needed) -- clients will not "
+				.. "authenticate\n"):format(w.ssid))
 		end
 
 		-- A UID IoT WLAN whose keys come from RADIUS only. Claiming
 		-- wifi_caps 0x100000 (PPSK) lets it through too, with
 		-- aaa.<n>.wpa.psk_radius = 0/1/2 (disabled/optional/required, the
 		-- same values as hostapd's wpa_psk_radius; enum decompiled from
-		-- 10.6.101, not seen on the wire). As with Enterprise the push names
-		-- no RADIUS server for it, so "required" is a WLAN nobody could
-		-- join. "optional" keeps working on its local keys.
+		-- 10.6.101, not seen on the wire). Still skipped, and not covered by
+		-- the 802.1X support above: this is a *PSK* WLAN whose keys come from
+		-- RADIUS (hostapd's wpa_psk_radius), a different feature from EAP, and
+		-- the push names no server for it -- so "required" is a WLAN nobody
+		-- could join. "optional" keeps working on its local keys.
 		local radius_psk_only = a["wpa.psk_radius"] == "2"
 		if radius_psk_only and w.ssid then
 			io.stderr:write(("inform: skipping WLAN %q -- its keys come from RADIUS "
@@ -2563,14 +2649,37 @@ function M._parse_wifi_system_cfg(sys_raw)
 				.. "this wire protocol\n"):format(w.ssid))
 		end
 
-		if w.ssid and w.parent and not is_enterprise and not radius_psk_only
+		-- WPA3 rides on its OWN keys, shared by the EAP and the PSK branch
+		-- below: the akm set alone cannot tell transition from WPA3-only.
+		local wpa3_support    = _wire_bool(a["wpa3.support"])
+		local wpa3_transition = _wire_bool(a["wpa3.transition"])
+
+		if w.ssid and w.parent and (not is_enterprise or radius) and not radius_psk_only
 				and not (a.devname and owe_hidden_half[a.devname]) then
 			local security = "open"
 			-- Enhanced Open: the akm is the only marker. It carries no
 			-- aaa.<n>.wpa and no psk. The pmf.* keys that do come along
 			-- cannot reach hostapd: OpenWrt's ap.uc forces ieee80211w=2 on
 			-- an OWE BSS and writes 0 on the open transition BSS.
-			if owe_transition or (a.wpa == nil and akm:find("OWE", 1, true)) then
+			if is_enterprise then
+				-- 802.1X. The encryption value each of these maps to is
+				-- verified against the LIVE generator (25.12's
+				-- /usr/share/ucode/wifi/, since /lib/netifd/wireless/mac80211.sh
+				-- is itself a ucode script): iface.uc takes auth_type from the
+				-- first `+` token of `encryption`, so wpa2+ccmp -> eap,
+				-- wpa3 -> eap2, wpa3-mixed -> eap-eap2, wpa3-192 -> eap192.
+				-- 192-bit is tested first: it implies wpa3.support.
+				if _wire_bool(a["wpa3.enhanced_192"])
+						or akm:find("SUITE-B-192", 1, true) then
+					security = "wpa3-enterprise-192"
+				elseif wpa3_support and wpa3_transition then
+					security = "wpa2/wpa3-enterprise"
+				elseif wpa3_support then
+					security = "wpa3-enterprise"
+				else
+					security = "wpa2-enterprise"
+				end
+			elseif owe_transition or (a.wpa == nil and akm:find("OWE", 1, true)) then
 				security = "owe"
 			elseif a.wpa == "2" or a.wpa == "3" then
 				local has_sae = akm:find("SAE", 1, true) ~= nil
@@ -2583,8 +2692,6 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- therefore provision a transition WLAN as pure WPA3 and drop
 				-- every WPA2-only client on the network (IoT devices above
 				-- all). These two keys are authoritative where present.
-				local wpa3_support    = _wire_bool(a["wpa3.support"])
-				local wpa3_transition = _wire_bool(a["wpa3.transition"])
 				if wpa3_support and wpa3_transition then security = "wpa2/wpa3"
 				elseif wpa3_support then security = "wpa3"
 				elseif has_sae and has_psk then security = "wpa2/wpa3"
@@ -2656,9 +2763,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 			-- stays on the VAP's own network. aaa.<n>.wpa.psk still comes
 			-- along, a random passphrase the controller generates for the
 			-- WLAN, and is provisioned like any other key.
+			-- `not is_enterprise`: an EAP BSS authenticates against RADIUS and
+			-- must never carry local private keys (nor a passphrase, see
+			-- x_passphrase below).
 			local ppsk
 			if _wire_bool(a["wpa.psk_file.status"]) and security ~= "open"
-					and security ~= "owe" then
+					and security ~= "owe" and not is_enterprise then
 				local idxs = {}
 				for k in pairs(a) do
 					local i = k:match("^wpa%.psk_file%.(%d+)%.psk$")
@@ -2693,7 +2803,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 			-- passphrase. UniFi firmware writes the rest as sae_password=
 			-- lines (6.8.2 ubntbox); OpenWrt's wifi-station writes the same
 			-- key to the SAE and the PSK file, so they join the private keys.
-			if security ~= "open" and security ~= "owe" then
+			if security ~= "open" and security ~= "owe" and not is_enterprise then
 				local idxs = {}
 				for k in pairs(a) do
 					local i = k:match("^sae%.psk%.(%d+)%.psk$")
@@ -2749,7 +2859,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- Always present, "true"/"false". Read by _guest_wlans,
 				-- not by UCI.
 				is_guest              = _wire_bool(w.is_guest) or false,
-				x_passphrase          = a["wpa.psk"],
+				-- An EAP WLAN has no passphrase. The controller leaves
+				-- aaa.<n>.wpa.psk absent on one, but forcing nil here keeps a
+				-- stray key from ever reaching an EAP BSS.
+				x_passphrase          = (not is_enterprise) and a["wpa.psk"] or nil,
+				-- 802.1X / WPA-Enterprise: see _wire_radius above for the wire
+				-- keys, what is deferred, and why. nil on every non-EAP WLAN.
+				radius                = radius,
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
 				-- aaa.<n>.wpa3.ft.status: FT for the SAE akm specifically,
 				-- a SEPARATE toggle from ft.status. Confirmed from the

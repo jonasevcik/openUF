@@ -164,6 +164,102 @@ run above; setting `super_identity.hostname` to the controller's container IP wa
 enough for adoption and informs to work. If you hit `invalid inform_ip` in
 `server.log`, that is the knob to revisit.
 
+## 1c. WPA-Enterprise (802.1X): the RADIUS server
+
+A FreeRADIUS container lives in the compose file behind the `radius` profile, so
+the default workflow is unchanged. It gives the controller's RADIUS profile a
+real, reachable endpoint, which is what makes the captured `aaa.<n>.radius.*`
+block the one a real site would get.
+
+**What it proves:** the wire format and openUF's parse/apply of it. **What it
+does not:** nothing authenticates here — this AP container has no radios and no
+hostapd, so no EAP exchange ever happens. Only real hardware can show that.
+
+```sh
+docker compose -f tools/validation/docker-compose.yml --profile radius up -d radius
+RIP=$(docker inspect openuf-validation-radius \
+      --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+
+# Sanity-check the server itself before blaming openUF. radclient is not in the
+# freeradius image, so borrow it from a throwaway container on the same network:
+NET=$(docker inspect openuf-validation-radius \
+      --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+docker run --rm --network "$NET" alpine:3.21 sh -c \
+  "apk add -q freeradius-utils && \
+   echo 'User-Name=openuf-vlan,User-Password=openufpass' | \
+   radclient -x $RIP:1812 auth openufradius"
+# -> Access-Accept with Tunnel-Private-Group-Id = "10"
+```
+
+Users and secret are in `tools/validation/radius/` (`authorize`, `clients.conf`):
+`openuf-test` accepts with no VLAN, `openuf-vlan` accepts with the RFC 3580
+tunnel attributes, anything else is rejected. The shared secret is
+`openufradius`. `docker logs openuf-validation-radius` shows every request —
+the server runs in `-X` debug mode on purpose.
+
+Then push an Enterprise WLAN (REST, continuing from section 1b's `$J` / `$B`):
+
+```sh
+RP=$(curl -sk -b $J -X POST $B/api/s/default/rest/radiusprofile \
+  -H 'Content-Type: application/json' -d "{\"name\":\"openuf-lab-radius\",
+   \"auth_servers\":[{\"ip\":\"$RIP\",\"port\":1812,\"x_secret\":\"openufradius\"}],
+   \"accounting_enabled\":true,
+   \"acct_servers\":[{\"ip\":\"$RIP\",\"port\":1813,\"x_secret\":\"openufradius\"}],
+   \"interim_update_enabled\":true,\"interim_update_interval\":900,
+   \"vlan_wlan_mode\":\"required\",
+   \"use_usg_auth_server\":false,\"use_usg_acct_server\":false}" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['_id'])")
+
+# ap_group_ids is REQUIRED on 10.6.106 -- without it the POST fails with
+# api.err.ApGroupMissing. The id comes from the v2 API; /rest/apgroup returns
+# api.err.InvalidObject on this build.
+AG=$(curl -sk -b $J $B/v2/api/site/default/apgroups \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['_id'])")
+WG=$(curl -sk -b $J $B/api/s/default/rest/wlangroup \
+     | python3 -c "import sys,json;print([g['_id'] for g in json.load(sys.stdin)['data'] if g['name']=='Default'][0])")
+NC=$(curl -sk -b $J $B/api/s/default/rest/networkconf \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['_id'])")
+
+curl -sk -b $J -X POST $B/api/s/default/rest/wlanconf \
+  -H 'Content-Type: application/json' -d "{\"name\":\"openuf-eap\",\"enabled\":true,
+   \"security\":\"wpaeap\",\"radiusprofile_id\":\"$RP\",\"wlangroup_id\":\"$WG\",
+   \"ap_group_ids\":[\"$AG\"],\"ap_group_mode\":\"all\",\"networkconf_id\":\"$NC\",
+   \"wpa_mode\":\"wpa2\",\"wpa_enc\":\"ccmp\",\"is_guest\":false}"
+```
+
+Capturing the push: clear `/var/log/openuf-informs.log` first, then **change**
+something (a `PUT` with identical content produces no new `cfgversion`, so no
+`setparam` is sent and you will wait for a push that never comes — a
+force-provision alone did not resend it either).
+
+```sh
+docker exec openuf-validation-ap sh -c ': > /var/log/openuf-informs.log'
+# ...PUT the radiusprofile with a different interim_update_interval..., then
+sleep 45
+docker exec openuf-validation-ap sh -c 'grep setparam /var/log/openuf-informs.log' \
+  | cut -d' ' -f2- | python3 -c "import sys,json;print(json.load(sys.stdin)['system_cfg'])" \
+  | grep radius
+```
+
+What openUF made of it is in the mock's own dump — the real `inform.lua`
+process's UCI state, which a separate `lua -e` cannot see:
+
+```sh
+docker exec openuf-validation-ap cat /var/log/openuf-uci-mock-wireless.json | python3 -m json.tool
+# expect on the openuf_radio*_... section: encryption=wpa2+ccmp, NO `key`,
+# auth_server_addr/port/shared_secret, acct_server_*, radius_acct_interim_interval,
+# dynamic_vlan.
+```
+
+Verified end to end on 2026-10-26 against 10.6.106. Two traps that capture
+pinned down, both now covered by tests:
+
+- `aaa.<n>.wpa.psk` is **still sent on an EAP WLAN** (a dummy value the
+  controller fills in). Carrying it into UCI would give the BSS a passphrase it
+  must not have.
+- `wireless.<n>.security=none` on the same push. The discriminator is
+  `aaa.<n>.wpa.key.<k>.mgmt`, never that field.
+
 ## 2. Complete the controller's first-run setup
 
 > The UI walkthrough, kept because it explains *what* each step is for. To just get
@@ -356,10 +452,11 @@ A bare `conf.lua` reports a different firmware version (6.6.55 instead of
 ```sh
 # Full reset (fresh controller + fresh AP state -- remember to redo step 3,
 # Inform Host Override, after this since it lives in the wiped database).
-# The --profile flag matters if you ever started ap2 (section 6): `down`
-# ignores services whose profile isn't active, so without it the ap2
-# container would survive the reset.
-docker compose -f tools/validation/docker-compose.yml --profile replacement down -v
+# The --profile flags matter if you ever started ap2 (section 6) or the RADIUS
+# server (section 1c): `down` ignores services whose profile isn't active, so
+# without them those containers would survive the reset.
+docker compose -f tools/validation/docker-compose.yml \
+  --profile replacement --profile radius down -v
 
 # Just re-adopt with a clean AP state, keep the controller/site config
 # (Inform Host Override survives this since it doesn't touch unifi-db):

@@ -2578,6 +2578,178 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: an EAP vap gets its RADIUS servers and no passphrase",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+					 -- x_passphrase is nil off the wire for an EAP WLAN; set
+					 -- here on purpose, to pin that it still cannot reach UCI.
+					 x_passphrase = "hunter22",
+					 radius = {
+						auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+						acct = {{ip = "192.0.2.11", port = "1813", secret = "b"}},
+						interim_interval = "600", nas_id = "ap-office",
+						dynamic_vlan = "2",
+					 }},
+				}}, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.encryption, "wpa2+ccmp", "encryption")
+				assert_nil(s.key, "an EAP BSS must carry no passphrase")
+				assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10", "auth server")
+				assert_eq(s.auth_server_port, "1812", "auth port")
+				assert_eq(s.auth_server_shared_secret, "a", "auth secret")
+				assert_eq(table.concat(s.acct_server_addr, " "), "192.0.2.11", "acct server")
+				assert_eq(s.acct_server_port, "1813", "acct port")
+				assert_eq(s.acct_server_shared_secret, "b", "acct secret")
+				assert_eq(s.radius_acct_interim_interval, "600", "interim interval")
+				assert_eq(s.nas_identifier, "ap-office", "NAS id")
+				assert_eq(s.dynamic_vlan, "2", "dynamic VLAN")
+				-- Nothing invented: the wire carries none of these.
+				for _, k in ipairs({"ownip", "dynamic_own_ip_addr", "eap_reauth_period",
+						"radius_request_cui", "radius_das_client", "radius_das_port",
+						"eap_server", "ieee8021x", "wpa_key_mgmt"}) do
+					assert_nil(s[k], k .. " is not written")
+				end
+			end)
+		end
+	},
+	{
+		name = "ucihelper: each enterprise security value maps to its own encryption",
+		fn = function()
+			-- Verified against 25.12's live ucode generator: iface.uc takes
+			-- auth_type from the first `+` token of encryption, so these four
+			-- strings are what produce eap / eap2 / eap-eap2 / eap192.
+			for _, c in ipairs({
+				{"wpa2-enterprise", "wpa2+ccmp"},
+				{"wpa3-enterprise", "wpa3"},
+				{"wpa2/wpa3-enterprise", "wpa3-mixed"},
+				{"wpa3-enterprise-192", "wpa3-192"},
+			}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = c[1],
+						 x_passphrase = "hunter22", radius = {
+							auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {},
+						 }},
+					}}, nil)
+					local s = db.wireless.openuf_radio0_corp
+					assert_eq(s.encryption, c[2], c[1] .. " -> encryption")
+					assert_nil(s.key, c[1] .. ": no passphrase")
+				end)
+			end
+		end
+	},
+	{
+		name = "ucihelper: extra RADIUS servers join the list only when port and secret match",
+		fn = function()
+			-- ap.uc re-appends the SAME auth_server_port/shared_secret after
+			-- every auth_server_addr, so a server with its own port or secret
+			-- cannot be expressed. Dropping it with a log beats authenticating
+			-- against the wrong secret.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"},
+							{ip = "192.0.2.20", port = "1812", secret = "a"},
+							{ip = "192.0.2.30", port = "1812", secret = "different"},
+							{ip = "192.0.2.40", port = "1645", secret = "a"},
+						 }, acct = {}}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10 192.0.2.20",
+					"only the servers sharing port and secret")
+				assert_eq(s.auth_server_shared_secret, "a", "the first server's secret")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an EAP vap adds no raw hostapd lines and leaves the SAE ones intact",
+		fn = function()
+			-- hostapd_bss_options has more than one producer, so it is appended
+			-- to, never assigned. Both WLANs in one push: the SAE lines must
+			-- survive and the EAP section must get none.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "home", radio = "radio0", security = "wpa3",
+						 x_passphrase = "hunter22", sae_anti_clogging = "5",
+						 sae_sync = "7"},
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}}},
+					}}, nil)
+				end)
+				assert_eq(table.concat(db.wireless.openuf_radio0_home.hostapd_bss_options, ","),
+					"sae_anti_clogging_threshold=5,sae_sync=7", "the SAE lines survive")
+				assert_nil(db.wireless.openuf_radio0_corp.hostapd_bss_options,
+					"the EAP vap adds none")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: PPSK still wins dynamic_vlan over a RADIUS profile",
+		fn = function()
+			-- They cannot meet (EAP and PSK live on disjoint encryption
+			-- values), but "2" alongside PPSK would reject every local key
+			-- without a VLAN, so the harmless branch has to be the one that wins.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22",
+						 ppsk = {{key = "userkey1"}},
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}, dynamic_vlan = "2"}},
+					}}, nil)
+				end)
+				assert_eq(db.wireless.openuf_radio0_corp.dynamic_vlan, "1", "PPSK's value")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an EAP vap's RADIUS options are gone on the next push",
+		fn = function()
+			-- No teardown code exists for these on purpose: apply_config
+			-- wlan_clear()s every openuf_ section and rebuilds it, so a option
+			-- the controller stops sending cannot persist. This pins that.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}, nas_id = "ap-office", dynamic_vlan = "1"}},
+					}}, nil)
+				end)
+				assert_eq(table.concat(
+					db.wireless.openuf_radio0_corp.auth_server_addr, " "),
+					"192.0.2.10", "written first")
+				-- The same WLAN comes back as plain WPA2 (the admin changed its
+				-- security), carrying no RADIUS keys at all.
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22"},
+				}}, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.encryption, "psk2", "back to PSK")
+				assert_eq(s.key, "hunter22", "with its passphrase")
+				for _, k in ipairs({"auth_server_addr", "auth_server_port",
+						"auth_server_shared_secret", "acct_server_addr",
+						"radius_acct_interim_interval", "nas_identifier",
+						"dynamic_vlan"}) do
+					assert_nil(s[k], k .. " is gone")
+				end
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes wpa_group_rekey and leaves it alone when absent",
 		fn = function()
 			for _, c in ipairs({{"3600", "3600"}, {"0", "0"}, {nil, nil}}) do

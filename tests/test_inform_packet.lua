@@ -1296,14 +1296,14 @@ return {
 		end
 	},
 	{
-		name = "inform packet: _parse_wifi_system_cfg skips WPA-Enterprise WLANs",
+		name = "inform packet: _parse_wifi_system_cfg skips a WPA-Enterprise WLAN with no RADIUS server",
 		fn = function()
-			-- An Enterprise WLAN carries mgmt=WPA-EAP and NO wpa.psk. Before
-			-- this guard it matched neither the SAE nor the PSK branch and fell
-			-- through to security="wpa2", producing a psk2 section with a nil
-			-- key -- a VAP hostapd refuses to bring up, silently. openUF has no
-			-- RADIUS configuration on this wire protocol, so the only honest
-			-- outcome is to drop the WLAN and say so.
+			-- An Enterprise WLAN carries mgmt=WPA-EAP and NO wpa.psk. Without
+			-- the aaa.<n>.radius.auth.* block there is nothing to authenticate
+			-- against, and falling through would match neither the SAE nor the
+			-- PSK branch and land on security="wpa2", producing a psk2 section
+			-- with a nil key -- a VAP hostapd refuses to bring up, silently.
+			-- The only honest outcome is to drop the WLAN and say so.
 			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
 				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
 				.. "aaa.2.ssid=guest\naaa.2.wpa=2\naaa.2.wpa.key.1.mgmt=WPA-PSK\n"
@@ -1313,6 +1313,196 @@ return {
 			assert_eq(#vap_table, 1, "only the PSK WLAN survives")
 			assert_eq(vap_table[1].ssid, "guest", "the Enterprise WLAN was dropped, not mis-provisioned")
 			assert_eq(vap_table[1].security, "wpa2", "the PSK WLAN is unaffected")
+		end
+	},
+	{
+		name = "inform packet: a WPA-Enterprise WLAN is provisioned with its RADIUS servers",
+		fn = function()
+			-- The wire DOES carry the RADIUS configuration: 10.6.106's AP config
+			-- builder emits aaa.<n>.radius.auth.<k>.{ip,port,secret} and UAP
+			-- 6.8.2's ubntbox turns them into auth_server_addr/port/shared_secret.
+			-- No device capability gates a WPA2-Enterprise WLAN, so this arrives
+			-- whether openUF asks for it or not.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.port=1812\n"
+				.. "aaa.1.radius.auth.1.secret=s3cret\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 1, "the Enterprise WLAN is provisioned")
+			local v = vap_table[1]
+			assert_eq(v.security, "wpa2-enterprise", "security")
+			assert_eq(#v.radius.auth, 1, "one auth server")
+			assert_eq(v.radius.auth[1].ip, "192.0.2.10", "ip")
+			assert_eq(v.radius.auth[1].port, "1812", "port")
+			assert_eq(v.radius.auth[1].secret, "s3cret", "secret")
+			assert_eq(#v.radius.acct, 0, "no accounting server was sent")
+			assert_nil(v.radius.interim_interval, "no interim updates")
+			assert_nil(v.radius.dynamic_vlan, "no dynamic VLAN")
+			assert_nil(v.x_passphrase, "an EAP WLAN carries no passphrase")
+			assert_nil(v.ppsk, "and no private keys")
+		end
+	},
+	{
+		name = "inform packet: the EAP akm and the wpa3 keys pick the enterprise security value",
+		fn = function()
+			-- The akm alone cannot tell WPA3-Enterprise from transition: the
+			-- authoritative keys are wpa3.support/.transition, exactly as on the
+			-- PSK side. 192-bit is tested first, since it implies wpa3.support.
+			local function sec(extra, mgmt)
+				local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\n"
+					.. "aaa.1.wpa.key.1.mgmt=" .. (mgmt or "WPA-EAP") .. "\n"
+					.. "aaa.1.radius.auth.1.ip=192.0.2.10\n"
+					.. "aaa.1.radius.auth.1.secret=s3cret\n"
+					.. extra
+					.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+				local vt
+				with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(sys_cfg)
+				end)
+				assert_eq(#vt, 1, "provisioned")
+				return vt[1]
+			end
+			assert_eq(sec("").security, "wpa2-enterprise", "plain WPA-EAP")
+			assert_eq(sec("aaa.1.wpa3.support=enabled\n").security,
+				"wpa3-enterprise", "wpa3.support alone")
+			assert_eq(sec("aaa.1.wpa3.support=enabled\naaa.1.wpa3.transition=enabled\n")
+				.security, "wpa2/wpa3-enterprise", "transition")
+			assert_eq(sec("aaa.1.wpa3.support=enabled\naaa.1.wpa3.enhanced_192=enabled\n")
+				.security, "wpa3-enterprise-192", "enhanced_192 wins over wpa3.support")
+			assert_eq(sec("", "WPA-EAP-SUITE-B-192").security, "wpa3-enterprise-192",
+				"the Suite-B akm alone is enough")
+			-- FT-EAP contains "EAP", so it must still be an enterprise WLAN,
+			-- and the existing 802.11r field is what carries fast roaming.
+			local v = sec("aaa.1.ft.status=enabled\n", "FT-EAP")
+			assert_eq(v.security, "wpa2-enterprise", "FT-EAP is still WPA2-Enterprise")
+			assert_true(v.fast_roaming_enabled, "and fast roaming is on")
+		end
+	},
+	{
+		name = "inform packet: RADIUS servers are read in index order, with defaults and validation",
+		fn = function()
+			-- The tokenizer keeps the whole dotted path as one flat key, so the
+			-- per-server indices have to be re-matched and sorted; the controller
+			-- does not emit them in order. A server that cannot be used is
+			-- dropped individually, never silently repaired.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.3.ip=192.0.2.30\naaa.1.radius.auth.3.secret=c\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.auth.4.ip=not-an-ip\naaa.1.radius.auth.4.secret=d\n"
+				.. "aaa.1.radius.auth.2.ip=192.0.2.20\naaa.1.radius.auth.2.secret=\n"
+				.. "aaa.1.radius.auth.5.ip=192.0.2.50\naaa.1.radius.auth.5.secret=e\n"
+				.. "aaa.1.radius.auth.5.tls=true\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_contains(logged, "dropping RADIUS auth server 4",
+				"the malformed address is named")
+			assert_true(logged:find("s3cret", 1, true) == nil
+				and logged:find("secret=", 1, true) == nil,
+				"no secret value is ever logged")
+			local auth = vap_table[1].radius.auth
+			assert_eq(#auth, 2, "the malformed, secretless and RadSec servers are dropped")
+			assert_eq(auth[1].ip, "192.0.2.10", "index 1 first")
+			assert_eq(auth[2].ip, "192.0.2.30", "then index 3")
+			assert_eq(auth[1].port, "1812", "an absent port defaults to 1812")
+		end
+	},
+	{
+		name = "inform packet: RADIUS accounting, interim updates, dynamic VLAN and NAS id",
+		fn = function()
+			local base = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+			local tail = "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local function r(extra)
+				local vt
+				with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(base .. extra .. tail)
+				end)
+				assert_eq(#vt, 1, "provisioned")
+				return vt[1].radius
+			end
+			local rad = r("aaa.1.radius.acct.1.ip=192.0.2.11\n"
+				.. "aaa.1.radius.acct.1.secret=b\n"
+				.. "aaa.1.interim_update.status=enabled\n"
+				.. "aaa.1.interim_update.interval=600\n"
+				.. "aaa.1.dynamic_vlan=2\naaa.1.nas_identifier=ap-office\n")
+			assert_eq(#rad.acct, 1, "one accounting server")
+			assert_eq(rad.acct[1].port, "1813", "accounting defaults to 1813")
+			assert_eq(rad.interim_interval, "600", "the pushed interval")
+			assert_eq(rad.dynamic_vlan, "2", "required")
+			assert_eq(rad.nas_id, "ap-office", "NAS id")
+			-- status with no interval is the firmware's 3600 default; status
+			-- off means "do not send interim updates", not "use 3600".
+			assert_eq(r("aaa.1.interim_update.status=enabled\n").interim_interval, "3600",
+				"default interval")
+			assert_nil(r("aaa.1.interim_update.status=disabled\n"
+				.. "aaa.1.interim_update.interval=600\n").interim_interval,
+				"disabled means none")
+			assert_nil(r("aaa.1.dynamic_vlan=0\n").dynamic_vlan, "0 is no dynamic VLAN")
+			assert_nil(r("").dynamic_vlan, "absent is no dynamic VLAN")
+		end
+	},
+	{
+		name = "inform packet: a WPA-Enterprise WLAN whose every RADIUS server is RadSec is skipped",
+		fn = function()
+			-- RadSec cannot be completed: the controller sends only the cert
+			-- FILENAMES, for files it transfers by another channel. Contacting
+			-- such a server as plain RADIUS would put the secret on the wire in
+			-- the clear, so the server is dropped -- and with no server left the
+			-- WLAN is skipped, like any other unprovisionable Enterprise WLAN.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.auth.1.tls=true\n"
+				.. "aaa.1.radius.auth.1.ca_cert=ca.pem\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 0, "no usable server left, so no WLAN")
+			assert_contains(logged, "RadSec (tls) is not supported", "the reason is named")
+			assert_contains(logged, "no usable RADIUS authentication server",
+				"and the skip says why")
+		end
+	},
+	{
+		name = "inform packet: the deferred RADIUS keys derive nothing and do not block the WLAN",
+		fn = function()
+			-- Dynamic Authorization (das/dad), RADIUS MAC authentication and the
+			-- RadSec cert filenames are deliberately not implemented. This pins
+			-- that: they must not appear as fields anything downstream could key
+			-- on, and their presence must not stop the WLAN being provisioned.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.das.status=enabled\naaa.1.radius.das.port=3801\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\naaa.1.radius.das.secret=b\n"
+				.. "aaa.1.radius.dad.status=enabled\n"
+				.. "aaa.1.radius.dad.client.1.cidr=192.0.2.11/32\n"
+				.. "aaa.1.radius.macacl.status=enabled\naaa.1.radius.macacl.format=none\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 1, "the WLAN is still provisioned")
+			local rad = vap_table[1].radius
+			assert_eq(#rad.auth, 1, "only the auth server was read")
+			assert_nil(rad.das, "no das field")
+			assert_nil(rad.dad, "no dad field")
+			assert_nil(rad.macacl, "no macacl field")
+			assert_nil(vap_table[1].mac_filter_policy,
+				"radius.macacl is not the MAC Address Filter")
 		end
 	},
 	{
@@ -2421,6 +2611,91 @@ return {
 			assert_true(s2 ~= nil, "vap section created")
 			assert_true(s2.ieee80211r ~= "1",
 				"the pre-0x2 push (both FT keys disabled) leaves 802.11r off")
+		end
+	},
+	{
+		-- Verbatim lab capture (controller 10.6.106, 2026-10-26): a wlanconf
+		-- with security="wpaeap" pointing at a radiusprofile that has two auth
+		-- servers, one acct server, interim updates and vlan_wlan_mode
+		-- "required". Addresses and the iapp_key are scrubbed to placeholders;
+		-- nothing else is edited. Two traps this capture pins down:
+		--   * aaa.<n>.wpa.psk is STILL sent on an EAP WLAN ("letmeinnow", a
+		--     dummy the controller fills in). Carrying it into UCI would give
+		--     the BSS a passphrase it must not have.
+		--   * wireless.<n>.security=none on the same push. The discriminator
+		--     is aaa.<n>.wpa.key.<k>.mgmt, never that field.
+		name = "inform packet: captured WPA-Enterprise push reaches UCI as wpa2+ccmp with RADIUS servers",
+		fn = function()
+			local ucihelper, db = new_apply_env()
+			local sys_cfg = table.concat({
+				"aaa.1.pmf.status=disabled", "aaa.1.pmf.mode=0",
+				"aaa.1.ft.status=disabled", "aaa.1.country_beacon=disabled",
+				"aaa.1.11k.status=disabled", "aaa.1.br.devname=br0",
+				"aaa.1.devname=ath0", "aaa.1.driver=madwifi",
+				"aaa.1.ssid=openuf-eap", "aaa.1.status=enabled",
+				"aaa.1.verbose=2", "aaa.1.wpa=2", "aaa.1.eapol_version=2",
+				"aaa.1.wpa.group_rekey=3600", "aaa.1.p2p=disabled",
+				"aaa.1.p2p_cross_connect=disabled", "aaa.1.proxy_arp=disabled",
+				"aaa.1.is_guest=false", "aaa.1.tdls_prohibit=disabled",
+				"aaa.1.bss_transition=enabled", "aaa.1.id=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+				"aaa.1.wpa.psk=letmeinnow",
+				"aaa.1.auth_cache=enabled",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.port=1812",
+				"aaa.1.radius.auth.1.secret=openufradius",
+				"aaa.1.radius.auth.2.ip=192.0.2.11",
+				"aaa.1.radius.auth.2.port=1812",
+				"aaa.1.radius.auth.2.secret=openufradius",
+				"aaa.1.radius.acct.1.ip=192.0.2.10",
+				"aaa.1.radius.acct.1.port=1813",
+				"aaa.1.radius.acct.1.secret=openufradius",
+				"aaa.1.interim_update.status=enabled",
+				"aaa.1.interim_update.interval=900",
+				"aaa.1.dynamic_vlan=2",
+				"aaa.1.hs20.status=disabled",
+				"aaa.1.wpa.1.pairwise=CCMP",
+				"aaa.1.pmf.cipher=AES-128-CMAC",
+				"aaa.1.radius.macacl.status=disabled",
+				"aaa.1.hide_ssid=false",
+				"aaa.1.iapp_key=00112233445566778899aabbccddeeff",
+				"wireless.1.mode=master", "wireless.1.devname=ath0",
+				"wireless.1.id=2", "wireless.1.status=enabled",
+				"wireless.1.authmode=1", "wireless.1.l2_isolation=disabled",
+				"wireless.1.is_guest=false", "wireless.1.security=none",
+				"wireless.1.ssid=openuf-eap", "wireless.1.hide_ssid=false",
+				"wireless.1.wmm=enabled", "wireless.1.uapsd=disabled",
+				"wireless.1.parent=radio0", "wireless.1.usage=user",
+				"radio.1.phyname=radio0", "radio.1.devname=ath0",
+				"radio.1.channel=auto", "radio.1.status=enabled",
+			}, "\n") .. "\n"
+
+			local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vt[1].security, "wpa2-enterprise",
+				"WPA-EAP without any wpa3 key -> wpa2-enterprise")
+			assert_nil(vt[1].x_passphrase,
+				"the dummy aaa.1.wpa.psk never becomes a passphrase")
+			assert_eq(vt[1].radius.auth[2].ip, "192.0.2.11",
+				"both auth servers parsed, in index order")
+			assert_eq(vt[1].radius.interim_interval, "900", "interim interval parsed")
+			assert_eq(vt[1].radius.dynamic_vlan, "2",
+				"vlan_wlan_mode=required reaches the wire as dynamic_vlan=2")
+
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			local s = db.wireless["openuf_radio0_openuf_eap_"
+				.. ucihelper.derive_mobility_domain("openuf-eap")]
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.encryption, "wpa2+ccmp",
+				"wpa2-enterprise -> the encryption ucode maps to auth_type eap")
+			assert_nil(s.key, "no passphrase on an EAP BSS")
+			assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10 192.0.2.11",
+				"both auth servers in the list (same port and secret)")
+			assert_eq(s.auth_server_port, "1812", "auth port")
+			assert_eq(s.auth_server_shared_secret, "openufradius", "auth secret")
+			assert_eq(table.concat(s.acct_server_addr, " "), "192.0.2.10", "acct server")
+			assert_eq(s.acct_server_port, "1813", "acct port")
+			assert_eq(s.radius_acct_interim_interval, "900", "interim interval")
+			assert_eq(s.dynamic_vlan, "2", "dynamic VLAN required")
 		end
 	},
 	{

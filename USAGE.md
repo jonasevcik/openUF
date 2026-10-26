@@ -529,7 +529,7 @@ Settings carried through from the controller:
 | SAE tuning | `sae.anti_clogging` → `sae_anti_clogging_threshold`, `sae.sync` → `sae_sync` (both as `hostapd_bss_options` raw lines), `sae.groups` → `sae_groups`; only on `sae`/`sae-mixed`. Needs the ucode wifi generator (24.10+). The controller sets them over REST only (`sae_anti_clogging`, `sae_sync`, `sae_groups`) |
 | Enhanced Open (OWE) | `encryption=owe`, from `wpa.key.1.mgmt=OWE` with no `aaa.<n>.wpa`. **Transition mode** arrives as two VAPs per radio with the same SSID (open + hidden OWE, linked by `owe_devname`). openUF writes them as one section with `owe_transition=1`, and OpenWrt's ucode generator (24.10+) builds both BSSes from it, naming the hidden one `<ssid>OWE`. Depends on openUF advertising `radio_caps2` bit `0x8`, which it does when `hostapd -vowe` passes |
 | Private Pre-Shared Keys | One `wifi-station` section per key (`openuf_<vap>_psk<k>`: `iface` = the VAP's section, `mac` = `00:00:00:00:00:00`, `key`, `vid` unless the key's network is VLAN 1) and one `wifi-vlan` per VLAN (`openuf_<vap>_vlan<vid>`: `name`/`vid` = the VLAN id, `network` = `openuf_vlan<vid>`), plus `dynamic_vlan=1` on the VAP, from `aaa.<n>.wpa.psk_file.<k>.psk`/`.vlanid`. OpenWrt turns them into hostapd's `wpa_psk_file` and `vlan_file`; the client's netdev is `<vap ifname>-<vid>`. The WLAN's own `wpa.psk` (a random passphrase the controller generates) stays the section's `key`. Needs a hostapd with VLAN support (the full `wpad-*` builds have it) and a `lan_cpueth` to build the VLANs on. `psk_radius=2` (keys from RADIUS only) skips the WLAN. The controller's `sae_psk` list (`sae.psk.<n>.psk/.mac/.vlan/.id`) feeds the same sections: with a `mac` the `wifi-station` carries that MAC instead of `00:00:00:00:00:00`; the `ff:ff:ff:ff:ff:ff` entry is the WLAN's own key and is skipped; a key also sent as `psk_file` is created once |
-| WPA-Enterprise (802.1X) | **not supported** — the WLAN is skipped and logged. The wire protocol carries no RADIUS server/port/secret to write, so there is nothing openUF could provision |
+| WPA-Enterprise (802.1X / RADIUS) | `encryption=wpa2+ccmp` / `wpa3` / `wpa3-mixed` / `wpa3-192`, chosen from the EAP AKM plus `wpa3.support`/`wpa3.transition`/`wpa3.enhanced_192` — the generator turns those into `auth_type` `eap`/`eap2`/`eap-eap2`/`eap192`. (`encryption=eap` looks right and is not: `auth_type` comes out `eap` but no `wpa` wildcard matches, so the BSS gets `wpa=0`.) Servers from `aaa.<n>.radius.auth.<k>.{ip,port,secret}` → `auth_server_addr` (list) / `auth_server_port` / `auth_server_shared_secret`, the `acct` twin → `acct_server_*`, `interim_update.{status,interval}` → `radius_acct_interim_interval`, `nas_identifier` → `nas_identifier`, `dynamic_vlan` → `dynamic_vlan`. No passphrase is ever written: the controller still sends a dummy `aaa.<n>.wpa.psk` on an EAP WLAN, and `wireless.<n>.security` reads `none` on the same push — neither is the discriminator. `ieee8021x`, `eapol_version` and the EAP key-mgmt list are the generator's own, so openUF writes none of them. `psk_radius=2` (PSK-from-RADIUS) is still skipped — that is a different feature |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
 | Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged. Both keys arrive `disabled` on a WPA3-only WLAN unless openUF advertises `radio_caps2` bit `0x2`, which it does wherever it advertises `0x1`. Key holders: `r0kh`/`r1kh` wildcard lists keyed with `aaa.<n>.iapp_key` (see below). Also `pmk_r1_push=1`, `reassociation_deadline=3000`, as UniFi firmware |
 | BSS Transition (802.11v) | `bss_transition` — **needs a full `wpad` build** |
@@ -600,6 +600,34 @@ shows the width, which was right) and visible only in `iw dev`. An explicit
 > when the name had to be altered at all — `corp` stays `openuf_radio0_corp`. Without it,
 > two SSIDs differing only in punctuation (`Guest WiFi` and `Guest-WiFi`) sanitized onto
 > one section and the second silently overwrote the first.
+
+**WPA-Enterprise: two narrowings worth knowing before you enable it.** Both are
+limits of what the UCI schema can express, not of the RADIUS config the
+controller sends.
+
+- **One port and one shared secret per server list.** OpenWrt's generator writes
+  `auth_server_port`/`auth_server_shared_secret` once and reuses them for every
+  address in `auth_server_addr`, so two servers that differ in either cannot be
+  expressed. openUF takes the port and secret from the **first** server, puts
+  every later server that agrees into the list, and drops the rest with a log
+  line naming the index (never the secret). Same for accounting. A RadSec/TLS
+  server (`radius.*.tls`) is dropped too: the controller sends only the
+  *filenames* of certificates it transfers by another channel, so the server
+  cannot be completed, and treating it as plain RADIUS would put the shared
+  secret on the wire in the clear. A WLAN whose every auth server is dropped is
+  skipped loudly rather than brought up as a BSS nobody can join.
+- **A RADIUS-assigned VLAN only works for VLANs this AP already has.** openUF
+  passes the profile's mode through as `dynamic_vlan` (1 optional / 2 required)
+  but writes no `wifi-vlan` section for it — the push enumerates no VLANs, so
+  there is nothing to build them from. hostapd's VLAN map therefore holds only
+  the VLANs the WLAN itself or a private pre-shared key brought. With
+  "RADIUS assigned VLAN: required" a station assigned anything else is refused.
+  That is deliberate: failing closed beats putting the client on the wrong
+  network, past the segmentation the setting exists for.
+
+Not implemented, and silently ignored rather than half-applied: DAS/CoA
+(`radius.das.*`/`radius.dad.*`), RADIUS MAC authentication
+(`radius.macacl.*`), and RadSec certificates.
 
 **Fast Roaming (802.11r) and the `ft_psk_generate_local` trap.** openUF sets
 `ieee80211r`, a `mobility_domain` derived from the SSID (so every AP computes the same one
@@ -1533,6 +1561,10 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | openUF does not start; `logread` says "not starting: /usr/sbin/hostapd has no 802.11v" | Deliberate: with a `wpad-basic-*` build every controller-pushed WLAN would take its radio down, so the init script refuses and the device's own WiFi keeps working. Swap in a full build as in the row above, then `/etc/init.d/openuf start` |
 | An Enhanced Open WLAN is missing from the AP, or a transition one is plain open | The radio does not claim `radio_caps2` bit `0x8`. Check `hostapd -vowe; echo $?` (must print 0; `wpad-basic-*` or `-mini` builds may lack OWE) and that `/usr/share/ucode/wifi/hostapd.uc` exists (OpenWrt 24.10+). Force Provision after fixing it |
 | A WLAN with Private Pre-Shared Keys is missing, or a key does not work | Missing: openUF does not claim `wifi_caps` bit `0x100000` (the controller logs "PPSK is not supported … will be skipped"). `grep -c vlanid= /usr/share/ucode/wifi/ap.uc` and `grep -c "from wpa_psk_file" /usr/sbin/hostapd` must both be non-zero. A VLAN key does not work: `uci show wireless | grep psk` should list it, `cat /var/run/hostapd-<ifname>.psk` should have its `vlanid=` line, and `logread | grep "from wpa_psk_file"` shows the VLAN hostapd assigned. openUF logs a key it left out because the VLAN had no network |
+| A WPA-Enterprise WLAN is on the air but no client can authenticate | Read hostapd's own truth: `grep -E "wpa_key_mgmt\|auth_server_addr\|auth_server_port\|acct_server_addr\|radius_acct_interim_interval\|dynamic_vlan\|nas_identifier\|wpa_passphrase" /var/run/hostapd-phy*.conf`. Expect `wpa_key_mgmt=WPA-EAP` (plus `FT-EAP` with 802.11r), the server lines, and **no** `wpa_passphrase`. `logread \| grep -i radius` shows what hostapd made of each exchange. If the server lines are there but nothing is answered, the AP cannot reach the server, or its shared secret differs — the server's own log is the place to look, and openUF never logs a secret |
+| A WPA-Enterprise WLAN exists but `hostapd-phy*.conf` has no `auth_server_addr` | A `wpad-basic-*` build: it has no RADIUS client. openUF logs `WLAN "<ssid>" is WPA-Enterprise, but this hostapd has no RADIUS client` and provisions anyway, since the controller applies no capability gate here. `grep -c auth_server_addr /usr/sbin/hostapd` must be non-zero; swap in a full `wpad-*` as in the `bss_transition` row above |
+| A WPA-Enterprise WLAN is skipped with `no usable RADIUS authentication server` | Every server the profile names was dropped. The log line gives the reason per index: a RadSec/TLS server (not supported), no usable IPv4 address, or a missing/oversized shared secret. A second server dropped for `has its own port/secret` is the schema limit described in § 6 |
+| EAP clients authenticate but are then refused | The RADIUS profile has "RADIUS assigned VLAN: required" (`dynamic_vlan=2` in `hostapd-phy*.conf`) and the server returned a VLAN this AP has no network for — `cat /var/run/hostapd-<ifname>.vlan` lists the only ones it can honour. Set the mode to optional, or put the WLAN on a network that already carries those VLANs |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Airtime Fairness switch does nothing | `ls /sys/kernel/debug/ieee80211/phy*/airtime_flags` must list a file per radio. Without it openUF does not claim `wifi_caps` bit `0x20` and the controller sends no `atf.*` at all (debugfs not mounted, or a kernel without `CONFIG_MAC80211_DEBUGFS`). `cat` it after a push: two flag names for on, none for off. A driver that does not schedule through mac80211 TXQs ignores the flags |
 | No "Possible interference" warning, ever | Only ath9k radios report the counters it needs. `cat /sys/kernel/debug/ieee80211/phy*/ath9k/interrupt` shows `GTT` (tx timeouts) and `CST` (carrier-sense timeouts); the controller warns when either rises faster than 10 per second, at most every 5 minutes per radio. A healthy radio stays far below that. ath10k and mt76 keep no such counters, so their radios never warn. Debugfs must be mounted, as it is on OpenWrt by default |
