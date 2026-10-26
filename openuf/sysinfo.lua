@@ -1009,6 +1009,32 @@ function M.eap_supported()
 	return found
 end
 
+M._hs20_supported_cache = nil
+
+--- Can this device run Hotspot 2.0 / Passpoint: ANQP/GAS answers, the
+--- Interworking element and the HS 2.0 indication element?
+---
+--- Claimed to the controller as fw_caps 0x800000 (supportHotspot2). Unlike
+--- M.eap_supported this IS a capability bit, because the controller drops a
+--- Hotspot 2.0 WLAN outright without it ("Hotspot 2 cannot provision OSEN on
+--- ... " in 10.6.106's ubntconf/LsyaJoEysWb), so claiming it where it cannot be
+--- honoured would produce a WLAN that advertises Passpoint and answers no ANQP
+--- query. Both halves are needed: the generator must know the interworking
+--- options (ap.uc, iface_interworking/iface_hs20, OpenWrt 24.10+) and the
+--- binary must be built with CONFIG_HS20 -- a build without it has no
+--- hs20_conn_capab option and would ignore every hs20_* line.
+function M.hs20_supported()
+	if M._hs20_supported_cache ~= nil then return M._hs20_supported_cache end
+	local found = false
+	local gen = M._read_file("/usr/share/ucode/wifi/ap.uc")
+	if gen and gen:find("iw_enabled", 1, true) then
+		found = M._run_cmd("grep -qF 'hs20_conn_capab' /usr/sbin/hostapd && echo yes")
+			:find("yes", 1, true) ~= nil
+	end
+	M._hs20_supported_cache = found
+	return found
+end
+
 -- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for every
 -- radio on every heartbeat, although it describes the HARDWARE plus the
 -- regulatory domain and changes only with the latter. Cached per phy with a

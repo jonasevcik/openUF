@@ -1977,7 +1977,22 @@ function M.build_json(st, cfg, ufhw)
 		-- wlansched.lua. 0x400000 (schedule_invert) stays unclaimed: the
 		-- controller then inverts the blackout windows into on-times
 		-- itself, the form the 4.0.15 firmware reads.
-		fw_caps          = 0x1110,
+		-- Bit 0x800000 (8388608): supportHotspot2(). Without it the
+		-- controller refuses to provision a WLAN with a Hotspot 2.0
+		-- profile attached AT ALL -- ubntconf/LsyaJoEysWb returns null
+		-- for it, logging "Hotspot 2 cannot provision OSEN on ..." --
+		-- so the whole aaa.<n>.hs20.* keyspace is unreachable without
+		-- the claim. Claimed only where hostapd can actually answer
+		-- ANQP (sysinfo.hs20_supported: the ucode generator knows the
+		-- interworking options AND the binary was built with
+		-- CONFIG_HS20), because the alternative to a dropped WLAN is a
+		-- WLAN that advertises Passpoint and answers nothing. 0x100000
+		-- (RADIUS Dynamic Authorization, CoA/disconnect) stays
+		-- unclaimed: with it the controller would add radius.das.* /
+		-- radius.dad.* to every accounting WLAN with Hotspot 2.0 on,
+		-- and openUF implements no CoA listener.
+		fw_caps          = 0x1110
+			+ ((M._sysinfo.hs20_supported and M._sysinfo.hs20_supported()) and 0x800000 or 0),
 		-- wifi_caps, the first WiFi bitmask. Bit 0x4 is
 		-- Device.supportBandsteering(): without it the controller never emits
 		-- the device-level bandsteering.* block (the AP's own Band Steering
@@ -2025,6 +2040,31 @@ function M.build_json(st, cfg, ufhw)
 		-- features (Mesh MLO parent/child and others, see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
 		wifi_caps2       = 0x60 + (M._assoc_enabled(st, cfg) and 0x2000 or 0),
+		-- fw2_caps, a THIRD firmware bitmask (hyFnQ.getFirmware2Capabilities
+		-- reads the field "fw2_caps"), sent only for its one needed bit.
+		--
+		-- Bit 0x80000 (524288): supportsRadSec(). openUF does NOT implement
+		-- RadSec, and this is claimed anyway, for one reason: the REST
+		-- validator that admits a Hotspot 2.0 profile onto a WLAN
+		-- (com/ubnt/service/W/ctfbDsCjrxgkv) tests
+		-- supportsHotspot2Passpoint() = supportHotspot2() AND
+		-- supportsRadSec(), and rejects the whole request with
+		-- api.err.DevicePasspointNotSupported otherwise -- so on 10.6.106
+		-- Passpoint is unreachable without it, bit 0x800000 or not.
+		-- Claimed only alongside that bit (same probe) so it never appears
+		-- on a device that cannot do Passpoint at all.
+		--
+		-- What claiming it actually changes on the wire: for a RADIUS server
+		-- whose profile has TLS on, the controller adds
+		-- aaa.<n>.radius.{auth,acct}.<k>.{ca_cert,client_cert,private_key,
+		-- private_key_passwd} -- FILENAMES of files it transfers by another
+		-- channel. _wire_radius drops such a server with a log rather than
+		-- speaking plain RADIUS to a RadSec port. That is strictly better
+		-- than the behaviour without the bit, where the same server arrives
+		-- as a bare ip/port/secret, indistinguishable from a plaintext one,
+		-- and its shared secret goes out in the clear.
+		fw2_caps         = (M._sysinfo.hs20_supported and M._sysinfo.hs20_supported())
+			and 0x80000 or 0,
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		-- Device-level Experience: the VAP scores weighted by their client
 		-- counts (calc_ap_satisfaction, see satisfaction.lua). The controller
@@ -2276,8 +2316,11 @@ end
 --   * radius.macacl.*              -- RADIUS MAC authentication
 --   * radius.auth|acct.<k>.{ca_cert,client_cert,private_key,private_key_passwd}
 --     -- RadSec. The controller sends only FILENAMES, for files it transfers
---     by another channel, so it cannot be completed here. A server flagged
---     .tls is therefore dropped rather than contacted in the clear.
+--     by another channel, so it cannot be completed here. Their presence is
+--     what marks a server as RadSec (there is no .tls key), and such a server
+--     is dropped rather than contacted with its secret in the clear. They
+--     arrive only because openUF claims fw2_caps 0x80000 for the Passpoint
+--     gate; see build_json.
 --
 -- Returns a table, or nil plus a reason naming what was missing. Secrets are
 -- never written to any log line.
@@ -2295,8 +2338,15 @@ local function _wire_radius(a)
 			local ip, secret = a[pfx .. "ip"], a[pfx .. "secret"]
 			local port = _wire_posint(a[pfx .. "port"]) or default_port
 			local why
-			if _wire_bool(a[pfx .. "tls"]) then
-				why = "RadSec (tls) is not supported"
+			-- RadSec. There is NO aaa.<n>.radius.<kind>.<k>.tls key: the
+			-- emitter writes only the cert FILENAMES, and only when
+			-- supportsRadSec() (fw2_caps 0x80000, which openUF claims for the
+			-- Passpoint gate -- see build_json). Their presence is therefore
+			-- the whole discriminator, and the server is dropped rather than
+			-- contacted with a shared secret in the clear.
+			if a[pfx .. "ca_cert"] or a[pfx .. "client_cert"]
+					or a[pfx .. "private_key"] then
+				why = "RadSec (TLS) is not supported"
 			elseif not netconfig.is_ipv4(ip) then
 				why = "no usable IPv4 address"
 			elseif type(secret) ~= "string" or secret == "" or #secret > 64 then
@@ -2328,6 +2378,194 @@ local function _wire_radius(a)
 		dynamic_vlan = dynamic_vlan,
 		nas_id = a.nas_identifier,
 	}
+end
+
+-- Free text from a controller-side profile (a venue or operator name, a realm,
+-- a URL) on its way to a hostapd config FILE. A control character -- a newline
+-- above all -- would end the line and let the rest be read as further hostapd
+-- options, so anything carrying one is dropped rather than sanitised. 128 is
+-- the controller's own cap on every one of these fields.
+local function _wire_text(v, maxlen)
+	if type(v) ~= "string" or v == "" or #v > (maxlen or 128) then return nil end
+	if v:find("%c") then return nil end
+	return v
+end
+
+-- A whole number within [lo, hi], as a string; nil when absent or out of range.
+local function _wire_range(v, lo, hi)
+	if type(v) ~= "string" or not v:match("^%d+$") or #v > 10 then return nil end
+	local n = tonumber(v)
+	if n < lo or n > hi then return nil end
+	return tostring(n)
+end
+
+-- Collect aaa.<n>.hs20.<prefix>.<k>.* into an index-ordered array. The
+-- tokenizer keeps the whole dotted tail as one flat key, so a sub-indexed
+-- block is read by re-matching it (same shape as sae.groups / wpa.psk_file).
+local function _wire_indexed(a, pattern, build)
+	local idxs = {}
+	for k in pairs(a) do
+		local i = k:match(pattern)
+		if i then idxs[#idxs + 1] = tonumber(i) end
+	end
+	table.sort(idxs)
+	local out = {}
+	for _, i in ipairs(idxs) do
+		local e = build(i)
+		if e then out[#out + 1] = e end
+	end
+	return #out > 0 and out or nil
+end
+
+-- aaa.<n>.hs20.* -- Hotspot 2.0 / Passpoint.
+--
+-- Reachable only because openUF claims fw_caps 0x800000 and fw2_caps 0x80000
+-- (see build_json): without them the controller drops the whole WLAN.
+--
+-- The emitter (10.6.106 com/ubnt/service/config/VAZShipWTNxlo) knows a wider
+-- keyspace than the controller can actually be made to send. A WLAN's Hotspot
+-- 2.0 settings live in the wlanconf's own embedded `hotspot2` object, and
+-- api/fields/WlanConf.json's schema for it is a SUBSET of the standalone
+-- api/fields/Hotspot2Conf.json template: it has no hessid, anqp_domain_id,
+-- network_auth_type/url, disable_dgaf, deauth_req_timeout, t_c_filename/
+-- timestamp, osu_ssid, osu.*, icon.*, gas_comeback_delay/gas_frag_limit or
+-- qos.map.*/qos.exception.* at all. A full-profile push (lab capture, every
+-- field the subset allows filled) carried exactly the keys read below and
+-- none of the others. So the rest is deliberately NOT read: there is no
+-- producer to test a consumer against.
+--
+-- Independently unimplementable even if they did arrive:
+--   * osu.* / icon.*  -- the installed hostapd (wpad-mbedtls 2025.08.26,
+--     hostapd v2.12-devel) carries no osu_server_uri, osu_ssid or hs20_icon
+--     option at all: the OSU/OSEN online-signup pieces are not built in.
+--     Verified by string search on /usr/sbin/hostapd on both APs.
+--   * t_c_filename / t_c_timestamp -- hostapd serves the Terms and Conditions
+--     file from disk, and the controller transfers it by another channel.
+--
+-- Returns a table, or nil when Hotspot 2.0 is off for this WLAN.
+local function _wire_hs20(a)
+	if not _wire_bool(a["hs20.status"]) then return nil end
+
+	local function k(suffix) return a["hs20." .. suffix] end
+
+	local hs = {
+		-- Interworking element. access_network_type is the 4-bit ANQP field
+		-- (0 private, 2 chargeable public, 3 free public ...).
+		access_network_type = _wire_range(k("access_network_type"), 0, 15),
+		internet            = _wire_bool(k("internet")),
+		asra                = _wire_bool(k("asra")),
+		uesa                = _wire_bool(k("uesa")),
+		venue_group         = _wire_range(k("venue_group"), 0, 11),
+		venue_type          = _wire_range(k("venue_type"), 0, 255),
+		-- Downstream Group-Addressed Forwarding. Sent twice, as
+		-- aaa.<n>.hs20.disable_dgaf and wireless.<n>.dgaf_disable, from the
+		-- same wlanconf field; this one is read and the other ignored.
+		disable_dgaf        = _wire_bool(k("disable_dgaf")),
+		deauth_req_timeout  = _wire_range(k("deauth_req_timeout"), 1, 3600),
+		-- IP Address Type Availability: (v4 << 2) | v6, already combined by
+		-- the controller (ipaddr_type_avail_v4 0-7, _v6 0-2).
+		ipaddr_type_avail   = _wire_range(k("network_availability"), 0, 31),
+		-- Already a comma-separated list on the wire, which is exactly
+		-- hostapd's domain_name format.
+		domain_name         = _wire_text(k("hs20_domain_name_list"), 1024),
+	}
+
+	-- aaa.<n>.hs20.esr is sent and deliberately dropped: the live ucode
+	-- generator (ap.uc, iface_interworking) never appends `esr`, although the
+	-- schema declares iw_esr as an alias for it, so the option would be stored
+	-- in UCI and silently discarded. Writing it would be a consumer keyed on a
+	-- producer that does not exist.
+
+	hs.venue_name = _wire_indexed(a, "^hs20%.venue_name%.(%d+)%.name$", function(i)
+		local p = "hs20.venue_name." .. i .. "."
+		local lang, name = _wire_text(a[p .. "lang"], 3), _wire_text(a[p .. "name"])
+		if not (lang and name) then return nil end
+		return {lang = lang, name = name, url = _wire_text(a[p .. "url"], 1024)}
+	end)
+
+	hs.nai_realm = _wire_indexed(a, "^hs20%.nai_realm%.(%d+)%.name$", function(i)
+		local p = "hs20.nai_realm." .. i .. "."
+		if a[p .. "status"] and not _wire_bool(a[p .. "status"]) then return nil end
+		local name = _wire_text(a[p .. "name"])
+		local eap  = _wire_range(a[p .. "eap_method"], 1, 255)
+		if not (name and eap) then return nil end
+		-- The auth parameters are a THIRD level down, under
+		-- aaa.<n>.hs20.nai_realm.<i>.eap_method.auth.<j>.{id,val}.
+		local auth = _wire_indexed(a, "^hs20%.nai_realm%." .. i
+			.. "%.eap_method%.auth%.(%d+)%.id$", function(j)
+			local q = p .. "eap_method.auth." .. j .. "."
+			local id  = _wire_range(a[q .. "id"], 1, 255)
+			local val = _wire_range(a[q .. "val"], 0, 255)
+			if not (id and val) then return nil end
+			return {id = id, val = val}
+		end)
+		return {
+			encoding = _wire_range(a[p .. "encoding"], 0, 1) or "0",
+			name = name, eap_method = eap, auth = auth,
+		}
+	end)
+
+	-- Note the index position: the key is hs20.<k>.roaming_consortium, not
+	-- hs20.roaming_consortium.<k>.
+	hs.roaming_consortium = _wire_indexed(a, "^hs20%.(%d+)%.roaming_consortium$",
+		function(i)
+			local oi = a["hs20." .. i .. ".roaming_consortium"]
+			-- An Organization Identifier is 3 to 15 octets of hex (hostapd
+			-- rejects anything else outright).
+			if type(oi) ~= "string" or not oi:match("^%x+$")
+					or #oi % 2 ~= 0 or #oi < 6 or #oi > 30 then
+				return nil
+			end
+			return oi
+		end)
+
+	hs.cell_net = _wire_indexed(a, "^hs20%.3gpp%.(%d+)%.mcc$", function(i)
+		local p = "hs20.3gpp." .. i .. "."
+		local mcc, mnc = a[p .. "mcc"], a[p .. "mnc"]
+		-- Kept as sent, not renormalised: a two-digit MNC is not a
+		-- three-digit one with a leading zero.
+		if type(mcc) ~= "string" or not mcc:match("^%d%d%d$") then return nil end
+		if type(mnc) ~= "string" or not mnc:match("^%d%d%d?$") then return nil end
+		return {mcc = mcc, mnc = mnc}
+	end)
+
+	hs.friendly_name = _wire_indexed(a, "^hs20%.friendly_name%.(%d+)%.text$",
+		function(i)
+			local p = "hs20.friendly_name." .. i .. "."
+			local lang = _wire_text(a[p .. "language"], 3)
+			local text = _wire_text(a[p .. "text"])
+			if not (lang and text) then return nil end
+			return {lang = lang, text = text}
+		end)
+
+	hs.conn_capab = _wire_indexed(a, "^hs20%.capab%.(%d+)%.protocol$", function(i)
+		local p = "hs20.capab." .. i .. "."
+		local proto = _wire_range(a[p .. "protocol"], 1, 255)
+		local port  = _wire_range(a[p .. "port"], 0, 65535)
+		-- hostapd wants a number: 0 closed, 1 open, 2 unknown.
+		local STATUS = {closed = "0", open = "1", unknown = "2"}
+		local status = STATUS[a[p .. "status"] or ""]
+		if not (proto and port and status) then return nil end
+		return {protocol = proto, port = port, status = status}
+	end)
+
+	if _wire_bool(a["hs20.metrics.status"]) then
+		local m = {}
+		local ok = true
+		-- info is the WAN Info bitfield the controller has already assembled
+		-- from link status + symmetric + at-capacity. The four rate/load
+		-- fields are 0 when the admin left them unset, which is also
+		-- hostapd's "unknown", so 0 is kept rather than dropped.
+		for field, hi in pairs({info = 255, downlink_speed = 4294967295,
+				uplink_speed = 4294967295, downlink_load = 255,
+				uplink_load = 255, measurement = 65535}) do
+			local v = _wire_range(a["hs20.metrics." .. field], 0, hi)
+			if v then m[field] = v else ok = false end
+		end
+		if ok then hs.wan_metrics = m end
+	end
+
+	return hs
 end
 
 -- Tri-state read of a `status` key for the radio/VAP disable controls:
@@ -2633,6 +2871,21 @@ function M._parse_wifi_system_cfg(sys_raw)
 				.. "authenticate\n"):format(w.ssid))
 		end
 
+		-- Hotspot 2.0 / Passpoint. Only ever on an EAP WLAN: hostapd refuses
+		-- a config with hs20=1 and anything but WPA2-Enterprise/CCMP ("HS 2.0:
+		-- WPA2-Enterprise/CCMP configuration is required for Hotspot 2.0
+		-- functionality", confirmed against hostapd v2.12-devel), and the
+		-- controller offers Passpoint on a wpaeap/OSEN WLAN only. A block
+		-- arriving on any other WLAN is dropped with a line rather than
+		-- written out to produce a BSS hostapd will not start.
+		local hs20
+		if is_enterprise then
+			hs20 = _wire_hs20(a)
+		elseif _wire_bool(a["hs20.status"]) and w.ssid then
+			io.stderr:write(("inform: WLAN %q carries Hotspot 2.0 but is not "
+				.. "WPA-Enterprise -- ignoring the hs20 block\n"):format(w.ssid))
+		end
+
 		-- A UID IoT WLAN whose keys come from RADIUS only. Claiming
 		-- wifi_caps 0x100000 (PPSK) lets it through too, with
 		-- aaa.<n>.wpa.psk_radius = 0/1/2 (disabled/optional/required, the
@@ -2866,6 +3119,10 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- 802.1X / WPA-Enterprise: see _wire_radius above for the wire
 				-- keys, what is deferred, and why. nil on every non-EAP WLAN.
 				radius                = radius,
+				-- Hotspot 2.0 / Passpoint: see _wire_hs20 above for the wire
+				-- keys, what the controller cannot be made to send, and why.
+				-- nil unless this WLAN has a Hotspot 2.0 profile attached.
+				hs20                  = hs20,
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
 				-- aaa.<n>.wpa3.ft.status: FT for the SAE akm specifically,
 				-- a SEPARATE toggle from ft.status. Confirmed from the

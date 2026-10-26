@@ -1396,7 +1396,7 @@ return {
 				.. "aaa.1.radius.auth.4.ip=not-an-ip\naaa.1.radius.auth.4.secret=d\n"
 				.. "aaa.1.radius.auth.2.ip=192.0.2.20\naaa.1.radius.auth.2.secret=\n"
 				.. "aaa.1.radius.auth.5.ip=192.0.2.50\naaa.1.radius.auth.5.secret=e\n"
-				.. "aaa.1.radius.auth.5.tls=true\n"
+				.. "aaa.1.radius.auth.5.ca_cert=ca.pem\n"
 				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
 			local vap_table
 			local logged = with_stderr(function()
@@ -1461,8 +1461,8 @@ return {
 			-- WLAN is skipped, like any other unprovisionable Enterprise WLAN.
 			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
 				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
-				.. "aaa.1.radius.auth.1.tls=true\n"
 				.. "aaa.1.radius.auth.1.ca_cert=ca.pem\n"
+				.. "aaa.1.radius.auth.1.private_key=key.pem\n"
 				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
 			local vap_table
 			local logged = with_stderr(function()
@@ -1470,7 +1470,7 @@ return {
 				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 			end)
 			assert_eq(#vap_table, 0, "no usable server left, so no WLAN")
-			assert_contains(logged, "RadSec (tls) is not supported", "the reason is named")
+			assert_contains(logged, "RadSec (TLS) is not supported", "the reason is named")
 			assert_contains(logged, "no usable RADIUS authentication server",
 				"and the skip says why")
 		end
@@ -1478,10 +1478,12 @@ return {
 	{
 		name = "inform packet: the deferred RADIUS keys derive nothing and do not block the WLAN",
 		fn = function()
-			-- Dynamic Authorization (das/dad), RADIUS MAC authentication and the
-			-- RadSec cert filenames are deliberately not implemented. This pins
-			-- that: they must not appear as fields anything downstream could key
-			-- on, and their presence must not stop the WLAN being provisioned.
+			-- Dynamic Authorization (das/dad) and RADIUS MAC authentication are
+			-- deliberately not implemented. This pins that: they must not appear
+			-- as fields anything downstream could key on, and their presence
+			-- must not stop the WLAN being provisioned. (The RadSec cert
+			-- filenames are not implemented either, but they are READ, as the
+			-- only mark of a RadSec server -- see the two tests above.)
 			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
 				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
 				.. "aaa.1.radius.das.status=enabled\naaa.1.radius.das.port=3801\n"
@@ -2696,6 +2698,306 @@ return {
 			assert_eq(s.acct_server_port, "1813", "acct port")
 			assert_eq(s.radius_acct_interim_interval, "900", "interim interval")
 			assert_eq(s.dynamic_vlan, "2", "dynamic VLAN required")
+		end
+	},
+	{
+		-- Verbatim lab capture (controller 10.6.106, 2026-10-26): the WLAN's
+		-- embedded `hotspot2` object filled with every field
+		-- api/fields/WlanConf.json allows, pushed to an openUF AP claiming
+		-- fw_caps 0x800000 + fw2_caps 0x80000. The RADIUS and wireless keys of
+		-- the same push are exercised by the WPA-Enterprise replay above; this
+		-- one keeps the hs20 block whole, including what the controller does
+		-- NOT send.
+		name = "inform packet: captured Hotspot 2.0 push reaches UCI as interworking and hs20 lines",
+		fn = function()
+			local ucihelper, db = new_apply_env()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-eap", "aaa.1.status=enabled", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP", "aaa.1.wpa.1.pairwise=CCMP",
+				"aaa.1.id=2", "aaa.1.auth_cache=enabled",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.port=1812",
+				"aaa.1.radius.auth.1.secret=openufradius",
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.access_network_type=2",
+				"aaa.1.hs20.internet=enabled",
+				"aaa.1.hs20.asra=disabled",
+				"aaa.1.hs20.esr=disabled",
+				"aaa.1.hs20.uesa=disabled",
+				"aaa.1.hs20.venue_group=2",
+				"aaa.1.hs20.venue_type=8",
+				"aaa.1.hs20.disable_dgaf=disabled",
+				"aaa.1.hs20.deauth_req_timeout=60",
+				"aaa.1.hs20.network_availability=13",
+				"aaa.1.hs20.venue_name.1.lang=eng",
+				"aaa.1.hs20.venue_name.1.name=openUF Lab",
+				"aaa.1.hs20.venue_name.1.url=https://example.com/venue",
+				"aaa.1.hs20.venue_name.2.lang=fra",
+				"aaa.1.hs20.venue_name.2.name=Labo openUF",
+				"aaa.1.hs20.hs20_domain_name_list=example.com,example.net",
+				"aaa.1.hs20.nai_realm.1.status=enabled",
+				"aaa.1.hs20.nai_realm.1.encoding=0",
+				"aaa.1.hs20.nai_realm.1.name=example.com",
+				"aaa.1.hs20.nai_realm.1.eap_method=13",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.id=5",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.val=6",
+				"aaa.1.hs20.nai_realm.2.status=enabled",
+				"aaa.1.hs20.nai_realm.2.encoding=0",
+				"aaa.1.hs20.nai_realm.2.name=example.net",
+				"aaa.1.hs20.nai_realm.2.eap_method=21",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.id=2",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.val=4",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.2.id=5",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.2.val=7",
+				"aaa.1.hs20.1.roaming_consortium=506f9a",
+				"aaa.1.hs20.2.roaming_consortium=001bc504bd",
+				"aaa.1.hs20.3gpp.1.mcc=230",
+				"aaa.1.hs20.3gpp.1.mnc=01",
+				"aaa.1.hs20.3gpp.2.mcc=262",
+				"aaa.1.hs20.3gpp.2.mnc=002",
+				"aaa.1.hs20.friendly_name.1.language=eng",
+				"aaa.1.hs20.friendly_name.1.text=openUF Operator",
+				"aaa.1.hs20.capab.1.protocol=6",
+				"aaa.1.hs20.capab.1.port=80",
+				"aaa.1.hs20.capab.1.status=open",
+				"aaa.1.hs20.capab.2.protocol=17",
+				"aaa.1.hs20.capab.2.port=5060",
+				"aaa.1.hs20.capab.2.status=closed",
+				"aaa.1.hs20.capab.3.protocol=1",
+				"aaa.1.hs20.capab.3.port=0",
+				"aaa.1.hs20.capab.3.status=unknown",
+				"aaa.1.hs20.metrics.status=enabled",
+				"aaa.1.hs20.metrics.info=1",
+				"aaa.1.hs20.metrics.downlink_speed=8000",
+				"aaa.1.hs20.metrics.uplink_speed=1000",
+				"aaa.1.hs20.metrics.downlink_load=80",
+				"aaa.1.hs20.metrics.uplink_load=40",
+				"aaa.1.hs20.metrics.measurement=3000",
+				"wireless.1.ssid=openuf-eap", "wireless.1.parent=radio0",
+				"wireless.1.usage=user", "wireless.1.dgaf_disable=disabled",
+				"radio.1.phyname=radio0", "radio.1.devname=ath0",
+				"radio.1.channel=auto", "radio.1.status=enabled",
+			}, "\n") .. "\n"
+
+			local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			local hs = vt[1].hs20
+			assert_true(hs ~= nil, "the hs20 block parsed")
+			assert_eq(hs.access_network_type, "2", "access network type")
+			assert_true(hs.internet, "internet reachable")
+			assert_eq(hs.asra, false, "no additional step required")
+			assert_eq(hs.uesa, false, "no unauthenticated emergency services")
+			assert_eq(hs.venue_group, "2", "venue group")
+			assert_eq(hs.venue_type, "8", "venue type")
+			assert_eq(hs.disable_dgaf, false, "DGAF left on")
+			assert_eq(hs.deauth_req_timeout, "60", "deauth request timeout")
+			assert_eq(hs.ipaddr_type_avail, "13",
+				"v4=3, v6=1 arrive already combined as (v4 << 2) | v6")
+			assert_eq(hs.domain_name, "example.com,example.net",
+				"the domain list is comma-separated on the wire already")
+			assert_eq(#hs.venue_name, 2, "both venue names")
+			assert_eq(hs.venue_name[1].url, "https://example.com/venue",
+				"the first venue's URL")
+			assert_nil(hs.venue_name[2].url, "the second venue has none")
+			assert_eq(#hs.nai_realm, 2, "both realms")
+			assert_eq(hs.nai_realm[2].name, "example.net", "second realm")
+			assert_eq(hs.nai_realm[2].eap_method, "21", "its EAP method (TTLS)")
+			assert_eq(#hs.nai_realm[2].auth, 2, "its two auth parameters")
+			assert_eq(hs.nai_realm[2].auth[2].val, "7", "third-level auth value")
+			assert_eq(table.concat(hs.roaming_consortium, " "),
+				"506f9a 001bc504bd", "both OIs, in index order")
+			assert_eq(hs.cell_net[1].mnc, "01",
+				"a two-digit MNC stays two digits")
+			assert_eq(hs.cell_net[2].mnc, "002", "and a three-digit one does too")
+			assert_eq(hs.friendly_name[1].text, "openUF Operator", "operator name")
+			assert_eq(#hs.conn_capab, 3, "all three connection capabilities")
+			assert_eq(hs.conn_capab[2].status, "0", "closed -> 0")
+			assert_eq(hs.conn_capab[3].status, "2", "unknown -> 2")
+			assert_eq(hs.wan_metrics.downlink_speed, "8000", "downlink speed")
+
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			local s = db.wireless["openuf_radio0_openuf_eap_"
+				.. ucihelper.derive_mobility_domain("openuf-eap")]
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.iw_enabled, "1", "iface_interworking's gate")
+			assert_eq(s.hs20, "1", "iface_hs20's gate")
+			assert_eq(s.access_network_type, "2", "scalar through UCI")
+			assert_eq(s.internet, "1", "boolean as 1/0")
+			assert_eq(s.asra, "0", "and an off one as 0")
+			assert_eq(s.disable_dgaf, "0", "DGAF option written explicitly")
+			assert_eq(s.hs20_deauth_req_timeout, "60", "deauth timeout")
+			assert_eq(s.hs20_wan_metrics, "01:8000:1000:80:40:3000",
+				"WAN metrics as one colon-separated hostapd value, the WAN "
+				.. "info octet in hex (hostapd hexstr2bin's it and rejects "
+				.. "the whole config if it is not two hex chars)")
+			local raw = table.concat(s.hostapd_bss_options or {}, "\n")
+			for _, want in ipairs({
+				"ipaddr_type_availability=13",
+				"domain_name=example.com,example.net",
+				"venue_name=eng:openUF Lab",
+				"venue_name=fra:Labo openUF",
+				"venue_url=1:https://example.com/venue",
+				"nai_realm=0,example.com,13[5:6]",
+				"nai_realm=0,example.net,21[2:4][5:7]",
+				"roaming_consortium=506f9a",
+				"roaming_consortium=001bc504bd",
+				"anqp_3gpp_cell_net=230,01;262,002",
+				"hs20_oper_friendly_name=eng:openUF Operator",
+				"hs20_conn_capab=6:80:1",
+				"hs20_conn_capab=17:5060:0",
+				"hs20_conn_capab=1:0:2",
+			}) do
+				assert_contains(raw, want, "raw hostapd line: " .. want)
+			end
+			assert_true(raw:find("venue_url=2:") == nil,
+				"no venue_url for the venue that has no URL")
+			-- The SAE tuning lines share hostapd_bss_options; nothing here may
+			-- have replaced a previous producer's list.
+			assert_eq(#s.hostapd_bss_options, 14,
+				"one raw line per entry, nothing lost or duplicated")
+		end
+	},
+	{
+		name = "inform packet: a WAN info octet above 9 is hex, not zero-padded decimal",
+		fn = function()
+			-- "At Capacity" (bit 3) plus "link up" (bits 0-1) is decimal 9 on
+			-- the wire; the symmetric-link bit takes it to 10, which hostapd
+			-- must see as 0a. Zero-padding the decimal would silently change
+			-- the advertised WAN status rather than fail loudly.
+			local ucihelper, db = new_apply_env()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=corp", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.secret=s",
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.metrics.status=enabled",
+				"aaa.1.hs20.metrics.info=10",
+				"aaa.1.hs20.metrics.downlink_speed=0",
+				"aaa.1.hs20.metrics.uplink_speed=0",
+				"aaa.1.hs20.metrics.downlink_load=0",
+				"aaa.1.hs20.metrics.uplink_load=0",
+				"aaa.1.hs20.metrics.measurement=0",
+				"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+				"radio.1.phyname=radio0", "radio.1.devname=ath0",
+			}, "\n") .. "\n"
+			local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			with_stderr(function()
+				ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			end)
+			local s = db.wireless["openuf_radio0_corp"]
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.hs20_wan_metrics, "0a:0:0:0:0:0", "WAN info in hex")
+		end
+	},
+	{
+		name = "inform packet: a Hotspot 2.0 block is dropped on a WLAN that is not WPA-Enterprise",
+		fn = function()
+			-- hostapd refuses a config with hs20=1 and anything but
+			-- WPA2-Enterprise/CCMP, so writing the block out would leave a BSS
+			-- that never starts. The controller only offers Passpoint on an
+			-- EAP/OSEN WLAN; this pins what happens if that ever changes.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=home", "aaa.1.wpa=2", "aaa.1.wpa.key.1.mgmt=WPA-PSK",
+				"aaa.1.wpa.psk=hunter22", "aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.access_network_type=2",
+				"wireless.1.ssid=home", "wireless.1.parent=radio0",
+			}, "\n") .. "\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 1, "the WLAN itself is still provisioned")
+			assert_nil(vap_table[1].hs20, "but with no hs20 field")
+			assert_contains(logged, "not WPA-Enterprise", "and a line says why")
+		end
+	},
+	{
+		name = "inform packet: Hotspot 2.0 entries that cannot be expressed are dropped individually",
+		fn = function()
+			-- Every value here reaches a hostapd config FILE. A control
+			-- character would end the line and let the rest be read as further
+			-- hostapd options, and a malformed OI or MCC is rejected by hostapd
+			-- outright -- so each bad entry is dropped on its own, leaving the
+			-- good ones.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=corp", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.secret=a",
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.venue_name.1.lang=eng",
+				"aaa.1.hs20.venue_name.1.name=good venue",
+				"aaa.1.hs20.venue_name.2.lang=eng",
+				"aaa.1.hs20.venue_name.2.name=bad\tvenue",
+				"aaa.1.hs20.venue_name.3.lang=english",
+				"aaa.1.hs20.venue_name.3.name=bad lang",
+				"aaa.1.hs20.1.roaming_consortium=506f9a",
+				"aaa.1.hs20.2.roaming_consortium=notahexstring",
+				"aaa.1.hs20.3.roaming_consortium=abc",
+				"aaa.1.hs20.3gpp.1.mcc=230", "aaa.1.hs20.3gpp.1.mnc=01",
+				"aaa.1.hs20.3gpp.2.mcc=23", "aaa.1.hs20.3gpp.2.mnc=01",
+				"aaa.1.hs20.nai_realm.1.name=live.example",
+				"aaa.1.hs20.nai_realm.1.eap_method=13",
+				"aaa.1.hs20.nai_realm.2.status=disabled",
+				"aaa.1.hs20.nai_realm.2.name=off.example",
+				"aaa.1.hs20.nai_realm.2.eap_method=13",
+				"aaa.1.hs20.nai_realm.3.name=norealm.example",
+				"aaa.1.hs20.capab.1.protocol=6", "aaa.1.hs20.capab.1.port=80",
+				"aaa.1.hs20.capab.1.status=open",
+				"aaa.1.hs20.capab.2.protocol=6", "aaa.1.hs20.capab.2.port=81",
+				"aaa.1.hs20.capab.2.status=maybe",
+				"aaa.1.hs20.metrics.status=enabled",
+				"aaa.1.hs20.metrics.info=1",
+				"aaa.1.hs20.metrics.downlink_speed=8000",
+				"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+			}, "\n") .. "\n"
+			local _, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			local hs = vt[1].hs20
+			assert_eq(#hs.venue_name, 1, "only the clean venue name survives")
+			assert_eq(hs.venue_name[1].name, "good venue", "and it is the right one")
+			assert_eq(table.concat(hs.roaming_consortium, " "), "506f9a",
+				"a non-hex and a too-short OI are both dropped")
+			assert_eq(#hs.cell_net, 1, "a two-digit MCC is dropped")
+			assert_eq(#hs.nai_realm, 1, "a disabled realm and one with no EAP method go")
+			assert_eq(hs.nai_realm[1].name, "live.example", "the enabled one stays")
+			assert_nil(hs.nai_realm[1].auth, "a realm with no auth parameters has none")
+			assert_eq(#hs.conn_capab, 1, "an unknown status word is dropped")
+			assert_nil(hs.wan_metrics,
+				"WAN metrics are all-or-nothing: one missing field drops the set")
+		end
+	},
+	{
+		name = "inform packet: Hotspot 2.0 off leaves no interworking option behind",
+		fn = function()
+			-- aaa.<n>.hs20.status=disabled is what every non-Passpoint EAP push
+			-- carries. The section is rebuilt from scratch on each push, so the
+			-- options must simply not be there.
+			local ucihelper, db = new_apply_env()
+			local function push(on)
+				local sys_cfg = table.concat({
+					"aaa.1.ssid=corp", "aaa.1.wpa=2",
+					"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+					"aaa.1.radius.auth.1.ip=192.0.2.10",
+					"aaa.1.radius.auth.1.secret=a",
+					"aaa.1.hs20.status=" .. (on and "enabled" or "disabled"),
+					on and "aaa.1.hs20.access_network_type=2" or "aaa.1.id=2",
+					on and "aaa.1.hs20.1.roaming_consortium=506f9a"
+						or "aaa.1.hide_ssid=false",
+					"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+					"radio.1.phyname=radio0", "radio.1.channel=auto",
+				}, "\n") .. "\n"
+				local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+				ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+				return db.wireless["openuf_radio0_corp"]
+			end
+			local s = push(true)
+			assert_eq(s.iw_enabled, "1", "on first")
+			s = push(false)
+			assert_nil(s.iw_enabled, "no iw_enabled left")
+			assert_nil(s.hs20, "no hs20 left")
+			assert_nil(s.access_network_type, "no access_network_type left")
+			assert_nil(s.hostapd_bss_options, "and no raw interworking lines")
 		end
 	},
 	{

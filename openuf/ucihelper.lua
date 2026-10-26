@@ -1538,6 +1538,113 @@ function M.apply_config(resp, cfg, opts)
 				end
 				if vap.radius.nas_id then extra.nas_identifier = vap.radius.nas_id end
 			end
+			-- Hotspot 2.0 / Passpoint. Two gates in the ucode generator:
+			-- iw_enabled turns on iface_interworking (the Interworking element
+			-- and the ANQP answers), hs20 turns on iface_hs20 (the HS 2.0
+			-- indication element and the hs20_* options). Both are needed, and
+			-- both are real schema options rather than aliases.
+			--
+			-- The SCALARS go in as wifi-iface options, the LISTS as raw
+			-- hostapd lines, for a specific reason: wifi.common's append()
+			-- joins an array value with SPACES into a single key=a b c line,
+			-- which is not a format hostapd accepts for any of the cumulative
+			-- interworking options (venue_name, nai_realm, roaming_consortium,
+			-- hs20_conn_capab each need one line per entry). On top of that,
+			-- ap.uc's iface_interworking() overwrites config.domain_name with
+			-- the joined anqp_3gpp_cell_net whenever the latter is set, so
+			-- routing the domain list through UCI would lose it on any WLAN
+			-- that also advertises a cellular network. Raw lines are appended
+			-- after every append_vars (ap.uc, "/* raw options */"), so they are
+			-- also what hostapd reads last.
+			--
+			-- Every line below was validated by feeding the generated config to
+			-- a real hostapd v2.12-devel (the APs' own build, from
+			-- openwrt/rootfs:x86-64-25.12.0 + wpad-mbedtls): zero parse errors.
+			if vap.hs20 then
+				local hs = vap.hs20
+				extra.iw_enabled = "1"
+				extra.hs20       = "1"
+				local function bit(v) return v and "1" or "0" end
+				if hs.access_network_type then
+					extra.access_network_type = hs.access_network_type
+				end
+				if hs.internet ~= nil then extra.internet = bit(hs.internet) end
+				if hs.asra ~= nil then extra.asra = bit(hs.asra) end
+				if hs.uesa ~= nil then extra.uesa = bit(hs.uesa) end
+				if hs.venue_group then extra.venue_group = hs.venue_group end
+				if hs.venue_type then extra.venue_type = hs.venue_type end
+				if hs.disable_dgaf ~= nil then
+					extra.disable_dgaf = bit(hs.disable_dgaf)
+				end
+				if hs.deauth_req_timeout then
+					extra.hs20_deauth_req_timeout = hs.deauth_req_timeout
+				end
+				if hs.ipaddr_type_avail then
+					-- hostapd's own option name. The schema's
+					-- iw_ipaddr_type_availability is NOT an alias and ap.uc
+					-- never appends it, so through UCI it would be stored and
+					-- dropped.
+					add_bss_option(extra,
+						"ipaddr_type_availability=" .. hs.ipaddr_type_avail)
+				end
+				if hs.domain_name then
+					add_bss_option(extra, "domain_name=" .. hs.domain_name)
+				end
+				for i, v in ipairs(hs.venue_name or {}) do
+					add_bss_option(extra, "venue_name=" .. v.lang .. ":" .. v.name)
+					-- venue_url's index refers to the venue_name entry it
+					-- belongs to, 1-based in the order written above.
+					if v.url then
+						add_bss_option(extra, "venue_url=" .. i .. ":" .. v.url)
+					end
+				end
+				for _, r in ipairs(hs.nai_realm or {}) do
+					-- <encoding>,<realm>,<eap method>[<auth id>:<auth value>]...
+					local line = r.encoding .. "," .. r.name .. "," .. r.eap_method
+					for _, au in ipairs(r.auth or {}) do
+						line = line .. "[" .. au.id .. ":" .. au.val .. "]"
+					end
+					add_bss_option(extra, "nai_realm=" .. line)
+				end
+				for _, oi in ipairs(hs.roaming_consortium or {}) do
+					add_bss_option(extra, "roaming_consortium=" .. oi)
+				end
+				if hs.cell_net then
+					-- One option, all pairs: hostapd's anqp_3gpp_cell_net is a
+					-- single semicolon-separated list, and a second line would
+					-- replace the first rather than add to it.
+					local pairs_out = {}
+					for _, c in ipairs(hs.cell_net) do
+						pairs_out[#pairs_out + 1] = c.mcc .. "," .. c.mnc
+					end
+					add_bss_option(extra,
+						"anqp_3gpp_cell_net=" .. table.concat(pairs_out, ";"))
+				end
+				for _, f in ipairs(hs.friendly_name or {}) do
+					add_bss_option(extra,
+						"hs20_oper_friendly_name=" .. f.lang .. ":" .. f.text)
+				end
+				for _, c in ipairs(hs.conn_capab or {}) do
+					add_bss_option(extra, "hs20_conn_capab="
+						.. c.protocol .. ":" .. c.port .. ":" .. c.status)
+				end
+				if hs.wan_metrics then
+					local m = hs.wan_metrics
+					-- <WAN info>:<downlink speed>:<uplink speed>:<downlink
+					-- load>:<uplink load>:<load measurement duration>
+					-- WAN info is one OCTET IN HEX, not a decimal: hostapd
+					-- parses it with hexstr2bin() over exactly two chars, so
+					-- the controller's decimal "1" is rejected with "Invalid
+					-- hs20_wan_metrics" -- and a rejected line is a config
+					-- parse error, which makes hostapd refuse the whole BSS.
+					-- Caught by feeding openUF's own generated config to a
+					-- real hostapd v2.12-devel. Every other field is decimal.
+					extra.hs20_wan_metrics = table.concat({
+						string.format("%02x", tonumber(m.info)),
+						m.downlink_speed, m.uplink_speed, m.downlink_load,
+						m.uplink_load, m.measurement}, ":")
+				end
+			end
 			if vap.owe_transition then
 				-- Enhanced Open transition mode: the ucode generator (24.10+,
 				-- hostapd.uc/mac80211.sh) turns this one section into the

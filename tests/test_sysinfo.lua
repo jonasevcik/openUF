@@ -1647,6 +1647,48 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: hs20_supported() needs both the interworking options and a CONFIG_HS20 hostapd",
+		fn = function()
+			-- This one IS a capability bit (fw_caps 0x800000, and fw2_caps
+			-- 0x80000 with it): the controller drops a Passpoint WLAN outright
+			-- without it, so it must be claimed only where hostapd can really
+			-- answer ANQP.
+			local orig_r, orig_c = sysinfo._read_file, sysinfo._run_cmd
+			local cmds
+			local function probe(gen, hostapd_yes)
+				sysinfo._hs20_supported_cache = nil
+				cmds = {}
+				sysinfo._read_file = function(path)
+					if path == "/usr/share/ucode/wifi/ap.uc" then return gen end
+					return nil
+				end
+				sysinfo._run_cmd = function(cmd)
+					cmds[#cmds + 1] = cmd
+					return hostapd_yes and "yes\n" or ""
+				end
+				return sysinfo.hs20_supported()
+			end
+			local ok, err = pcall(function()
+				-- 25.12's ap.uc, iface_interworking().
+				local gen = "if (!config.iw_enabled)\n\t\treturn;"
+				assert_true(probe(gen, true), "generator + HS 2.0 hostapd")
+				assert_true(cmds[1]:find("hs20_conn_capab", 1, true) ~= nil,
+					"asks the hostapd binary itself")
+				assert_false(probe(gen, false),
+					"a hostapd built without CONFIG_HS20 -> not supported")
+				assert_false(probe(nil, true), "no ucode generator -> not supported")
+				assert_eq(#cmds, 0, "and hostapd is not even searched")
+				assert_false(probe("append('auth_server_addr', server);", true),
+					"a generator without the interworking options -> not supported")
+				sysinfo._read_file = function() error("probed twice") end
+				assert_false(sysinfo.hs20_supported(), "cached")
+			end)
+			sysinfo._read_file, sysinfo._run_cmd = orig_r, orig_c
+			sysinfo._hs20_supported_cache = nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "sysinfo: owe_supported() needs both hostapd's OWE build and the ucode generator",
 		fn = function()
 			-- Claimed as radio_caps2 0x8: the controller then pushes Enhanced
