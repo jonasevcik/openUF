@@ -3692,6 +3692,25 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: a station-bound private key becomes a wifi-station for that MAC only",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {{ssid = "keys", radio = "radio0", security = "wpa3",
+						x_passphrase = "basepass123", ppsk = {
+							{key = "anystation1"},
+							{key = "stationkey1", mac = "aa:bb:cc:dd:ee:01"},
+						}}},
+				}, {net = {lan_cpueth = "eth1"}})
+				local w = db.wireless
+				assert_eq(w.openuf_radio0_keys_psk1.mac[1], "00:00:00:00:00:00", "any station")
+				assert_eq(w.openuf_radio0_keys_psk2.mac[1], "aa:bb:cc:dd:ee:01", "that station")
+				assert_eq(w.openuf_radio0_keys_psk2.key, "stationkey1", "its key")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: a key whose VLAN has no network is left out, not put on the VAP's",
 		fn = function()
 			with_ucihelper(function(db)

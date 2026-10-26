@@ -2687,6 +2687,52 @@ function M._parse_wifi_system_cfg(sys_raw)
 				end
 			end
 
+			-- aaa.<n>.sae.psk.<k>.{psk,mac,vlan,id}: SAE passwords bound to a
+			-- station (wlanconf sae_psk; 10.x emitter XWWFgnDBrNRLQZ). Entry
+			-- ff:ff:ff:ff:ff:ff is the WLAN's own key, already the WLAN's
+			-- passphrase. UniFi firmware writes the rest as sae_password=
+			-- lines (6.8.2 ubntbox); OpenWrt's wifi-station writes the same
+			-- key to the SAE and the PSK file, so they join the private keys.
+			if security ~= "open" and security ~= "owe" then
+				local idxs = {}
+				for k in pairs(a) do
+					local i = k:match("^sae%.psk%.(%d+)%.psk$")
+					if i then idxs[#idxs + 1] = tonumber(i) end
+				end
+				table.sort(idxs)
+				for _, i in ipairs(idxs) do
+					local pre = "sae.psk." .. i .. "."
+					local key = a[pre .. "psk"]
+					local mac_raw = a[pre .. "mac"]
+					local mac = mac_raw and mac_raw:lower()
+					local vid_raw = a[pre .. "vlan"]
+					local vid = tonumber(vid_raw)
+					local key_ok = (#key >= 8 and #key <= 63)
+						or (#key == 64 and key:match("^%x+$") ~= nil)
+					local vid_ok = vid_raw == nil
+						or (vid ~= nil and vid == math.floor(vid) and vid >= 1 and vid <= 4094)
+					local mac_ok = mac == nil or is_mac(mac)
+					if mac ~= "ff:ff:ff:ff:ff:ff" then
+						if key_ok and vid_ok and mac_ok then
+							local dup = false
+							for _, e in ipairs(ppsk or {}) do
+								if e.key == key and e.vid == vid and e.mac == mac then dup = true end
+							end
+							if not dup then
+								ppsk = ppsk or {}
+								ppsk[#ppsk + 1] = {key = key, vid = vid, mac = mac}
+							end
+						else
+							io.stderr:write(("inform: WLAN %q: skipping SAE key %d (%s)\n")
+								:format(w.ssid, i, not key_ok
+									and "passphrase is not 8-63 characters or 64 hex digits"
+									or (not vid_ok and "bad VLAN id " .. tostring(vid_raw)
+										or "bad station MAC " .. tostring(mac_raw))))
+						end
+					end
+				end
+			end
+
 			vap_table[#vap_table + 1] = {
 				ssid                  = w.ssid,
 				radio                 = w.parent,

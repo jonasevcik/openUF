@@ -1686,6 +1686,35 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg reads the per-station SAE keys (sae.psk.<n>)",
+		fn = function()
+			local base = "aaa.1.ssid=sae-keys\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=SAE\n"
+				.. "wireless.1.ssid=sae-keys\nwireless.1.parent=radio0\n"
+			local _, v = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.sae.psk.1.psk=mainpass123\naaa.1.sae.psk.1.mac=ff:ff:ff:ff:ff:ff\n"
+				.. "aaa.1.sae.psk.2.psk=stationkey1\naaa.1.sae.psk.2.mac=AA:BB:CC:DD:EE:01\n"
+				.. "aaa.1.sae.psk.2.vlan=30\naaa.1.sae.psk.2.id=phone\n"
+				.. "aaa.1.sae.psk.3.psk=anystation1\n"
+				.. "aaa.1.sae.psk.4.psk=short\n"
+				.. "aaa.1.sae.psk.5.psk=badvlankey1\naaa.1.sae.psk.5.vlan=9999\n"
+				.. "aaa.1.sae.psk.6.psk=badmackey11\naaa.1.sae.psk.6.mac=zz\n")
+			local p = v[1].ppsk
+			assert_eq(#p, 2, "main key (ff:..), short key, bad VLAN and bad MAC are left out")
+			assert_eq(p[1].key, "stationkey1", "key 2")
+			assert_eq(p[1].vid, 30, "its VLAN")
+			assert_eq(p[1].mac, "aa:bb:cc:dd:ee:01", "its station, lowercased")
+			assert_eq(p[2].key, "anystation1", "key 3")
+			assert_nil(p[2].mac, "no mac: any station")
+			-- The same key arriving through psk_file too is one key.
+			local _, d = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.wpa.psk_file.status=enabled\naaa.1.wpa.psk_file.1.psk=anystation1\n"
+				.. "aaa.1.sae.psk.2.psk=anystation1\n")
+			assert_eq(#d[1].ppsk, 1, "psk_file + sae.psk duplicates collapse")
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_nil(none[1].ppsk, "no keys -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses the SAE tuning keys",
 		fn = function()
 			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
