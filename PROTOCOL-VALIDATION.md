@@ -4795,6 +4795,159 @@ ARM64 U6/U7 (incl. U6-IW) stays opaque; nothing below is claimed for it. Method:
   know the 8 new chart keys (not in the jar; the UI chunks were not checked). A port would drop today's signal term, which is a visible change.
   **Hybrid checked and dropped (2026-10-26):** keeping the 4.0.15 signal/PHY/retry terms and adding only sourceable 6.8.2 terms adds nothing: the network terms (ip/arp/dns/icmp, no-DHCP) and tcp latency need probes the AP firmware makes and OpenWrt has no source for (they would score 100, as now); rate needs the free-airtime % input (inferred); disconnects and drops need the window and units of the assoc tracker (unknown); the retry term's only 6.8.2 differences are the ≥30-tries gate and the 60 floor, behind the unidentified phy-mode gate. The score stays as 4.0.15.
 - Per-feature results are in the feature matrix rows (27 = SAE tuning, 28 = SAE station keys).
+- The complete cross of the firmware's key universe, producers and command verbs against openUF
+  is the next section, "Firmware sweep"; read it before opening a new firmware question.
+
+## Firmware sweep: the whole key universe (U7LR 6.8.2, BZ2 4.3.28)
+
+The audit above was a targeted read of the security keys. This is the **complete** cross of
+what the firmware consumes, produces and answers against what openUF does, run 2026-10-26 so
+that later work starts from evidence instead of a fresh read. Nothing here is a feature claim:
+each row carries a verdict — **implement**, **decline** (with the reason), or **needs capture**
+(the key exists in the firmware but no captured `system_cfg` has ever carried it, so the
+controller setting that emits it has to be toggled in the lab first).
+
+**Method.** `strings` over `sbin/ubntbox` for `%d`/`%s` key templates (the firmware's own
+controller-key → action map), normalised to `N`; the union of every captured 10.6.106 push;
+and a leaf-name cross against `openuf/*.lua`. Counts: **627** key templates in 6.8.2 → **609**
+distinct keys (177 of them `switch.*`), **469** templates in 4.3.28, **234** distinct keys in
+the captured pushes, **166** firmware keys with no leaf match in openUF (56 `switch.*`, 110
+others). The leaf cross is a candidate filter, not a verdict — every row below was then
+checked by hand against the code. Builds read: **U7LR 6.8.2** (Jan 2026) and **BZ2 4.3.28**,
+both MIPS/QCA956x and Wi-Fi 5 only; **nothing here is claimed for the ARM64 U6/U7 firmware**
+openUF impersonates. Rebuild the artifacts with `tools/fw-extract.sh <fw.bin> <outdir>` (build
+list via the `fw-update.ui.com` firmware API, see CLAUDE.local.md).
+
+### Axis 1 — keys the controller already pushes that openUF reads nothing from
+
+Values are verbatim from a lab push (10.6.106, U6-IW identity, four VAPs, PSK + EAP + guest).
+A value that is constant with the matching UI control off is a decoy, not a setting — the
+discriminator must be shown by a toggle diff before anything is implemented (the same test
+that already demoted `mac_acl.status`, `bcmc_l2_filter.status` and `multicast.inspect`).
+
+| Key | Value seen | Firmware action (6.8.2) | Candidate OpenWrt consumer | Verdict |
+|---|---|---|---|---|
+| `aaa.<n>.auth_cache` | `enabled` | PMKSA/opportunistic key caching | `okc` / `disable_pmksa_caching` | needs capture (toggle diff) — then implement if it moves |
+| `aaa.<n>.eapol_version` | `2` | `eapol_version=` | `eapol_version` | needs capture |
+| `aaa.<n>.wpa.1.pairwise` | `CCMP` | the authoritative pairwise cipher | openUF derives the cipher from its own `SECURITY_MAP` | implement as a cross-check: a mismatch between pushed and derived cipher is a bug signal we currently cannot see |
+| `aaa.<n>.country_beacon` | `disabled` | country IE in the beacon | `ieee80211d` | needs capture |
+| `aaa.<n>.tdls_prohibit` | `disabled` | `tdls_prohibit=` | `tdls_prohibit` | needs capture |
+| `aaa.<n>.p2p`, `.p2p_cross_connect` | `disabled` | `manage_p2p=` / `allow_cross_connection=` | same names in hostapd | needs capture |
+| `aaa.<n>.filter_id` | not seen | RADIUS `Filter-Id` handling | — | needs capture (arrives with a RADIUS profile variant we have not built) |
+| `wireless.<n>.wmm` | `enabled` | WMM/WME on the VAP | `wmm` (wifi-iface) | needs capture — WMM off is a real UI control on some builds |
+| `qos.mode` | `1` | selects the qos engine | `shaper.lua`'s own choice | decline unless a toggle moves it: openUF's HTB/IFB path is not the firmware's, and the value has been `1` in every capture |
+| `radio.<n>.antenna.gain` | `3` | antenna gain, feeds the tx-power ceiling | `wifi-device.antenna_gain` | implement if a board with external antennas ever matters; today both boards are fixed-gain — **needs capture** of a non-default value first |
+| `radio.outdoor` | `disabled` | regulatory/outdoor channel set | no OpenWrt equivalent (country code carries it) | decline: no consumer |
+| `radio.<n>.ampdu.status`, `.rate.auto`, `.rate.mcs`, `.acktimeout`, `.ack.auto`, `.cwm.enable`, `.bgscan.status`, `.hard_noisefloor.status`, `.clksel` | `enabled`/`auto`/`64`/`disabled`/`0` | airMAX-era radio tuning, mostly `iwpriv` on QCA | nothing in mac80211 takes them per-radio | decline: airMAX/QCA-specific, constant in every capture (`cwm.mode` was already documented as a decoy) |
+| `wireless.<n>.authmode`, `.puren`, `.pureg`, `.element_adopt`, `.autowds`, `.vwire`, `.addmtikie` | `1`/`0`/`disabled` | legacy AirOS VAP flags | — | decline: legacy; `pureg` is already consumed as part of Minimum Data Rate |
+| `switch.port.<n>.{name,opmode}`, `switch.{status,vlan.status,dot1x.status,jumboframes}` | `PoE Out + Data`, `switch`, `disabled` | the in-wall's own 5 ports | openUF's per-port VLAN path | already correct: openUF keeps only ports carrying a real override (`inform.lua:3493`); the name/opmode-only rows are the U6-IW identity's port list, not an override |
+
+### Axis 1b — the reverse direction, which bounds how far the firmware can be trusted
+
+**74 keys the controller pushes do not exist in 6.8.2's key universe at all**, among them
+`wireless.<n>.advertise_ap_name`, `wireless.<n>.multicast.inspect`, `aaa.<n>.pmf.cipher`,
+`aaa.<n>.hs20.{deauth_req_timeout,friendly_name.<k>.*,hs20_domain_name_list}`,
+`aaa.<n>.wpa.key.<k>.mgmt`, `radio.<n>.bcmc_l2_filter.status`, `atf.*`, `cron.*`,
+`dnsmasq.walled_garden.*`, `users.*`, `sshd.*`, `unifi.*`, and the whole `bridge.*`/`dhcpc.*`/
+`ntpclient.*`/`resolv.*`/`route.*`/`iptables.*`/`ipset.*` plumbing. Two consequences worth
+keeping: the MIPS firmware is **not** a complete oracle for a U6-IW identity (those keys are
+consumed by the ARM64 builds, by `syswrapper.sh`, or by plain OpenWrt-style config files), and
+a key's absence from `ubntbox` is therefore **not** evidence that the AP ignores it.
+
+### Axis 2 — keys the firmware consumes that no captured push has ever carried
+
+All **needs capture**: find the controller setting in the jar, toggle it in the lab, diff. In
+descending promise, with why each is worth the toggle:
+
+- `wireless.<n>.advanced_isolation.{status,<k>.mac}` — a per-MAC **exception list** to client
+  isolation. If the controller emits it, the forced-`ap_isolate` trade behind proxy ARP and
+  Multicast Enhancement (see the hairpin finding) stops being necessary.
+- `wireless.<n>.intelligent_dhcp`, `.dhcp_bcast2ucast.status`, `.bintval`,
+  `.ubnt_discovery_filter`, `.signal_led*` — VAP-level behaviour with plausible UCI
+  counterparts (`dtim_period`, `beacon_int`); `intelligent_dhcp` and `element_adopt` were
+  already noted as never captured in the audit above.
+- `radio.<n>.backup_channel`, `.acsdfs`, `.scan_list.{status,channels}`, `.ch144` — DFS
+  fallback and channel-list narrowing; `channel`/`channels` exist in OpenWrt, so these are
+  implementable if pushed.
+- `aaa.<n>.{rsn_preauth,rsn_preauth_uplinks,reauth_period,psk.sha256,sha1,sha256,rsn_group_cipher,wpa.group_update_count,wpa.strict_rekey,wpa.gmk_rekey,disable_na_mcast_to_ucast,strict_specification,log_level,verbose}`
+  — the audit above already found **no occurrence in the 10.6.106 jar** for `rsn_preauth`,
+  `wpa.{strict_rekey,gmk_rekey,group_update_count}` and `fils.*`: those stay **declined, no
+  emitter**. The rest of the list is unchecked.
+- `aaa.<n>.radius.macacl.{status,format,emptypassword}` + `aaa.<n>.accept_mac.{status,<k>.vlanid}`
+  (RADIUS MAC authentication) and `aaa.<n>.radius.{das,dad}.*` (DAS/CoA) — the two deliberate
+  deferrals of the WPA-Enterprise commit. `radius.macacl.status=disabled` **is already on the
+  wire**, so the toggle exists and these can be closed properly.
+- `connectivity.{status,uplink,uplink_eth,uplink_bridge,uplink_gateway,uplink_wds}` — the uplink
+  connectivity monitor; `connectivity.status=disabled` in every capture. Read what `mcad` does
+  when it is on **before** writing code: the firmware's response to a dead uplink can take
+  radios down, which is not a change to make blind on a production AP.
+- `mesh.*`, `aaa.<n>.owe_devname`, `wireless.<n>.{wds,parent,vwirepeers,vwirepayload*}` —
+  wireless uplink / mesh. **Decline (scope):** openUF presents a wired AP, and a mesh uplink
+  would need the whole vwire/WDS peering path plus `is_wireless_uplink` reporting.
+- `ble.*` (12 keys: iBeacon, Eddystone, `ble.mode`) — **decline:** neither board has Bluetooth.
+- `system.monitor.<x>.{host,poll_interval,status,threshold}`, `system.{resetbtn,kernel.panic,kernel.panic_on_oops,boot_sound.status,analytics.*}` — device-level monitors and knobs; only
+  `system.analytics.status` has ever been captured. Needs capture.
+- `switch.*` beyond the U6-IW port rows (177 keys: ACLs, STP/MSTP, IGMP, LAG, SNMP, dot1x,
+  routing interfaces, DHCP server/relay, storm control, port mirroring) — **decline, wrong
+  product:** these are UniFi *switch* keys in a shared `ubntbox`; the only `switch.*` an AP
+  identity receives are the 14 rows in axis 1.
+
+### Axis 3 — the reporting side, which the last series never touched
+
+What the controller *displays* comes from what the AP sends up, and 6.8.2's producers are
+readable: `usr/lib/libubnt.so.1.0.0` (`fill_stainfo_json`, `fill_wireless_info[_full]`,
+`fill_radio_stat_info_full`, `fill_ap_info_full`, `anomalies_bar_chart_to_json`,
+`reasons_bar_chart_to_json`, `tcp_stats_to_json`, `wifi_tx_lat_to_json`), `bin/stainfo`,
+`bin/stamgr`, `sbin/stahtd`, `sbin/wevent` (the wireless-event producer behind the
+association/roam notifications), and `sbin/{sysmon,ubnt-netmon,ubntevent}`.
+
+Per-station keys present in `libubnt` 6.8.2 and **absent from openUF's payload**:
+`sta_ip_timeout`, `sta_arp_timeout`, `sta_dns_timeout`, `sta_dns_latency`, `sta_icmp_rtt`,
+`sta_disconnects`, `wifi_drops`, `rx_tcp_lat_avg`, `tx_tcp_lat_avg`, `tx_rate_avg`,
+`rx_rate_avg`. openUF sends `wifi_retries`/`wifi_latency` (and the anomaly/reason bar charts)
+from `satisfaction.lua` and nothing else from this family. These are exactly the inputs of the
+6.8.2 WiFi Experience terms that the hybrid port was dropped over, so the two questions are the
+same one: **needs the controller side first** — whether 10.6.106 reads each key (jar string
+search) and whether OpenWrt has any source for it, since the firmware fills most of them from
+probes `mcad` runs against the client (ARP/DNS/ICMP) that openUF does not perform.
+
+### Axis 4 — commands: `syswrapper.sh`'s own answer list vs openUF's dispatcher
+
+6.8.2 `bin/syswrapper.sh` dispatches ~150 verbs. openUF's dispatcher
+(`inform.lua`, `_type`/`cmd`) answers: `set-locate`/`unset-locate`, `block-sta`/`unblock-sta`,
+`kick-sta`, `authorize-guest`/`unauthorize-guest`, `rate-update`, `scan`/`scan_band`,
+`spectrum-scan`, `upgrade` (stored only), `set-selfrun`/`unset-selfrun`,
+`refresh-walled-garden` (as a cron job), `setdefault`/`restore-default`, `reboot`, `setparam`,
+plus `_note_unhandled` for anything else — which makes the device itself the oracle for what
+actually arrives.
+
+Verbs with no openUF equivalent, worth triage (**needs jar check**: the controller's `cmd`
+enum decides whether a verb can ever arrive; a verb `mcad` only invokes from its own state
+machine is **declined as not a controller command**):
+
+`vlan-detected`, `cache-vlan-detected`, `clear-vlan-detected` (the controller's VLAN-mismatch
+warning), `scan-rrm`, `scan-rrm-check`, `airtime-scan`, `11k-boot`, `11k-scan`, `11k-stop`,
+`dfs-reset`, `set-channel`, `get-support-file`, `gen-sup-file`, `pcap-start`, `pcap-stop`,
+`read-crash-log`, `dump-radar-log`, `dump-isolation-log`, `send-wificoredump`,
+`mca-custom-alert`, `mca-send-inform`, `set-element-payload`/`unset-element-payload`,
+`set-meshv3-payload`, `schedule-action`, `probe-lan-iface`, `ip-changed`, `handle-dyn`,
+`soft-restart`, `shutdown`, `wireless-vlan-add`/`-del`, `del-bridge-vlans`, `get-tmpfs-usage`,
+`install-runtime-package`, `lcm-sync`, `lcm-tracker`, `relayctl`, `ssh-adopt`, `set-ready`,
+`set-inform`, `check-is-adopted`, `led-locate`, `set-custom-sysled`, `netconsole`,
+`sensitive-data-filter`, `systemcfg-sensitive-data-filter`, `uplink`, `wds`,
+`wireless-bridge`, `wireless-bridge-failover`, `mesh-halt`, `do-ir-send`, `set-volume`,
+`set-stream`/`set-stream-media`, `lte_prov`, `set-uboot-var`, `backup-part-upgrade`.
+Already declined by product scope within that list: the speaker/IR verbs (`set-volume`,
+`set-stream*`, `do-ir-send`), `lte_prov`, the mesh/WDS verbs (axis 2), and the U-Boot and
+partition verbs, which openUF deliberately never flashes.
+
+### Where the evidence lives
+
+Extracted rootfs (6.8.2 `u7root`, 4.3.28 `root`), the `ubntbox` key dumps
+(`keys682.txt`, `keys4328.txt`, `keys4015.txt`), `libubnt682.so`, `mcad682`, the captured
+pushes and the CFR-decompiled 10.6.106 jar were all produced in session scratchpads, which are
+not durable. Everything above is reproducible from `tools/fw-extract.sh` plus the lab
+controller; the jar recipe is in "Decompiling the controller".
 
 ## Open questions
 
