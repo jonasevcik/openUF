@@ -4424,6 +4424,7 @@ ARM64 U6/U7 (incl. U6-IW) stays opaque; nothing below is claimed for it. Method:
   **Not ported because** the inputs are not pinned down: struct offsets 376/416/1560/328–340/1216–1232/1244–1252/1492 are named only by inference
   (rate, free-airtime %, VAP phy mode, tries/retries, network flags), the enum behind modes 17/18/23 is unknown, and the controller does not
   know the 8 new chart keys (not in the jar; the UI chunks were not checked). A port would drop today's signal term, which is a visible change.
+  **Hybrid checked and dropped (2026-10-26):** keeping the 4.0.15 signal/PHY/retry terms and adding only sourceable 6.8.2 terms adds nothing: the network terms (ip/arp/dns/icmp, no-DHCP) and tcp latency need probes the AP firmware makes and OpenWrt has no source for (they would score 100, as now); rate needs the free-airtime % input (inferred); disconnects and drops need the window and units of the assoc tracker (unknown); the retry term's only 6.8.2 differences are the ≥30-tries gate and the 60 floor, behind the unidentified phy-mode gate. The score stays as 4.0.15.
 - Per-feature results are in the feature matrix rows (27 = SAE tuning, 28 = SAE station keys).
 
 ## Open questions
