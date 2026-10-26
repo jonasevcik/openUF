@@ -3572,6 +3572,64 @@ function M._parse_switch_system_cfg(sys_raw)
 	return out
 end
 
+-- The IP Settings / DNS / hostname half of a system_cfg: the keys
+-- handle_response acts on outside the wifi, switch and sysconf passes.
+--
+-- Pure on purpose. It was inline in handle_response until 2026-10-26, which
+-- left the device-level keys as the one part of a push with no replayable
+-- parser -- neither a unit test nor tools/cfg-coverage.lua could reach them
+-- without running the whole response handler and its side effects.
+-- The malformed-address refusal stays in handle_response: it writes to stderr
+-- and feature-detects netconfig, neither of which belongs in a parser.
+--
+-- Returns a table, always: {ip, netmask, gateway, dhcp, device_name, dns}.
+function M._parse_net_system_cfg(sys_raw)
+	if type(sys_raw) ~= "string" then return {dhcp = false, dns = {}} end
+	local ip, netmask, gateway, device_name
+	local dhcp = false
+	-- DNS servers, keyed by their wire index so the controller's ordering
+	-- (primary/secondary) survives -- resolv.conf's order is the resolver's
+	-- preference order, so it is load-bearing. Same index-keyed-then-sorted
+	-- treatment as macacl's acl.<k> list.
+	local dns_by_idx = {}
+	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
+		local k, v = line:match("^([^=]+)=(.*)$")
+		if k and v then
+			local dns_idx = k:match("^resolv%.nameserver%.(%d+)%.ip$")
+			if dns_idx then
+				if v ~= "" then dns_by_idx[tonumber(dns_idx)] = v end
+			elseif k == "netconf.1.ip" then ip = v
+			elseif k == "netconf.1.netmask" then netmask = v
+			elseif k == "route.1.gateway" then gateway = v
+			elseif k == "dhcpc.1.status" then
+				-- Only an enabled-ish value means DHCP. The key's presence
+				-- alone used to set dhcp=true, so a hypothetical
+				-- dhcpc.1.status=disabled alongside a netconf.1.ip would have
+				-- misread a static push as DHCP and flushed the working static
+				-- address. Every capture so far carries =enabled; this is
+				-- defensive for the static-mode shape that hasn't been
+				-- captured yet.
+				dhcp = _wire_bool(v) == true
+			elseif k == "resolv.host.1.name" then
+				-- The controller's own idea of this device's name (its local
+				-- network hostname) -- already present in every capture (e.g.
+				-- "U6IW" when never renamed). Reused as the WPS Device Name
+				-- value when advertise_ap_name is on, since it's the only
+				-- controller-assigned "AP name" string available on this wire
+				-- protocol.
+				if v ~= "" then device_name = v end
+			end
+		end
+	end
+	-- Flatten the index-keyed DNS table into controller order.
+	local dns, idxs = {}, {}
+	for i in pairs(dns_by_idx) do idxs[#idxs + 1] = i end
+	table.sort(idxs)
+	for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
+	return {ip = ip, netmask = netmask, gateway = gateway,
+		dhcp = dhcp, device_name = device_name, dns = dns}
+end
+
 -- ─── Dropped-key visibility ──────────────────────────────────────────────────
 
 -- Key shapes some pass in openUF actually reads. Everything else in a config
@@ -3639,6 +3697,13 @@ local RECOGNIZED_MGMT_CFG = {
 	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
 	"^capability$", "^selfrun_guest_mode$", "^stun_url$",
 }
+
+-- Exported for tools/cfg-coverage.lua, which cross-checks these CLAIMS against
+-- what a replay proves the parsers actually use. The lists are prefix-coarse by
+-- design (`^aaa%.%d+%.` covers keys openUF drops, such as auth_cache), so a key
+-- being "recognized" here is not evidence that anything reads it.
+M.RECOGNIZED_SYSTEM_CFG = RECOGNIZED_SYSTEM_CFG
+M.RECOGNIZED_MGMT_CFG   = RECOGNIZED_MGMT_CFG
 
 -- Set from handle_response when cfg.config.debug_dump_file is on -- the
 -- dropped-key report is a diagnostic for exactly the same workflow (diffing
@@ -3941,53 +4006,9 @@ function M.handle_response(json_str, st, cfg)
 		if type(sys_raw) == "string" then
 			M._report_dropped_keys("system_cfg", sys_raw, RECOGNIZED_SYSTEM_CFG)
 
-			local ip, netmask, gateway
-			local dhcp = false
-			local device_name
-			-- DNS servers, keyed by their wire index so the controller's
-			-- ordering (primary/secondary) survives -- resolv.conf's order is
-			-- the resolver's preference order, so it is load-bearing. Same
-			-- index-keyed-then-sorted treatment as macacl's acl.<k> list.
-			local dns_by_idx = {}
-			for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
-				local k, v = line:match("^([^=]+)=(.*)$")
-				if k and v then
-					local dns_idx = k:match("^resolv%.nameserver%.(%d+)%.ip$")
-					if dns_idx then
-						if v ~= "" then dns_by_idx[tonumber(dns_idx)] = v end
-					elseif k == "netconf.1.ip" then ip = v
-					elseif k == "netconf.1.netmask" then netmask = v
-					elseif k == "route.1.gateway" then gateway = v
-					elseif k == "dhcpc.1.status" then
-						-- Only an enabled-ish value means DHCP. The key's
-						-- presence alone used to set dhcp=true, so a
-						-- hypothetical dhcpc.1.status=disabled alongside a
-						-- netconf.1.ip would have misread a static push as
-						-- DHCP and flushed the working static address. Every
-						-- capture so far carries =enabled; this is defensive
-						-- for the static-mode shape that hasn't been
-						-- captured yet.
-						dhcp = _wire_bool(v) == true
-					elseif k == "resolv.host.1.name" then
-						-- The controller's own idea of this device's name
-						-- (its local network hostname) -- already present
-						-- in every capture (e.g. "U6IW" when never
-						-- renamed). Reused as the WPS Device Name value
-						-- when advertise_ap_name is on, since it's the
-						-- only controller-assigned "AP name" string
-						-- available on this wire protocol.
-						if v ~= "" then device_name = v end
-					end
-				end
-			end
-			-- Flatten the index-keyed DNS table into controller order.
-			local dns = {}
-			do
-				local idxs = {}
-				for i in pairs(dns_by_idx) do idxs[#idxs + 1] = i end
-				table.sort(idxs)
-				for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
-			end
+			local net = M._parse_net_system_cfg(sys_raw)
+			local ip, netmask, gateway = net.ip, net.netmask, net.gateway
+			local dhcp, device_name, dns = net.dhcp, net.device_name, net.dns
 
 			-- Shape check BEFORE anything is recorded or run. These three
 			-- values are interpolated into `ip addr` / `ip route` command

@@ -174,6 +174,22 @@ local function with_stderr(fn)
 	return table.concat(buf)
 end
 
+-- tools/cfg-coverage.lua: the key-coverage sweep over a captured push. Loaded
+-- as a module (its script half is gated on arg[0]), so the tests below drive
+-- M.analyse/M.format directly with their own parser sets where a synthetic one
+-- pins the probe design, and with openUF's real ones where the point is what
+-- openUF does.
+local cfgcov = dofile("tools/cfg-coverage.lua")
+
+local function real_parsers()
+	return cfgcov.parsers(inform, {
+		sysconf     = inform._sysconf,
+		l2guard     = inform._l2guard,
+		guestportal = inform._guestportal,
+		airtime     = inform._airtime,
+	})
+end
+
 local MAGIC = "TNBU"
 
 -- Parse header fields from a raw TNBU packet for assertions
@@ -7417,6 +7433,123 @@ return {
 			inform._shaper_resync, inform._reload_if_changed, inform._rrm_tick, inform.build_json,
 				inform.build_packet = orig.sh, orig.rl, orig.rrm, orig.bj, orig.bp
 			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "net push: IP Settings, DNS order and the controller's hostname out of one blob",
+		fn = function()
+			local net = inform._parse_net_system_cfg(table.concat({
+				"netconf.1.ip=192.0.2.7",
+				"netconf.1.netmask=255.255.255.0",
+				"route.1.gateway=192.0.2.1",
+				"dhcpc.1.status=disabled",
+				-- Deliberately out of wire order: resolv.conf's order is the
+				-- resolver's preference order, so the index decides, not the
+				-- line position.
+				"resolv.nameserver.2.ip=192.0.2.3",
+				"resolv.nameserver.1.ip=192.0.2.2",
+				"resolv.nameserver.3.ip=",
+				"resolv.host.1.name=U6IW",
+			}, "\n"))
+			assert_eq(net.ip, "192.0.2.7", "static address")
+			assert_eq(net.netmask, "255.255.255.0", "netmask")
+			assert_eq(net.gateway, "192.0.2.1", "gateway")
+			assert_false(net.dhcp, "dhcpc.1.status=disabled is NOT DHCP")
+			assert_eq(net.device_name, "U6IW", "controller-assigned hostname")
+			assert_eq(table.concat(net.dns, ","), "192.0.2.2,192.0.2.3",
+				"sorted by wire index, the empty one dropped")
+		end
+	},
+	{
+		name = "net push: a DHCP push and a blob with none of these keys",
+		fn = function()
+			local dh = inform._parse_net_system_cfg("dhcpc.1.status=enabled\nnetconf.1.ip=192.0.2.7")
+			assert_true(dh.dhcp, "enabled means DHCP")
+			local empty = inform._parse_net_system_cfg("wireless.1.ssid=x")
+			assert_nil(empty.ip, "no address pushed")
+			assert_false(empty.dhcp, "absent dhcpc.1.status is not DHCP")
+			assert_eq(#empty.dns, 0, "no nameservers")
+			-- Called on every system_cfg, including the degenerate ones.
+			assert_eq(#inform._parse_net_system_cfg(nil).dns, 0, "nil blob is a table, not an error")
+		end
+	},
+	{
+		name = "cfg-coverage: a replay sorts a push into consumed / inert / ignored",
+		fn = function()
+			local report = cfgcov.analyse(table.concat({
+				"# no wlan provisioned as no radio found",
+				"radio.1.phyname=wifi0",
+				"radio.1.channel=36",
+				"",
+				"wireless.1.devname=ath0",
+				"wireless.1.parent=wifi0",
+				"wireless.1.ssid=openuf-test",
+				"wireless.1.status=enabled",
+				-- Claimed by `^wireless%.%d+%.` yet read by nothing: the
+				-- MAC-filter decoy from PROTOCOL-VALIDATION.md.
+				"wireless.1.mac_acl.policy=deny",
+				"unifi.version=10.6.106",
+				"",
+			}, "\n"), real_parsers(), inform.RECOGNIZED_SYSTEM_CFG)
+
+			local function bucket(key)
+				for _, name in ipairs({"consumed", "inert", "ignored"}) do
+					for _, row in ipairs(report[name]) do
+						if row.key == key then return name end
+					end
+				end
+				return "(absent)"
+			end
+			assert_eq(bucket("wireless.1.ssid"), "consumed", "the SSID reaches a VAP")
+			assert_eq(bucket("radio.1.channel"), "consumed", "the channel reaches a radio")
+			assert_eq(bucket("wireless.1.mac_acl.policy"), "inert",
+				"recognized by prefix, read by nothing")
+			assert_eq(bucket("unifi.version"), "ignored", "neither claimed nor read")
+			assert_eq(report.lines, 8, "key=value lines")
+			-- The comment and the interior blank. The trailing newline's empty
+			-- element is dropped rather than counted.
+			assert_eq(report.blanks, 2, "the comment and the blank line")
+		end
+	},
+	{
+		name = "cfg-coverage: mutating the value catches a key a fallback hides from deletion",
+		fn = function()
+			-- radio.<n>.countrycode falls back to the unindexed
+			-- radio.countrycode, so DELETING either leaves the regdomain
+			-- unchanged and a deletion-only sweep reports both as unread.
+			-- Modelled here as a parser with exactly that fallback, so the
+			-- probe design is pinned rather than one controller's capture.
+			local parsers = {{"fallback", function(blob)
+				return blob:match("\na%.1%.k=([%w_]+)") or blob:match("\na%.k=([%w_]+)")
+			end}}
+			local blob = "\na.1.k=203\na.k=203"
+			local report = cfgcov.analyse(blob, parsers, {})
+			local verdict = {}
+			for _, name in ipairs({"consumed", "inert", "ignored"}) do
+				for _, row in ipairs(report[name]) do verdict[row.key] = name end
+			end
+			assert_eq(verdict["a.1.k"], "consumed", "the indexed key is read, fallback or not")
+			-- The unindexed one genuinely cannot be observed while the indexed
+			-- one shadows it -- the honest verdict, and why the sweep needs two
+			-- captures across a toggle rather than one.
+			assert_eq(verdict["a.k"], "ignored", "shadowed: no probe can move the output")
+		end
+	},
+	{
+		name = "cfg-coverage: a report never prints a pushed secret",
+		fn = function()
+			local parsers = {{"none", function() return nil end}}
+			local report = cfgcov.analyse(table.concat({
+				"aaa.1.wpa.psk=letmeinnow",
+				"aaa.1.radius.auth.1.secret=letmeinnow",
+				"aaa.1.iapp_key=letmeinnow",
+				"authkey=letmeinnow",
+				"aaa.1.ssid=openuf-test",
+			}, "\n"), parsers, {})
+			local out = cfgcov.format(report, {values = true})
+			assert_nil(out:find("letmeinnow", 1, true), "no secret in the report")
+			assert_true(out:find("openuf%-test") ~= nil, "a non-secret value still prints")
+			assert_true(out:find("<redacted>") ~= nil, "and says it was redacted")
 		end
 	},
 }

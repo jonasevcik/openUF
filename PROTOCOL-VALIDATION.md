@@ -4813,7 +4813,8 @@ and a leaf-name cross against `openuf/*.lua`. Counts: **627** key templates in 6
 distinct keys (177 of them `switch.*`), **469** templates in 4.3.28, **234** distinct keys in
 the captured pushes, **166** firmware keys with no leaf match in openUF (56 `switch.*`, 110
 others). The leaf cross is a candidate filter, not a verdict — every row below was then
-checked by hand against the code. Builds read: **U7LR 6.8.2** (Jan 2026) and **BZ2 4.3.28**,
+checked by hand against the code, and that hand check is now re-derivable mechanically with
+`tools/cfg-coverage.lua` (see "Axis 1, mechanically" below). Builds read: **U7LR 6.8.2** (Jan 2026) and **BZ2 4.3.28**,
 both MIPS/QCA956x and Wi-Fi 5 only; **nothing here is claimed for the ARM64 U6/U7 firmware**
 openUF impersonates. Rebuild the artifacts with `tools/fw-extract.sh <fw.bin> <outdir>` (build
 list via the `fw-update.ui.com` firmware API, see CLAUDE.local.md).
@@ -4841,6 +4842,53 @@ that already demoted `mac_acl.status`, `bcmc_l2_filter.status` and `multicast.in
 | `radio.<n>.ampdu.status`, `.rate.auto`, `.rate.mcs`, `.acktimeout`, `.ack.auto`, `.cwm.enable`, `.bgscan.status`, `.hard_noisefloor.status`, `.clksel` | `enabled`/`auto`/`64`/`disabled`/`0` | airMAX-era radio tuning, mostly `iwpriv` on QCA | nothing in mac80211 takes them per-radio | decline: airMAX/QCA-specific, constant in every capture (`cwm.mode` was already documented as a decoy) |
 | `wireless.<n>.authmode`, `.puren`, `.pureg`, `.element_adopt`, `.autowds`, `.vwire`, `.addmtikie` | `1`/`0`/`disabled` | legacy AirOS VAP flags | — | decline: legacy; `pureg` is already consumed as part of Minimum Data Rate |
 | `switch.port.<n>.{name,opmode}`, `switch.{status,vlan.status,dot1x.status,jumboframes}` | `PoE Out + Data`, `switch`, `disabled` | the in-wall's own 5 ports | openUF's per-port VLAN path | already correct: openUF keeps only ports carrying a real override (`inform.lua:3493`); the name/opmode-only rows are the U6-IW identity's port list, not an override |
+
+### Axis 1, mechanically: the replay sweep (`tools/cfg-coverage.lua`)
+
+The table above was hand-checked against the code, which is exactly the step that does not
+survive a refactor. `tools/cfg-coverage.lua` (added 2026-10-26) re-derives it mechanically and
+without reading the source at all: it replays a captured push through every pure parser, then
+re-replays it once per key with that key **deleted** and once per key with its value
+**replaced**, and sorts each key by whether any parser's output moved.
+
+- **consumed** — the output moved. Proof that some parser read the key, not an inference.
+- **inert** — nothing moved, and `RECOGNIZED_SYSTEM_CFG` claims the key.
+- **ignored** — nothing moved and nothing claims it.
+
+The value probes matter: deletion alone cannot see a key that a **redundant** key covers.
+`radio.<n>.countrycode` falls back to the unindexed `radio.countrycode`, so dropping either one
+leaves the regdomain unchanged and a deletion-only sweep calls both unread. Mutating the value
+exposes the read instead — eight keys (`system.timezone`, `cron.status`, `ntpclient.status`,
+`ebtables.status`, `dhcpc.<n>.status` among them) move from inert to consumed on that probe
+alone. Where two keys shadow each other outright, the honest verdict is still "unobservable",
+which is why a verdict needs **two** captures across the controller toggle, not one.
+
+On the 2026-10-26 lab push (10.6.106, U6-IW identity, four VAPs: PSK + EAP + two guest), 665
+key=value lines and 29 comment/blank lines: **296 consumed, 254 inert, 115 ignored**. What it
+establishes beyond the hand check:
+
+- Every axis-1 candidate above is confirmed unread by the oracle: `auth_cache`,
+  `eapol_version`, `country_beacon`, `tdls_prohibit`, `p2p`, `p2p_cross_connect`,
+  `wireless.<n>.wmm`, `wpa.<n>.pairwise` and `radio.<n>.antenna.gain` land in **inert**;
+  `qos.mode` and `radio.outdoor` in **ignored**.
+- **`RECOGNIZED_SYSTEM_CFG` over-claims by 254 keys.** Its patterns are prefix-coarse on
+  purpose (`^aaa%.%d+%.` covers the whole per-WLAN block), so `_report_dropped_keys`
+  systematically *under*-reports what openUF ignores. "Recognized" is a claim about a prefix;
+  only the replay is evidence about a key.
+- Several keys that look load-bearing are inert because openUF joins differently from the
+  firmware: `aaa.<n>.devname` (openUF joins `aaa` to `wireless` by **index**; devname feeds
+  only the OWE hidden-half pairing), `aaa.<n>.ssid` (the SSID is taken from
+  `wireless.<n>.ssid`) and `wireless.<n>.security` (the cipher suite is derived from the
+  `wpa.key.<k>.mgmt` list). Each is a correct verdict, and each is a key a source grep would
+  have scored as consumed.
+- The controller pushes `aaa.<n>.wpa.psk` on a **WPA-Enterprise** WLAN too (both EAP VAPs in
+  this capture carry one). openUF ignores it there, which is right — but it means a capture's
+  `wpa.psk` is not evidence that a WLAN is PSK.
+
+Run it after implementing a key family and expect that family wholly in **consumed**; a row
+left behind is a consumer wired to a producer that does not exist, this repo's recurring defect.
+Usage is in `tools/validation/README.md`. Secrets are redacted even under `--values`, since the
+output is meant to be pasted here.
 
 ### Axis 1b — the reverse direction, which bounds how far the firmware can be trusted
 

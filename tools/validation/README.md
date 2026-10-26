@@ -159,6 +159,34 @@ Three things that will cost you time otherwise:
   aborts with exit 143. Kill by PID, or match on something the wrapper does not
   contain.
 
+### What openUF actually did with the push
+
+A capture answers "what was sent"; `tools/cfg-coverage.lua` answers "what did we
+read". Recover a `system_cfg` from the dump (`config.debug_dump_file`, see
+USAGE.md) into a plain file, then, from the repo root:
+
+```sh
+eval $(luarocks path --local)
+lua tools/cfg-coverage.lua /tmp/syscfg.txt --shapes          # one row per key shape
+lua tools/cfg-coverage.lua /tmp/syscfg.txt --values          # with the wire value
+```
+
+It replays the blob through every pure parser, then re-replays it once per key
+with that key deleted and with its value replaced, and sorts the keys by whether
+any parser's output moved: **consumed** (proof that something read it),
+**inert** (openUF's recognized-key list claims it, yet nothing reacts to this
+value) and **ignored** (nothing looks at it at all). Secrets are redacted even
+under `--values`.
+
+Two uses:
+
+- After implementing a key family, expect every key of that family in
+  **consumed**. A row left in inert/ignored is a consumer that never got wired
+  up — this repo's recurring defect.
+- For a *new* candidate key, run the tool over two captures taken across the
+  controller toggle and diff the two reports. One capture cannot tell a setting
+  from a decoy: per CLAUDE.md the discriminator is the key whose value *changes*.
+
 `override_inform_host` on the `mgmt` setting did not persist on 10.4.57 in the
 run above; setting `super_identity.hostname` to the controller's container IP was
 enough for adoption and informs to work. If you hit `invalid inform_ip` in

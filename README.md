@@ -254,6 +254,13 @@ python3 tools/test_controller.py --adopt --verbose
 cd openuf && lua inform.lua
 ```
 
+`tools/cfg-coverage.lua <capture>` answers the other half of a capture: of the
+keys the controller pushed, which ones openUF actually reads. It replays the blob
+through every parser, once per key with that key removed and once with its value
+changed, and reports each key as consumed, inert or ignored — so a consumer wired
+to a key nothing produces shows up as a row instead of as a silent no-op. See
+[`tools/validation/README.md`](tools/validation/README.md).
+
 On a real AP, `tools/heartbeat-probe.lua` reports what one inform actually costs
 that board — every process spawned and file opened, per command and path — by
 building its own payload in a throwaway process alongside the running daemon.
