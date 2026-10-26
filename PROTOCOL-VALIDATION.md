@@ -4412,9 +4412,18 @@ ARM64 U6/U7 (incl. U6-IW) stays opaque; nothing below is claimed for it. Method:
 - **Closed, no code needed:** capability bits are per-board data in `ubnthal.ko`, not readable for a U6-IW, and the controller-side sweep already
   decides them; 4.3.28/6.8.2 `mcad` adds `default_url`, `selfrun_beacon`, `last_dns_fail_count`, `ipv6_ll_inform_url`, none of which the controller
   sends or reads (jar string search); selfrun (3 fails, `mgmt.selfrun_guest_mode`) and `setdefault`/`restore-default` strings are unchanged from 4.0.15.
-- **Open: WiFi Experience.** 4.3.28+ `libubnt` has a new satisfaction model (`satisfaction_new_impl_enabled`, `satisfaction_experimental_enabled`,
-  `calc_satisfaction_mov`, per-band latency/rate profile tables, 14 reason bits up to `0x8000` in 6.8.2 against 8 in 4.0.15, `satisfaction_exp`/`_subscores_now`
-  in the AP report). openUF still ports the 4.0.15 formula. The controller reads `satisfaction`, `_now`, `_real`, `_reason`, `anomalies` only.
+- **Open: WiFi Experience, decoded but not ported.** 4.3.28 gates a new model behind `satisfaction_new_impl_enabled` (default 0); in 6.8.2
+  `calc_sta_satisfaction` (U7LR) is that model with no flag. Checked by running the real code in an emulator (`tools/fw-oracle`) and a
+  disassembly. Result block at struct+520 (score, reason @+8, anomalies @+16, 16 sub-scores @+24) plus an experimental twin at +864; the
+  controller gets the first. Terms: retry (needs ≥30 tries; ratio p = retries·100/tries: p≤25 → 100, else 100 − (min(p,105)−25)·51/100, so
+  floor 60; only when the **VAP's** phy mode, struct+1560, is 17, 18 or 23, else 100: oracle-exact over modes × ratios), rate (5/6 GHz only:
+  f(rate·free-airtime%/100), a soft-float curve, 0 below ~1000 and 92 at 20000), tcp latency (100 − (x−100)/15), and one 0/100 or stepped term each
+  for ip timeout, arp timeout (`!= 0` → 100), dns timeout (100 − 10n), dns latency (curve), icmp rtt (100 − (x−100)/15), disconnects (100 − 10(n−1)),
+  no-DHCP and drops (`sat_xretry_penalty_thrs`/`_metric_ranges` tables). The 4.0.15 signal, TCP-loss, stream-efficiency, sleepy and wifi-latency
+  terms (bits 0x1/0x4/0x20/0x40/0x80) are not evaluated in it. `calc_sta_satisfaction_mov` averages each term over 4 samples. Charts have 16 keys.
+  **Not ported because** the inputs are not pinned down: struct offsets 376/416/1560/328–340/1216–1232/1244–1252/1492 are named only by inference
+  (rate, free-airtime %, VAP phy mode, tries/retries, network flags), the enum behind modes 17/18/23 is unknown, and the controller does not
+  know the 8 new chart keys (not in the jar; the UI chunks were not checked). A port would drop today's signal term, which is a visible change.
 - Per-feature results are in the feature matrix rows (27 = SAE tuning, 28 = SAE station keys).
 
 ## Open questions
