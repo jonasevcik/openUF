@@ -77,9 +77,11 @@ Put every verification step into a tier and name the tier:
   never a block's presence (decoys: `mac_acl.status`, `bcmc_l2_filter.status`, `qos.vap.*`).
 - Controller protocol questions: decompile the controller (CFR, not jadx, on
   `internal-dependencies.jar`) or call live frontend functions. Don't infer from
-  behaviour. For what the AP *does* with a key, read the firmware: current builds are
-  encrypted, but UAP BZ2 3.9.27 to 4.0.15 are plaintext (`/usr/etc/syswrapper.sh`,
-  `/bin/mcad`). Label such claims "firmware-confirmed for 3.9.27 to 4.0.15".
+  behaviour. For what the AP *does* with a key, read the firmware: the MIPS/QCA956x builds
+  (UAP-AC family, incl. current 6.8.2) are plaintext (`/usr/etc/syswrapper.sh`,
+  `/usr/bin/mcad`); ARM64 U6/U7 images are opaque. Label claims with the build read,
+  e.g. "firmware-confirmed for BZ2 4.3.28", and don't generalise to Wi-Fi 6/7 APs.
+  Extract a rootfs with `tools/fw-extract.sh <fw.bin> <outdir>` (needs xz, cpio, binwalk).
 - Absence of a wire key is often a sentinel for "off/auto". Tear down via an explicit
   signal, or via a marker/ledger when absence is ambiguous (`openuf_*` stamps, `st.*` ledgers).
 - A controller-initiated kick (one-shot deauth) is not a block (persistent nft drop).
