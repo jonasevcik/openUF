@@ -2555,6 +2555,29 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes the SAE tuning keys only on an SAE WLAN",
+		fn = function()
+			for _, sec in ipairs({"wpa3", "wpa2/wpa3", "wpa2"}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = sec,
+						 x_passphrase = "hunter22", sae_anti_clogging = "5",
+						 sae_sync = "7", sae_groups = "19 20"},
+					}}, nil)
+					local s = db.wireless.openuf_radio0_corp
+					if sec == "wpa2" then
+						assert_eq(s.sae_groups, nil, "wpa2: no groups")
+						assert_eq(s.hostapd_bss_options, nil, "wpa2: no raw options")
+					else
+						assert_eq(s.sae_groups, "19 20", sec .. ": groups")
+						assert_eq(table.concat(s.hostapd_bss_options, ","),
+							"sae_anti_clogging_threshold=5,sae_sync=7", sec .. ": raw options")
+					end
+				end)
+			end
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes wpa_group_rekey and leaves it alone when absent",
 		fn = function()
 			for _, c in ipairs({{"3600", "3600"}, {"0", "0"}, {nil, nil}}) do

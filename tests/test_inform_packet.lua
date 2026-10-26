@@ -1686,6 +1686,28 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses the SAE tuning keys",
+		fn = function()
+			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, v = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.sae.anti_clogging=5\naaa.1.sae.sync=7\n"
+				.. "aaa.1.sae.has_groups=enabled\n"
+				.. "aaa.1.sae.groups.2.group=20\naaa.1.sae.groups.1.group=19\n")
+			assert_eq(v[1].sae_anti_clogging, "5", "anti_clogging")
+			assert_eq(v[1].sae_sync, "7", "sync")
+			assert_eq(v[1].sae_groups, "19 20", "groups sorted by index")
+			local _, bad = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.sae.anti_clogging=0\naaa.1.sae.sync=x\n"
+				.. "aaa.1.sae.has_groups=enabled\naaa.1.sae.groups.1.group=19;x\n")
+			assert_eq(bad[1].sae_anti_clogging, nil, "0 is off")
+			assert_eq(bad[1].sae_sync, nil, "non-numeric")
+			assert_eq(bad[1].sae_groups, nil, "non-numeric group")
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_eq(none[1].sae_groups, nil, "no keys -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.wpa.group_rekey",
 		fn = function()
 			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

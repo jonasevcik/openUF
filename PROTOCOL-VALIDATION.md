@@ -1426,8 +1426,8 @@ wlanconf: `wpa3_support: true`, `wpa3_transition: true`, `pmf_mode: optional`. (
 revision of this document claimed the mixed choice left `wpa3_support` false and that a mixed
 WLAN therefore never emits these keys. Wrong: the WLAN-side gate passes; what suppresses the
 whole SAE block is the *per-device radio* capability check described in the WPA3 section.)
-openUF used to map these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`. Neither is a
-wifi-iface UCI option, so the writes were dropped in silence and have been removed (feature 27).
+openUF maps them to hostapd's `sae_anti_clogging_threshold` / `sae_sync` through `hostapd_bss_options` (feature 27).
+Neither is a wifi-iface UCI option; the radio-level `hostapd_options` is ignored for a BSS.
 
 ### `wireless.<n>.*` — per-SSID radio binding and behavior
 
@@ -4373,7 +4373,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 24 | Security tab WPA2/WPA3 protocol options | **None** | ℹ️ Not capability-driven from anything openUF sends. No security-capability field exists in the payload; `ucihelper`'s `SECURITY_MAP` (`wpa2`→`psk2`, `wpa3`→`sae`, `wpa2/wpa3`→`sae-mixed`, `wpa-enterprise`→`wpa2+ccmp`) is a one-way map of a choice the controller has already made. The dropdown's options come from the controller's own internal per-model database, keyed on the reported `model`/`platform`. Not fixable here. |
 | 25 | Band Steering / BSS Transition / DTIM | `wireless.<n>.no2ghz_oui` / `aaa.<n>.bss_transition` / `wireless.<n>.dtim_period` | ✅ All three confirmed live by individual before/after `system_cfg` diffs, and ✅ **a real client steered 2.4 → 5 GHz** on the AX3000T 2026-09-02. The whole exchange is in the AP's log: the station associates on `phy0-ap0` (2.4 GHz, ch 11) at 05:33:23, and 72 s later `phy0-ap0: BSS-TM-RESP <sta> status_code=0 target_bssid=00:00:5e:00:53:05` — accepted, naming the **5 GHz** BSSID — followed in the same second by `phy1-ap0: associated` and `phy0-ap0: Prune association`. `auth_alg=ft` on both, so the move used fast roaming. usteer had been up since boot and was never restarted, so this was its own unprompted decision. Two negative results worth keeping: usteer's per-BSS `roam_events` counters stayed at 0 through it, so they do not count BTM-driven band steers; and every client that was *not* steered had a concrete reason visible in `ubus call usteer get_clients` / `hostapd get_clients` — either no 5 GHz sighting at all, or `rrm: [0,0,0,0,0]` with the BSS-Transition bit clear in `extended_capabilities`. "Nothing moved" is not evidence of a broken steerer. |
 | 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ⚠️ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt side does not work and is not implemented.** openUF writes `wps_device_name` + `ap_setup_locked` (both valid wifi-iface options — confirmed present in the schema and in `/usr/share/ucode/wifi/`), but OpenWrt emits the WPS/WSC block that carries `device_name` only under `if (config.wps_possible && length(config.config_methods))` (`ap.uc:227`), and `config_methods` is populated solely from `wps_pushbutton`/`wps_label`. openUF sets neither, so WPS never activates and no WSC Device Name IE reaches a beacon. Verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T (filogic), both 25.12.5, same gate on both; no live BSS conf carries any WPS key. Turning WPS on to broadcast a name trades a real security surface for a cosmetic feature — deliberately not done. |
-| 27 | SAE Anti-clogging / Sync Time | `aaa.<n>.sae.anti_clogging` / `.sae.sync` | ❌ **Not applicable on OpenWrt.** Key names, integer shape and `isWpa3()` gating are confirmed via an unambiguous decompiled method body, and the emitting (true WPA3) case could not be live-diffed — forcing pure WPA3 tripped the [config-sync issue](#config-sync-can-get-stuck-after-informs-stabilise). It does not matter: `sae_anti_clogging_threshold` and `sae_sync` are real hostapd config keys but are **not** wifi-iface UCI options. Verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T (filogic), both 25.12.5, against all three places an option can be declared — the wifi-iface schema, `/usr/share/ucode/wifi/` and `hostapd.sh`'s `config_add_*` lists. Neither name appears in any of them, on either board, so openUF's writes were stored in UCI and dropped in silence. Both writes removed; the wire keys are no longer parsed either, since nothing could consume them. |
+| 27 | SAE tuning | `aaa.<n>.sae.anti_clogging` / `.sae.sync` / `.sae.has_groups` + `.sae.groups.<k>.group` | ✅ Hardware-confirmed 2026-10-26. Firmware 6.8.2 `ubntbox` writes `sae_anti_clogging_threshold=%d`, `sae_sync=%d`, `sae_groups=` (absent from 4.0.15, so the old "cannot be applied" verdict rested on the schema alone). They are no wifi-iface option; the per-BSS raw-line list is `hostapd_bss_options` (`ap.uc:612`), while `hostapd_options` is radio-level (`hostapd.uc:548`) and is silently ignored: a first attempt with it left hostapd without the lines. Temp WPA3-only WLAN (REST `sae_anti_clogging=7`, `sae_sync=9`) → both lines in every BSS on both APs; home WPA2/WPA3 WLAN got 5/5. Sent only for `sae`/`sae-mixed`. |
 | 28 | PMF (802.11w) / Multicast Enhancement | `aaa.<n>.pmf.status`/`.pmf.mode`; `wireless.<n>.mcast.enhance` | ✅ Confirmed live by `system_cfg` diff. PMF is what actually carries WPA2/WPA3 transition intent on this model. |
 | 29 | Channel width | `radio.<n>.ieee_mode` → `wifi-device.htmode` | ✅ Confirmed live both directions: `11nght20`↔`11nght40` follows the per-AP 2.4 GHz Channel Width control, and the pushed value reaches UCI (`radio0` `HT20`, `radio1` `HT40`). Previously parsed by nothing, so width never applied. |
 | 30 | IoT Optimization: Lock 2.4 GHz to Channel 6 | `radio.<n>.channel` (no dedicated key) | ✅ Confirmed live end-to-end: the toggle changes the 2.4 GHz radio's `channel` from `auto` to `6`, and UCI `radio0.channel` follows (verified 11 → 6, so it is not a coincidence of the default). |
@@ -4390,6 +4390,18 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 41 | Discovery requests (UniFi app, WiFiman Discovery, Device Discovery Tool) | UDP 10001 request `01 00 00 00` / `02 08 00 00`, reply `01 00` / `02 09` + announce TLVs from port 10001 | ✅ Wire format captured 2026-10-25 from a real UCG Ultra (see "Discovery requests (UDP 10001)"). AP always-listening and targeted `01 04` firmware-confirmed for UAP 4.0.15. openUF answers all three; lab-validated only (home APs run `l2_announce = false`), not seen in WiFiman's UI. |
 
 ---
+
+## Newer firmware audit (4.3.28, 6.8.2)
+
+Builds read (plaintext MIPS/QCA956x, `tools/fw-extract.sh`): BZ2 3.9.27, 4.0.15 (2019), BZ2 4.3.28 (2021), U7LR 6.8.2 (2026).
+ARM64 U6/U7 (incl. U6-IW) stays opaque; nothing below is claimed for it. Method: `strings` over `ubntbox`, `mcad`, `libubnt`,
+`syswrapper.sh`; the `aaa.%d.*` key table in `ubntbox` is the firmware's controller-key → hostapd-line map.
+
+- 4.0.15 has no WPA3/OWE/PPSK template; 4.3.28 adds more `aaa.*` keys; **6.8.2 `ubntbox` holds the full hostapd generator**:
+  `sae.{pwe,confirm_immediate,anti_clogging,sync,groups,psk.<n>.{mac,vlan,id}}`, `owe_ptk_workaround`, `fils.*`,
+  `ft_r0_key_lifetime`/`r1_max_key_lifetime`/`rkh_pos_timeout`/`ft_over_ds`/`rsn_preauth`, `wpa.{strict_rekey,gmk_rekey,group_update_count}`,
+  `wpa3.enhanced_192`, `btm_disassoc.{status,threshold}`, `disable_na_mcast_to_ucast`. 6.8.2 also ships its own `wpad`, `scan-rrm`, `airtime-scan`.
+- Per-feature results are in the feature matrix rows (27 = SAE tuning).
 
 ## Open questions
 
@@ -4412,10 +4424,6 @@ through the real UI with the resulting wire payload captured or the effect verif
 - ~~**hostapd's acceptance of `wps_device_name`/`ap_setup_locked`**~~ — ✅ resolved
   2026-09-10: the option names are valid, but OpenWrt never emits the WPS block that would
   carry them (see feature 26). The feature is now documented as not implemented.
-- **SAE anti-clogging / sync time** cannot be applied on OpenWrt at all:
-  `sae_anti_clogging_threshold` and `sae_sync` are real hostapd keys but are declared in no
-  wifi-iface schema, no ucode generator and no `hostapd.sh` `config_add_*` list, on either
-  board. openUF no longer writes them (see feature 27).
 - **PoE self-reporting** could be reopened if the validation environment ever gains a real
   switch container, or if a non-Parent-Device UI surface for those fields is found.
 

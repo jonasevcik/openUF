@@ -1402,6 +1402,19 @@ function M.apply_config(resp, cfg, opts)
 			if vap.uapsd ~= nil then extra.uapsd = vap.uapsd and "1" or "0" end
 			-- GTK rekey interval (s, 0 = off); hostapd's own default is 86400.
 			if vap.group_rekey then extra.wpa_group_rekey = vap.group_rekey end
+			-- SAE tuning, as the firmware writes it (6.8.2 ubntbox). Only on a WLAN
+			-- that really offers SAE. sae_groups is a wifi-iface option;
+			-- hostapd's anti-clogging threshold and sync time are not, so they
+			-- go in as raw lines (hostapd_bss_options: per-BSS raw lines, ucode generator).
+			if vap.security == "wpa3" or vap.security == "wpa2/wpa3" then
+				if vap.sae_groups then extra.sae_groups = vap.sae_groups end
+				local raw = {}
+				if vap.sae_anti_clogging then
+					raw[#raw + 1] = "sae_anti_clogging_threshold=" .. vap.sae_anti_clogging
+				end
+				if vap.sae_sync then raw[#raw + 1] = "sae_sync=" .. vap.sae_sync end
+				if #raw > 0 then extra.hostapd_bss_options = raw end
+			end
 			if vap.qbssload ~= nil then
 				-- "Force WiFi 4 Mode" (IoT Optimization) sends
 				-- wireless.<n>.qbssload=disabled alongside iot=enabled. The
