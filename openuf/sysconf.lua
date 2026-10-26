@@ -65,10 +65,26 @@ M.CRON_COMMANDS = {
 
 -- Wire commands openUF's inform loop already does on its own, so they need
 -- no crontab line: the WiFi Blackout Schedule's re-check (wlansched.lua),
--- done on every heartbeat.
+-- done on every heartbeat, and the walled garden's DNS refresh below.
 M.CRON_IN_DAEMON = {
 	["syswrapper.sh schedule-action"] = true,
 }
+
+-- Same, but for a verb the controller sends with an argument: the walled
+-- garden's index (always 1 so far). Re-resolving the garden's domains is
+-- inform._guest_wg_resync, on the same ten minutes this job asks for.
+M.CRON_IN_DAEMON_PATTERNS = {
+	"^syswrapper%.sh refresh%-walled%-garden %d+$",
+}
+
+local function in_daemon(cmd)
+	if type(cmd) ~= "string" then return false end
+	if M.CRON_IN_DAEMON[cmd] then return true end
+	for _, p in ipairs(M.CRON_IN_DAEMON_PATTERNS) do
+		if cmd:match(p) then return true end
+	end
+	return false
+end
 
 local function get_uci()
 	if M._uci then return M._uci end
@@ -321,7 +337,7 @@ function M.apply_cron(cron)
 		for _, job in ipairs(cron.jobs or {}) do
 			if job.enabled ~= false then
 				local runs = M.CRON_COMMANDS[job.cmd]
-				if M.CRON_IN_DAEMON[job.cmd] then
+				if in_daemon(job.cmd) then
 					-- Nothing to install.
 				elseif not runs then
 					io.stderr:write("sysconf: cron job not installed -- not a command this build provides: "

@@ -3628,6 +3628,11 @@ local RECOGNIZED_SYSTEM_CFG = {
 	-- Guest portal on/off (M._guest_wlans) and where it is (guestportal.lua).
 	"^redirector%.status$",
 	"^redirector%.url$",
+	-- The walled garden's domain half (guestportal.parse). dnsmasq.status and
+	-- dnsmasq.<n>.* are not here: those ask for a local DNS answerer openUF
+	-- does not run, so they stay in the report.
+	"^dnsmasq%.walled_garden%.%d+%.status$",
+	"^dnsmasq%.walled_garden%.%d+%.site%.%d+%.",
 }
 
 local RECOGNIZED_MGMT_CFG = {
@@ -4689,6 +4694,63 @@ M._guest_server = nil
 M._guest_ctx    = nil
 M._guest_built  = nil
 
+-- The walled garden's resolved domain half as reconcile wants it. Empty when
+-- the push carries no garden domains, so the rules simply are not there.
+function M._guest_garden(st)
+	local store = type(st.guest_wg_ips) == "table" and st.guest_wg_ips or {}
+	return {
+		allowed    = M._guestportal.garden_ips(store.allowed),
+		restricted = M._guestportal.garden_ips(store.restricted),
+	}
+end
+
+-- Resolve the garden's domains and keep the answers in state. Driven on every
+-- push and then on the controller's own cadence for the job it asks the device
+-- to run (`*/10 * * * *  syswrapper.sh refresh-walled-garden 1`, which
+-- sysconf.lua therefore installs no crontab line for). Returns true when the
+-- address set changed, i.e. when the chains have to be rebuilt.
+M.GUEST_WG_INTERVAL = 600
+M._guest_wg_next = 0
+function M._guest_wg_resolve(st)
+	local gp, spec = M._guestportal, st.guest_portal
+	local names = {
+		allowed    = (type(spec) == "table" and spec.wg_allowed) or {},
+		restricted = (type(spec) == "table" and spec.wg_restricted) or {},
+	}
+	M._guest_wg_next = M._time() + M.GUEST_WG_INTERVAL
+	if #names.allowed == 0 and #names.restricted == 0 then
+		if st.guest_wg_ips == nil then return false end
+		st.guest_wg_ips = nil
+		M._state.save(st)
+		return true
+	end
+	local store = type(st.guest_wg_ips) == "table" and st.guest_wg_ips or {}
+	local changed = false
+	local out = {}
+	for _, which in ipairs({"allowed", "restricted"}) do
+		local map, _, diff = gp.resolve_garden(names[which], store[which])
+		out[which] = map
+		changed = changed or diff
+	end
+	if changed then
+		st.guest_wg_ips = out
+		M._state.save(st)
+	end
+	return changed
+end
+
+-- The ten-minute refresh itself, from the heartbeat.
+function M._guest_wg_resync(st)
+	local spec = st and st.guest_portal
+	if not (M._guestportal and type(spec) == "table" and spec.enabled) then return false end
+	if #(spec.wg_allowed or {}) == 0 and #(spec.wg_restricted or {}) == 0 then return false end
+	if M._time() < M._guest_wg_next then return false end
+	if not M._guest_wg_resolve(st) then return false end
+	io.stderr:write("guestportal: walled-garden addresses changed -- rebuilding\n")
+	M._guest_enforce(st)
+	return true
+end
+
 -- Make the kernel and the listener match st.guest_portal.
 function M._guest_enforce(st, vaps)
 	local gp = M._guestportal
@@ -4709,7 +4771,8 @@ function M._guest_enforce(st, vaps)
 		M._state.save(st)
 	end
 	vaps = vaps or M._guest_vaps(st)
-	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_selfrun_on)
+	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_selfrun_on,
+		M._guest_garden(st))
 	M._guest_built = guest_vaps_key(vaps)
 	M._guest_ctx = {url = spec.url, ap = st.mac, vaps = vaps}
 	if not M._guest_server then
@@ -4737,6 +4800,9 @@ function M._guest_apply_push(sys_raw, st)
 	end
 	spec.unknown = nil
 	st.guest_portal = spec.enabled and spec or nil
+	-- Before the rebuild, so this push's garden is enforced by it rather than
+	-- ten minutes later.
+	pcall(M._guest_wg_resolve, st)
 	M._guest_enforce(st)
 	return true
 end
@@ -6016,6 +6082,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._maybe_service_scan_request, cfg)
 	pcall(M._l2guard_resync, st)
 	pcall(M._guest_resync, st)
+	pcall(M._guest_wg_resync, st)
 	pcall(M._hairpin_resync)
 	pcall(M._usteer_filter_resync)
 	pcall(M._block_resync, st)

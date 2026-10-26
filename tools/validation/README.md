@@ -260,6 +260,54 @@ pinned down, both now covered by tests:
 - `wireless.<n>.security=none` on the same push. The discriminator is
   `aaa.<n>.wpa.key.<k>.mgmt`, never that field.
 
+## 1d. The guest walled garden (both forms)
+
+No extra service: the garden is site settings plus one guest WLAN. With `$J` and `$B`
+from 1b:
+
+```sh
+# The guest settings doc's _id (key=guest_access)
+GA=$(curl -sk -b $J $B/api/s/default/get/setting/guest_access \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['_id'])")
+
+# One IP entry and two domain entries in the SAME list -- the controller splits
+# them by what each one looks like, not by which list it is in.
+curl -sk -b $J -X PUT $B/api/s/default/set/setting/guest_access/$GA \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"guest_access","portal_enabled":true,"auth":"none",
+       "allowed_subnet_1":"www.example.net","allowed_subnet_2":"198.51.100.7/32",
+       "allowed_subnet_3":"example.com","restricted_subnet_4":"ads.example.org"}'
+
+# A guest WLAN, or nothing guest-related is pushed at all. ap_group_ids and
+# usergroup_id are required (api.err.ApGroupMissing otherwise); copy them from an
+# existing WLAN.
+curl -sk -b $J -X POST $B/api/s/default/rest/wlanconf -H 'Content-Type: application/json' \
+  -d '{"name":"openuf-guest","enabled":true,"security":"open","is_guest":true,
+       "wlangroup_id":"<id>","ap_group_ids":["<id>"],"ap_group_mode":"all","usergroup_id":"<id>"}'
+
+# Then force-provision and read the push out of the debug dump (section 3's
+# debug_dump_file), not stat/device -- that document carries no system_cfg on this build.
+docker exec openuf-validation-ap grep -c "handle_response failed" /tmp/inform.log   # 0
+docker exec openuf-validation-ap sh -c 'nft list chain bridge openuf_guest guestin'
+```
+
+Expect, above every drop, one `ip daddr <ip> accept` per resolved address plus
+`ip daddr 198.51.100.7 accept` (no port — that is the shape that marks a garden entry),
+and the egress twins in `guestout`. A name that does not resolve is logged as
+`walled garden: <name> did not resolve …` and left out.
+
+To check the generated statements against real `nft` rather than the mock, run them on a
+dummy netdev in the AP container, twice, and compare:
+
+```sh
+docker exec openuf-validation-ap sh -c 'ip link add openuf-test0 type dummy; ip link set openuf-test0 up'
+# ... reconcile() with vaps = {{ifname = "openuf-test0", bridge_mac = "02:00:00:00:00:aa"}}
+docker exec openuf-validation-ap sh -c 'nft delete table bridge openuf_guest; ip link del openuf-test0'
+```
+
+Verified end to end on 2026-10-26 against 10.6.106; the capture and the findings are in
+PROTOCOL-VALIDATION.md, "The walled garden: two forms".
+
 ## 2. Complete the controller's first-run setup
 
 > The UI walkthrough, kept because it explains *what* each step is for. To just get

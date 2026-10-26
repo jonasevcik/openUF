@@ -272,6 +272,29 @@ return {
 		end
 	},
 	{
+		name = "sysconf: the walled garden's refresh job is left to the inform loop, quietly",
+		fn = function()
+			-- Lab capture (10.6.106, 2026-10-26): a guest walled garden with a
+			-- domain in it adds this job. openUF re-resolves on the same ten
+			-- minutes in inform._guest_wg_resync, so there is nothing to install
+			-- -- and the argument must not make it look like an unknown command.
+			local _, cmds, files = fresh(system_db("IST-5:30", nil, nil))
+			local cron = sysconf.parse("cron.status=enabled\ncron.1.status=enabled\ncron.1.user=root\n"
+				.. "cron.1.job.1.status=enabled\ncron.1.job.1.schedule=*/10 * * * *\n"
+				.. "cron.1.job.1.cmd=syswrapper.sh refresh-walled-garden 1\n").cron
+			local out = with_stderr(function() assert_false(sysconf.apply_cron(cron), "nothing to install") end)
+			assert_nil(files[sysconf.CRONTAB], "no crontab line")
+			assert_eq(#cmds, 0, "crond not touched")
+			assert_eq(out, "", "and nothing logged")
+			local odd = sysconf.parse("cron.status=enabled\ncron.1.status=enabled\n"
+				.. "cron.1.job.1.status=enabled\ncron.1.job.1.schedule=*/10 * * * *\n"
+				.. "cron.1.job.1.cmd=syswrapper.sh refresh-walled-garden; reboot\n").cron
+			local said = with_stderr(function() assert_false(sysconf.apply_cron(odd), "not installed") end)
+			assert_nil(files[sysconf.CRONTAB], "a verb with something appended is not the verb")
+			assert_true(said:find("not a command this build provides", 1, true) ~= nil, "and is reported")
+		end
+	},
+	{
 		name = "sysconf: apply_cron removes the managed block when the push stops carrying jobs",
 		fn = function()
 			local _, cmds, files = fresh(system_db("IST-5:30", nil, nil))

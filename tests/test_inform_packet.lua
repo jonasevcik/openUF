@@ -6583,6 +6583,7 @@ return {
 			local calls = {reconcile = {}, listen = 0, closed = 0}
 			inform._guestportal = {
 				parse = real.parse, is_guest_rule = real.is_guest_rule, PORT = real.PORT,
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
 				bridge_mac = function(ifname) return ifname == "phy0-ap1" and "02:00:00:00:00:aa" or nil end,
 				reconcile = function(spec, vaps, macs, selfrun)
 					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs,
@@ -6980,6 +6981,7 @@ return {
 			local built = 0
 			inform._guestportal = {
 				bridge_mac = function() return "02:00:00:00:00:aa" end,
+				garden_ips = real.garden_ips,
 				reconcile = function() built = built + 1; return 1 end,
 				listen = function() return {close = function() end} end, PORT = 1,
 			}
@@ -7005,6 +7007,70 @@ return {
 			end)
 			inform._guestportal, inform._time, inform._ucihelper = real, rt, nil
 			inform._guest_server, inform._guest_built, inform._guest_ctx, inform._guest_next = nil, nil, nil, 0
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: the walled garden is resolved on the push and every ten minutes after",
+		fn = function()
+			local real, rt, save = inform._guestportal, inform._time, inform._state.save
+			local orig_resolve = real._resolve
+			local built, saved, passed = 0, 0, nil
+			local answers = {["a.example"] = {"198.51.100.20"}}
+			-- resolve_garden is the real one, so the resolver seam is replaced on
+			-- the real module: that is what its closure reaches.
+			real._resolve = function(n) return answers[n] or {} end
+			inform._guestportal = {
+				bridge_mac = function() return "02:00:00:00:00:aa" end,
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+				reconcile = function(_, _, _, _, garden)
+					built = built + 1
+					passed = garden
+					return 1
+				end,
+				listen = function() return {close = function() end} end, PORT = 1,
+			}
+			inform._state.save = function() saved = saved + 1 end
+			inform._ucihelper = {wlanconf_ifnames = function() return {} end}
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_token = "00", guest_portal = {enabled = true,
+					url = "http://192.0.2.2/", wg_allowed = {"a.example"}, wg_restricted = {}}})
+				inform._guest_wg_next = 0
+				assert_true(inform._guest_wg_resolve(st), "first resolve: an address appeared")
+				assert_eq(table.concat(st.guest_wg_ips.allowed["a.example"], ","), "198.51.100.20",
+					"kept in state, so a reboot rebuilds without waiting on DNS")
+				assert_eq(saved, 1, "written once")
+				inform._guest_enforce(st)
+				assert_eq(table.concat(passed.allowed, ","), "198.51.100.20",
+					"and handed to reconcile as addresses")
+				built, saved = 0, 0
+				assert_false(inform._guest_wg_resync(st), "not before the interval")
+				assert_eq(built, 0, "no rebuild")
+				answers["a.example"] = {"198.51.100.22"}
+				now = now + inform.GUEST_WG_INTERVAL
+				with_stderr(function()
+					assert_true(inform._guest_wg_resync(st), "the record moved: re-resolved and rebuilt")
+				end)
+				assert_eq(built, 1, "rebuilt once")
+				assert_eq(table.concat(passed.allowed, ","), "198.51.100.22", "with the new address")
+				now = now + inform.GUEST_WG_INTERVAL
+				assert_false(inform._guest_wg_resync(st), "an unchanged answer rebuilds nothing")
+				assert_eq(built, 1, "still one rebuild")
+				-- A garden that empties takes its addresses with it.
+				st.guest_portal.wg_allowed = {}
+				inform._guest_wg_next = 0
+				assert_true(inform._guest_wg_resolve(st), "the garden emptied")
+				assert_nil(st.guest_wg_ips, "and state no longer carries addresses")
+				assert_false(inform._guest_wg_resync(st), "nothing to refresh")
+				assert_false(inform._guest_wg_resync(sample_state()), "portal off: nothing to do")
+			end)
+			inform._guestportal, inform._time, inform._state.save = real, rt, save
+			real._resolve = orig_resolve
+			inform._ucihelper = nil
+			inform._guest_server, inform._guest_built, inform._guest_ctx = nil, nil, nil
+			inform._guest_wg_next = 0
 			if not ok then error(err, 0) end
 		end
 	},

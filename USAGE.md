@@ -479,7 +479,7 @@ announced on stderr rather than passed off as a fresh install.
 | `inform_url` | URL for the inform heartbeat (every 10 s, or the interval the controller's `noop` names). Seeded from `conf.lua` on a first boot (or after a factory reset) and overwritten by the controller or by `syswrapper.sh set-inform`; once present here it always wins over `conf.lua` |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup and to hostapd's deny list, so blocks survive restarts. The deny list is checked once a minute, at once when one of hostapd's control sockets in `/var/run/hostapd/` is replaced (hostapd restarted or an SSID rebuilt), and every heartbeat for 60 s after a config push or a Forget. A reload openUF did not run that keeps the SSID (LuCI, `wifi reload` by hand) is caught within a minute; until then the client can associate, but nftables drops its traffic. Replaced by the controller's `blocked_sta` list on every config push, so it can't drift from the controller's list |
-| `guest_wlans`, `guest_authorized`, `guest_portal`, `guest_token`, `guest_selfrun`, `guest_vaps_down` | Guest portal state (⚠️ lab-validated only). `guest_wlans`: the wlanconf ids of the guest WLANs while the controller has the portal on, replaced on every config push. `guest_authorized`: each MAC the controller sent `authorize-guest` for, with the time it arrived; `unauthorize-guest` removes it and disconnects the guest. This map is where each station's `authorized` on a portal WLAN comes from (`true` everywhere else), and it fills the `authorized` nft set. It holds at most 512 entries; past that the oldest goes, and the controller re-authorizes it on the next heartbeat if its guest record is still active. `guest_portal`: what the enforcement is built from (portal URL, the portal's address and ports, restricted subnets), present only while the portal is on. `guest_token`: generated once, then reported while the portal is on. `guest_selfrun`: `pass` or `off`, from `mgmt_cfg`'s `selfrun_guest_mode`. `guest_vaps_down`: the guest WLANs `off` took down, until the controller answers again. See § Guest portal |
+| `guest_wlans`, `guest_authorized`, `guest_portal`, `guest_token`, `guest_selfrun`, `guest_vaps_down`, `guest_wg_ips` | Guest portal state (⚠️ lab-validated only). `guest_wlans`: the wlanconf ids of the guest WLANs while the controller has the portal on, replaced on every config push. `guest_authorized`: each MAC the controller sent `authorize-guest` for, with the time it arrived; `unauthorize-guest` removes it and disconnects the guest. This map is where each station's `authorized` on a portal WLAN comes from (`true` everywhere else), and it fills the `authorized` nft set. It holds at most 512 entries; past that the oldest goes, and the controller re-authorizes it on the next heartbeat if its guest record is still active. `guest_portal`: what the enforcement is built from (portal URL, the portal's address and ports, restricted subnets), present only while the portal is on. `guest_token`: generated once, then reported while the portal is on. `guest_selfrun`: `pass` or `off`, from `mgmt_cfg`'s `selfrun_guest_mode`. `guest_vaps_down`: the guest WLANs `off` took down, until the controller answers again. `guest_wg_ips`: the walled garden's domain entries as resolved, `{allowed = {name = {ip, …}}, restricted = …}` — kept so a reboot rebuilds the rules without waiting on DNS, and so a name that stops resolving keeps the addresses it had. See § Guest portal |
 | `sta_rates` | Each client's own WiFi Speed Limit from `rate-update` (`up`/`down` in kbps, `-1` = no limit that way), for clients associated to this AP only. A client's entry goes when it leaves or reconnects, as the firmware's per-station class does; the controller sends it again on every connect |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
 | `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf`. In static mode these are **re-applied on every start**, because the address is `ip addr` state that a reboot discards and the controller does not re-push it (a matching `cfgversion` gets a `noop` back, carrying no `system_cfg` at all) — the same reason `blocked_stas` and `led_enabled` are reconciled at startup |
@@ -1344,6 +1344,34 @@ everything, when the portal or the guest WLAN goes away, or on a factory reset.
 A MAC in the `authorized` set (filled from `state.json`'s `guest_authorized`) may reach
 any host other than the AP, but the restricted subnets still apply.
 
+**The walled garden ("Pre-Authorization Access").** The controller splits the site's
+`allowed_subnet_<n>` / `restricted_subnet_<n>` list by what each entry *looks like*, not
+by which list it is in, and sends the two halves by different routes:
+
+| Entry | How it arrives | What openUF does |
+|---|---|---|
+| IP or CIDR | `ebtables.<n>.cmd` — `-I GUESTIN -p 0x800 --ip-dst <net> -j ACCEPT` and its `-I GUESTOUT … --ip-src` twin, or `-A GUESTIN … -j DROP` for a restricted one | one `ip daddr … accept` / `ip saddr … accept` / `ip daddr … drop`, above every drop (allowed) or among the restricted-subnet drops |
+| domain name | `dnsmasq.walled_garden.1.site.<n>.{allowed,restricted}`, plus empty `ALLOWED_DOMAIN_IN` / `ALLOWED_DOMAIN_OUT` / `RESTRICTED_DOMAIN_IN` chains the firmware would fill | resolved on the AP with `nslookup`, then the same rules inline |
+
+Two traps worth knowing:
+
+- **An IP entry carries no port.** The portal's own accepts do (`8880`, `8843`, `8881`),
+  and until 2026-10-26 openUF knew only that shape — so an IP walled-garden entry, and
+  the egress rule that lets its replies back, were parsed as unknown and silently
+  unenforced. Both shapes are now applied.
+- **Re-resolution is on the controller's own cadence.** Along with the garden it pushes
+  `*/10 * * * *  syswrapper.sh refresh-walled-garden 1`. openUF does that work in the
+  inform loop (`GUEST_WG_INTERVAL`, 600 s) and on every config push, so `sysconf.lua`
+  installs no crontab line for the job — the same treatment `syswrapper.sh
+  schedule-action` gets. Each name is asked twice per round, as the firmware's
+  `walled_action.sh` does, so a round-robin record does not shrink the set.
+
+The answers live in `state.json` as `guest_wg_ips` (`{allowed = {name = {ip, …}},
+restricted = …}`), which makes two things true: a reboot rebuilds the rules from the last
+good answers instead of waiting on DNS, and a name that *stops* resolving keeps the
+addresses it had. A name that has never resolved is simply not enforced, and the log says
+which one.
+
 `ip openuf_guest` redirects the marked HTTP to port **8820**. The inform daemon answers
 there between heartbeats with a `302` to the controller's portal, adding:
 - `?id=<guest MAC>`, looked up in `/proc/net/arp`;
@@ -1403,6 +1431,16 @@ authorization".
 - **The redirect needs an IPv4 address on the guest network's bridge.** The answer
   leaves from there. A guest WLAN on a VLAN where the AP has no address keeps its
   guests blocked, and they never see the portal.
+- **The walled garden is IPv4 only and resolved on the AP.** AAAA answers are
+  discarded, because both the firmware's chains and openUF's are IPv4. A name whose
+  answer differs from the client's — a CDN, geo-DNS, short-TTL round robin — can be
+  reachable at an address openUF never saw, and the ten-minute refresh is the only thing
+  that catches up. UniFi firmware has exactly the same limit; a DNS-intercepting garden
+  would need a resolver on the AP, which openUF does not run.
+- **A domain-only restricted list never arrives.** The controller emits the whole
+  `dnsmasq.walled_garden` block only when the *allowed* list contains at least one
+  domain (10.6.106), so restricted domains alone are dropped on its side. Put one
+  allowed domain in the list, or express the restriction as a subnet.
 
 **Needs** `kmod-nft-bridge` (for `iifname`/`oifname`), and `kmod-nft-nat` for the
 redirect. firewall4 already pulls in `kmod-nft-nat`.
@@ -1424,6 +1462,22 @@ redirect. firewall4 already pulls in `kmod-nft-nat`.
   (`guestportal: guest WLANs back up (…)`).
 - `guestportal: unrecognised guest rule shape`: the controller pushed a rule openUF
   doesn't know. It was not applied.
+- `guestportal: walled garden: <name> did not resolve -- keeping the last N address(es)`:
+  DNS failed for that name this round; the rules it had still stand.
+- `guestportal: walled garden: <name> did not resolve and has no earlier answer -- not
+  enforced`: that site is not in the garden at all. Check the AP's own resolver
+  (`nslookup <name>` on the device) before blaming openUF.
+- `guestportal: ignoring malformed walled-garden site`: the name did not pass openUF's
+  check (spaces, an IPv4 literal, a label over 63 characters). It never reaches a
+  command line.
+- `guestportal: walled-garden addresses changed -- rebuilding`: the ten-minute refresh
+  found a different address set and rebuilt the chains.
+
+**Check the garden:**
+
+    nft list chain bridge openuf_guest guestin | head -20   # allowed sites, above every drop
+    nft list chain bridge openuf_guest guestout             # their replies
+    grep -o '"guest_wg_ips":[^}]*}}' /etc/openuf/state.json # the last good answers
 
 ### Hairpin on SSIDs with Proxy ARP or Multicast Enhancement
 
