@@ -2237,7 +2237,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: fw_caps sets the QCA-switch, OWRT-switch and multi-block schedule bits (0x1110)",
+		name = "inform json: fw_caps sets the switch, schedule and RADIUS-DAS bits (0x101110)",
 		fn = function()
 			-- Confirmed via decompiled controller 10.4.57: Device.hasQCASwitch()
 			-- is hasFirmwareCapability(16) (gates the Ports view's projection
@@ -2248,9 +2248,13 @@ return {
 			-- section 18). supportMultiBlockWlanSchedule() is
 			-- hasFirmwareCapability(4096): a day's schedule blocks as
 			-- schedule_<day>.<i> (wlansched.lua); schedule_invert (0x400000)
-			-- stays unclaimed.
+			-- stays unclaimed. 0x100000 is RADIUS Dynamic Authorization, which
+			-- the config writer tests inline (VAZShipWTNxlo:567) and which brings
+			-- aaa.<n>.radius.das.* to an accounting WLAN; hostapd is the CoA
+			-- listener it needs (radius_das_port/radius_das_client).
 			local d = build()
-			assert_eq(d.fw_caps, 0x1110, "fw_caps bits 0x10 | 0x100 | 0x1000 set")
+			assert_eq(d.fw_caps, 0x101110,
+				"fw_caps bits 0x10 | 0x100 | 0x1000 | 0x100000 set")
 			assert_eq(d.fw2_caps, 0,
 				"and no fw2_caps bit where Hotspot 2.0 is not supported")
 		end
@@ -2267,7 +2271,7 @@ return {
 			inform._sysinfo.hs20_supported = function() return true end
 			local ok, err = pcall(function()
 				local d = build()
-				assert_eq(d.fw_caps, 0x801110, "the Hotspot 2.0 bit joins fw_caps")
+				assert_eq(d.fw_caps, 0x901110, "the Hotspot 2.0 bit joins fw_caps")
 				assert_eq(d.fw2_caps, 0x80000, "and RadSec is claimed for the gate")
 			end)
 			inform._sysinfo.hs20_supported = orig

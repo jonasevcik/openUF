@@ -3049,7 +3049,7 @@ Everything openUF sends. Names were audited against the controller's own Device 
 | **`system-stats`** | Hyphenated key, `{cpu, mem, uptime}` — all three **strings**, cpu/mem as percentages. `cpu` is `0` on the very first inform (delta-sampling `/proc/stat` has no prior sample). |
 | **`sys_stats`** | Sent beside `system-stats`, as UniFi firmware does: `loadavg_1/5/15` as `/proc/loadavg`'s strings, `mem_total`, `mem_used` (total − free), `mem_buffer` in bytes. The UI's **Load Average**. See [VAP, device and radio fields](#vap-device-and-radio-fields-2026-10-10). |
 | `connect_request_ip`, `connect_request_port` | Both **strings**, as the firmware sends them (the UCG's own record carries the port as a string too): the mapped address of the AP's STUN socket. Sent only while STUN runs and once a Binding Response has come back. See [STUN wake-up](#stun-wake-up-2026-10-10). |
-| **`fw_caps`** | `0x1110` — see [capability bitmasks](#capability-bitmasks) |
+| **`fw_caps`** | `0x101110`, plus `0x800000` where Hotspot 2.0 is supported — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps`** | `0xC`, plus `0x20` (Airtime Fairness) and `0x100000` (Private Pre-Shared Keys) where the device can do them — see [capability bitmasks](#capability-bitmasks) |
 | **`wifi_caps2`** | `0x60` — see [capability bitmasks](#capability-bitmasks) |
 | `spectrum_scanning` | **Device-level**, not per-radio (the per-radio fields are `spectrum_table`/`spectrum_table_time`). `spectrum_scan_timestamp` is controller-owned: it stamps it itself (ms) from quick-scan results, and nothing reads it from an inform, so openUF does not send it |
@@ -3111,6 +3111,7 @@ Gates that drop or weaken a feature openUF could implement (claimed ones are lis
 |---|---|---|---|
 | `fw_caps` | `0x1000` | `supportMultiBlockWlanSchedule()` | **Claimed since 2026-10-11** (WiFi Blackout Schedule). Without it, a schedule with several blocks per day goes out as one `wireless.<n>.schedule_<day>` key per block, all under the same name, so the last one wins. With the bit set they become `schedule_<day>.<i>` |
 | `fw_caps` | `0x400000` | `supportWlanScheduleInvert()` | The controller inverts a schedule itself instead of sending `schedule_invert`. Left unclaimed on purpose: that is the form the 4.0.15 firmware reads |
+| `fw_caps` | `0x100000` | tested inline, not through a named `Device` helper: `hyFnQ2.hasFirmwareCapability(0x100000)` at `com/ubnt/service/config/VAZShipWTNxlo:567`, AND-ed with the WLAN's `radius_das_enabled` or `hotspot2conf_enabled` | **Claimed since 2026-10-27** (RADIUS Dynamic Authorization). Without it no `aaa.<n>.radius.das.*` key is emitted at all, however the RADIUS profile is configured, so CoA/Disconnect is unreachable. See [RADIUS MAC authentication and Dynamic Authorization](#radius-mac-authentication-and-dynamic-authorization-settled-2026-10-27) |
 
 **`wifi_caps` `0x4` + `0x8` (device-level Band Steering): CLAIMED, confirmed in the lab 2026-09-27.**
 Predicates: `supportBandsteering()` = `hasWifiCapability(4)` and
@@ -4857,7 +4858,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 34 | Minimum Data Rate Control | `wireless.<n>.minrate_data` (+ `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg`) | ✅ Confirmed live 2026-07-18 by REST-setting `minrate_setting_preference=manual` + `minrate_ng_data_rate_kbps=12000` and diffing: `minrate_data`/`beacon_rate`/`mgmt_rate` 1000→12000, `minrate_cck_rates.status` true→false, `pureg` 0→1. Separately confirmed **not band-gated** — enabling `minrate_na` (24 Mbps) made the same keys appear on the 5 GHz entries. **The OpenWrt side is radio-level**, not per-BSS (verified in OpenWrt's `hostapd.sh`: these are `hostapd_common_add_device_config` options), so openUF aggregates a radio's VAPs to the most permissive floor. Note `beacon_rate` is passed to hostapd **verbatim in 100-kbps units** while `basic_rate`/`supported_rates` are divided by 100 by `hostapd_add_rate` — openUF converts only the former. Not verified on real hardware. |
 | 35 | Multicast and Broadcast Blocker | `wireless.<n>.bcfilt.status` + `bcfilt.<k>.mac`/`.status` | ✅ Wire format confirmed live 2026-07-18 across four diffs (on with one MAC, with two MACs, on with an empty list, off). Two keys already on the wire were **excluded** as candidates by the same diffs: `radio.<n>.bcmc_l2_filter.status` (sits at `enabled` with the control off) and `wireless.<n>.multicast.inspect` — neither moved. ✅ Enforcement confirmed on real hardware 2026-09-02 (AX3000T, nftables 1.1.6, kernel 6.12), measured with counter-only probe rules carrying the same predicate: broadcast sourced onto the VLAN from a second AP and flooded out the IoT VAP matched the drop rule **14 of 14** times with that sender absent from the allow-list, and **0 of 15** times after adding it through the controller — both halves of the control, and the `bcfilt.<k>.mac` parse, end to end. ⚠️ Requires `kmod-nft-bridge`: the drop rule is openUF's only bridge-family `meta` match, `nft_meta_bridge` is absent from stock filogic and ath79 images alike, and without it the kernel returns a bare `Could not process rule: No such file or directory` **only for that rule** — table, chain and allow-list set all build, so the control appeared enabled everywhere while filtering nothing. `firewall.lua`'s block-sta matches on `ether saddr` alone, needs no module, and worked throughout, which is what hid this. |
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
-| 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
+| 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control, implemented since 2026-10-27 as row 45). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
 | 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname`; a client's own profile as `rate-update` | ✅ Wire format confirmed live 2026-07-18 (kbps; the discriminator is the presence of `maxspeed`; needs a profile to exist). **Per client**, both directions queued (firmware-confirmed for 4.0.15; corrected 2026-10-11 from "per-VAP aggregate"). openUF: one HTB class per client per direction (upload on an IFB), live on both APs 2026-10-11: a phone held 1.97 Mbit/s up under 2 and 4.5 down under 5. See "`qos.*` — WiFi Speed Limit" |
 | 39 | Ports view Connection column on an **uplink** port | `port_table[]` with **no** `mac_table` field on `is_uplink` ports | ✅ Blank (or a retained stale value) is the CORRECT state, verified 2026-09-12. Reporting the one MAC on the other end of the cable is tempting — openUF knows it, since finding it is how the uplink socket is identified, and a real UniFi gateway visibly does it on its own uplink port — but it would invert the topology map: the controller files a known device seen alone on a port into this device's `downlink_table`, and the `isUplinkMac` guard against that is ANDed with `!is_uplink`, so it disables itself on exactly the port where it is needed. The gateway would hang beneath every AP that reported it. A real gateway escapes it only because the ISP's router is not an adopted device. Live proof of the correct shape: both APs' `downlink_table` empty, the gateway's holding both APs. The stale text persists because `last_connection` is never recomputed when a port sends no `mac_table` field (and only ever recomputed when a port reports exactly **one** MAC) — clear it with the Ports view's **Clear Last Seen Device**. |
 | 40 | Roaming Assistant | `wifi_caps2` bit `0x20` → `wireless.<n>.btm_disassoc.status`/`.threshold` | ✅ Wire format, gate and teardown confirmed live in the lab (10.4.57) and against a real UCG Ultra (Network 10.6), 2026-09-26: the keys arrive on the 5 GHz WLAN entry only, and switching off removes openUF's stamp on both APs. **Steering confirmed on real radios:** a client at −80 dBm on one AP, heard at −52 by the other, got a BTM request, answered `BSS-TM-RESP status_code=4` (refused), was disassociated 16 s later by openUF, and reassociated on the other AP within 1 s at −61 dBm. Its hostapd `extended_capabilities` did not advertise BSS Transition, yet it answered, so the capability bytes do not predict which clients reply. It stayed put for all 30 one-minute samples, with no further actions. The no-better-AP rule is unit-tested only: no qualifying client was present. |
@@ -4865,6 +4866,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 42 | WPA-Enterprise (802.1X / RADIUS) | `aaa.<n>.radius.{auth,acct}.<k>.{ip,port,secret,ca_cert,client_cert,private_key}`, `aaa.<n>.interim_update.{status,interval}`, `aaa.<n>.dynamic_vlan`, `aaa.<n>.nas_identifier` | ✅ Wire captured in the lab 2026-10-26 (10.6.106) and replayed end to end through the parser and `apply_config`; the mapped `encryption` values were run through the **device's own** ucode generator on an Archer C5 the same day and produce `wpa_key_mgmt=WPA-EAP`/`-SHA256`/`-SUITE-B-192`, plus FT-EAP with 802.11r. The previous verdict ("the wire carries no RADIUS server/port/secret") came from a capture taken with no RADIUS profile configured. ⚠️ No client has authenticated. A **correction landed 2026-10-26**: the RadSec guard was keyed on a `radius.*.tls` key the controller never sends — dead code. The real discriminator is the certificate *filenames*, which arrive only once `fw2_caps` `0x80000` is claimed (see row 43). See [`aaa.<n>.radius.*`](#aaanradius--wpa-enterprise-8021x). |
 | 43 | Hotspot 2.0 / Passpoint | `aaa.<n>.hs20.*` (55 keys), `wireless.<n>.dgaf_disable` | ✅ Wire captured in the lab 2026-10-26 (10.6.106) and replayed end to end through the parser and `apply_config`; the generated wifi-iface section was then run through the **device's own** ucode generator on an Archer C5 and the resulting config parsed on a real hostapd v2.12-devel with zero errors (`interworking=1`, `hs20=1`, `nai_realm=`, `venue_name=`, `hs20_wan_metrics=`). Needs `fw_caps` `0x800000` **and** `fw2_caps` `0x80000` (RadSec), the latter for a feature openUF does not implement — a stated trade. The reachable keyspace is the subset a WLAN's embedded `hotspot2` object carries; OSU, icons, HESSID, QoS maps and GAS timings never arrive. ⚠️ No Passpoint client has associated. See [`aaa.<n>.hs20.*`](#aaanhs20--hotspot-20--passpoint). |
 | 44 | Guest walled garden, both forms | `dnsmasq.walled_garden.1.{status,site.<n>.{allowed,restricted}}`, the port-less `-I GUESTIN/GUESTOUT … --ip-dst/--ip-src <net> -j ACCEPT` ebtables pair, `cron.1.job.<n>` `syswrapper.sh refresh-walled-garden 1` | ✅ Wire captured in the lab 2026-10-26 (10.6.106), replayed through `guestportal.parse` with 0 unknown shapes, and the generated statements accepted by the lab's real `nft` on a dummy netdev, idempotently. The controller splits the operator's one list by whether an entry parses as an address or as a domain name, so the IP half (and its egress twin) was **silently unenforced before this** — those rules carry no port, and openUF only knew the portal's port-qualified accepts. The domain half is resolved on the AP and refreshed on the controller's own ten minutes; the last good answer per name is kept in `state.json`. `fw_caps` `0x40000` (`supportIPSet()`) is unclaimed on purpose: claiming it would swap this form for an ipset form openUF does not implement. ⚠️ Deployed to both APs and confirmed inert — the home site runs no guest portal, so no guest client has reached a garden site. See [the walled garden](#the-walled-garden-two-forms-split-by-what-the-entry-looks-like). |
+| 45 | RADIUS MAC authentication, and Dynamic Authorization (CoA/Disconnect) | `aaa.<n>.radius.macacl.{status,format,emptypassword}` (+ the `radius.auth.<k>.*` block on any security type), `aaa.<n>.radius.das.{status,port,client,secret}`, `aaa.radius.dad.*` | ✅ Wire captured in the lab 2026-10-27 (10.6.106) on an **open** WLAN and replayed end to end; the generated option set was parsed by the APs' own hostapd build with zero errors, and the split-secret alternative the schema invites was refused with `invalid DAS client`. `macaddr_acl=2` goes in as a raw BSS line (it is no UCI option), and the auth servers go in raw on a non-EAP WLAN, where the ucode generator never emits them. DAS needs `fw_caps` `0x100000`, now claimed. ⚠️ No RADIUS server at home, so no MAC has been admitted or denied and no CoA answered on hardware. Declined with reasons: `macacl.format`/`.emptypassword` (UniFi hostapd patches, absent from OpenWrt's binary) and the `dad.*` shape (relays via `127.0.0.1` through the firmware's own daemon). See [RADIUS MAC authentication and Dynamic Authorization](#radius-mac-authentication-and-dynamic-authorization-settled-2026-10-27). |
 
 ---
 
@@ -5032,10 +5034,14 @@ descending promise, with why each is worth the toggle:
   — the audit above already found **no occurrence in the 10.6.106 jar** for `rsn_preauth`,
   `wpa.{strict_rekey,gmk_rekey,group_update_count}` and `fils.*`: those stay **declined, no
   emitter**. The rest of the list is unchecked.
-- `aaa.<n>.radius.macacl.{status,format,emptypassword}` + `aaa.<n>.accept_mac.{status,<k>.vlanid}`
-  (RADIUS MAC authentication) and `aaa.<n>.radius.{das,dad}.*` (DAS/CoA) — the two deliberate
-  deferrals of the WPA-Enterprise commit. `radius.macacl.status=disabled` **is already on the
-  wire**, so the toggle exists and these can be closed properly.
+- `aaa.<n>.radius.macacl.{status,format,emptypassword}` (RADIUS MAC authentication) and
+  `aaa.<n>.radius.{das,dad}.*` (DAS/CoA) — the two deliberate deferrals of the
+  WPA-Enterprise commit. **Settled 2026-10-27, both implemented**; `format`,
+  `emptypassword` and the whole `dad.*` shape are declined with reasons. The third key in
+  this row, `aaa.<n>.accept_mac.{status,<k>.vlanid}`, turned out **not** to be part of
+  RADIUS MAC auth at all — it is the site's MAC-based VLAN feature, with its own gate and
+  its own open question. See
+  [RADIUS MAC authentication and Dynamic Authorization](#radius-mac-authentication-and-dynamic-authorization-settled-2026-10-27).
 - `connectivity.{status,uplink,uplink_eth,uplink_bridge,uplink_gateway,uplink_wds}` — the uplink
   connectivity monitor; `connectivity.status=disabled` in every capture. Read what `mcad` does
   when it is on **before** writing code: the firmware's response to a dead uplink can take
@@ -5406,6 +5412,154 @@ blacklist on 5 GHz — exactly the non-DFS channels CZ allows, on ath10k and on 
 teardown clearing both the list and its stamp. Not claimed: no radio here runs on Auto, so no
 ACS has actually chosen under the restriction.
 
+#### RADIUS MAC authentication and Dynamic Authorization, settled 2026-10-27
+
+The two deliberate deferrals of the WPA-Enterprise commit, closed. Both are settings of a
+WLAN's RADIUS profile, and **neither needs the WLAN to be WPA-Enterprise.**
+
+**Where they come from (10.6.106, `com/ubnt/service/config/VAZShipWTNxlo`).**
+
+| Setting | Gate in the writer | Keys emitted |
+|---|---|---|
+| MAC Authentication | `glUEhxTYZtqmhf.is("radius_mac_auth_enabled")` at `:639` — **no capability bit, no security-type condition**; the `else` branch at `:646` sends `radius.macacl.status=disabled` | `aaa.<n>.radius.macacl.{status,emptypassword,format}`, plus the whole `radius.auth.<k>.*` block (`:640`, and `NvfcKfHPI(...)` for a non-EAP WLAN) |
+| RADIUS DAS | `hasFirmwareCapability(0x100000)` at `:567`, AND (`radius_das_enabled` OR `hotspot2conf_enabled`), AND the profile's `accounting_enabled` at `:948` | `aaa.<n>.radius.das.{status,port,client,secret}` (`:954`, `:973`) and the second shape `aaa.radius.dad.{status,port}` + `aaa.<n>.radius.dad.client.<k>.{cidr,secret}` (`:951`, `:976`) |
+
+`radius_mac_auth_enabled`, `radius_macacl_format` and `radius_macacl_empty_password` are
+WlanConf fields (`api/fields/WlanConf.json:142-145`); `format` is an enum
+`none|hyphen|colon` × `lower|upper`. The DAS client address and secret are taken from the
+**first accounting server**, written once, and the port is `3800 + the WLAN's section index`.
+
+**What the AP does with them (U7LR 6.8.2 `sbin/ubntbox`).** The format strings sit together
+and name their hostapd output directly:
+
+```
+aaa.%d.radius.das.port      -> radius_das_port=%u
+aaa.%d.radius.das.client
+aaa.%d.radius.das.secret    -> radius_das_client=%s %s
+aaa.%d.radius.dad.client.%d.secret -> radius_das_client=127.0.0.1 %s
+aaa.%d.radius.macacl.status -> macaddr_acl=2
+aaa.%d.radius.macacl.format -> macaddr_format=%s
+aaa.%d.radius.macacl.emptypassword -> mac_acl_empty_passwd=%d
+```
+
+Two things fall out of that. The `dad.*` shape points hostapd at **localhost** — the request
+reaches the AP's own `mcad`, which checks the CIDR and relays it — so it is unusable without
+that relay. And `macaddr_format`/`mac_acl_empty_passwd` are options of UniFi's **patched**
+hostapd: neither string occurs in `/usr/sbin/hostapd` on either AP (`strings -a | grep -c`
+gives 0 on ath79 and on filogic), while `radius_das_client`, `radius_das_port` and
+`macaddr_acl` all do.
+
+**The OpenWrt consumers, read off the live 25.12.5 generator** (`/usr/share/ucode/wifi/ap.uc`,
+identical on both boards):
+
+- `macaddr_acl` is **not a wifi-iface option**: it is absent from
+  `/usr/share/schema/wireless.wifi-iface.json`, and the only producers are
+  `iface_macfilter()` (`allow` → 1, `deny` → 0) and `ppsk` → 2. So it goes in through
+  `hostapd_bss_options` (ap.uc:612, raw lines appended last). `ppsk=1` would also set it, but
+  in `case 'psk'` it additionally sets `wpa_psk_radius=2` and leaves the passphrase out —
+  that is UniFi's *Private PSK* feature, not MAC auth, and would make the WLAN unjoinable.
+- `iface_authentication_server()` is called **only** from the EAP branch and from
+  `iface_ppsk()`, so on an open/PSK/SAE BSS the `auth_server_*` options are stored and
+  dropped. `iface_accounting_server()` is called unconditionally, so `acct_server_*` is fine
+  as an option. openUF therefore writes the auth servers raw on a non-EAP WLAN and through
+  UCI on an EAP one.
+- `radius_das_client` and `radius_das_port` are in ap.uc's unconditional `append_vars` list,
+  **but the join** `radius_das_client = client + ' ' + secret` (ap.uc:187-189, with
+  `set_default(radius_das_port, 3799)`) sits inside `case 'eap'`. `radius_das_secret` and its
+  `dae_secret` alias are in the schema with no other consumer — the "stored and silently
+  dropped" shape. openUF joins the two itself, which is both what the firmware writes and
+  what hostapd parses (first token the address, the rest of the line the secret), and always
+  writes the port explicitly because hostapd's own default is 0 = no listener.
+
+**Why MAC authentication fails closed.** A WLAN that asks for it and cannot have it (no
+usable RADIUS server, or a `wpad` with no RADIUS client) is **dropped**, not provisioned
+without it: it is an access control, and on an open WLAN it is the only one. The RADIUS-client
+check is not cosmetic either — on a basic `wpad`, `auth_server_addr` is an unknown option and
+hostapd refuses the whole config, so the BSS would not come up anyway.
+
+**Lab, 10.6.106, 2026-10-27.** MAC auth on an **open** guest WLAN with the lab RADIUS profile
+attached, verbatim:
+
+```
+aaa.3.radius.macacl.status=enabled
+aaa.3.radius.macacl.emptypassword=enabled
+aaa.3.radius.macacl.format=%.2X-%.2X-%.2X-%.2X-%.2X-%.2X
+aaa.3.radius.auth.1.ip=…   .port=1812  .secret=…       (and auth.2)
+aaa.3.radius.acct.1.ip=…   .port=1813  .secret=…
+aaa.3.interim_update.status=enabled   .interval=900
+aaa.3.dynamic_vlan=2
+```
+
+— the `format` really is a printf string. With `fw_caps 0x100000` claimed and "RADIUS DAS" on,
+the same push gained, per WLAN:
+
+```
+aaa.radius.dad.status=enabled        aaa.radius.dad.port=3799
+aaa.1.radius.das.status=enabled      aaa.1.radius.das.port=3801
+aaa.1.radius.das.client=<acct server ip>   aaa.1.radius.das.secret=<secret>
+aaa.1.radius.dad.status=enabled
+aaa.1.radius.dad.client.1.cidr=<acct server ip>/32   .secret=<secret>
+```
+
+with ports 3801–3804 across the four BSSes. `tools/cfg-coverage.lua` puts all four `das.*`
+keys per BSS and `macacl.status` where it is enabled in **consumed**, and leaves `dad.*`,
+`macacl.format` and `macacl.emptypassword` outside it. Replaying the capture through
+`_parse_wifi_system_cfg` + `apply_config` with a recording cursor gives the EAP WLAN
+`radius_das_client=<ip> <secret>` + `radius_das_port=3801` with the servers as UCI options,
+and the open WLAN the raw `auth_server_addr/port/shared_secret` triplets followed by
+`macaddr_acl=2`, with **no** `dynamic_vlan`. 0 `handle_response failed`.
+
+**A real hostapd parses it, and refuses the alternative.** Feeding the generated option set to
+the APs' own hostapd build (`openwrt/rootfs:x86-64-25.12.0` + `wpad-mbedtls`) gives zero
+configuration errors — it proceeds to driver init and fails only for want of nl80211.
+Splitting the DAS client and secret into two options instead, which is what the schema
+invites, gives `Line 10: invalid DAS client` / `1 errors found in configuration file` and
+hostapd refuses the interface: the join is load-bearing, not cosmetic.
+
+**Hardware, 2026-10-27, both APs.** Deployed and restarted on both boards; `fw_caps` now
+`0x101110` and the production controller answered with steady noops and no new push, which is
+correct — no WLAN here has a RADIUS profile, so no `macacl`/`das` key is emitted. `uci show
+wireless` carries no `radius_*`, `macaddr_acl` or `dynamic_vlan` anywhere, the SAE raw lines
+are untouched, and no BSS in `/var/run/hostapd-phy*.conf` gained an option. **Not claimed:**
+there is no RADIUS server at home, so no client has been admitted or denied by MAC, and no
+CoA/Disconnect has been answered on hardware.
+
+**Declines, each with its reason.**
+
+| Key | Verdict |
+|---|---|
+| `radius.macacl.format` | **decline: no consumer.** A printf format string for UniFi's patched `macaddr_format=`; absent from OpenWrt's hostapd on both boards, which always sends lower-case colon-separated. A real limitation (a server expecting another format rejects the client), documented in USAGE.md |
+| `radius.macacl.emptypassword` | **decline: no consumer.** UniFi's `mac_acl_empty_passwd=`; same absence |
+| `aaa.radius.dad.{status,port,loglevel}`, `radius.dad.client.<k>.{cidr,secret}` | **decline: needs a relay openUF does not have.** The firmware turns it into `radius_das_client=127.0.0.1`, accepting the request from its own daemon; hostapd pointed at localhost would answer nobody. The `das.*` shape carries the same information and is implemented |
+| `aaa.<n>.dynamic_vlan` on a non-EAP WLAN | **decline: would break the WLAN.** `2` (required) with no `vlan_file` makes hostapd reject every station, and openUF writes no `wifi-vlan` sections for RADIUS-assigned VLANs. Honouring it needs the dynamic-VLAN plumbing |
+
+#### `aaa.<n>.accept_mac.*` — MAC-based VLANs, a feature found while settling the above
+
+Not RADIUS at all, though the sweep's axis-2 table had filed it next to MAC auth. Its emitter
+is its own class (`com/ubnt/service/config/ubntconf/fdwW`), and it writes
+
+```
+aaa.<n>.accept_mac.status=enabled       (once, before the first entry)
+aaa.<n>.accept_mac.<k>.mac              aaa.<n>.accept_mac.<k>.vlanid
+switch.vnet.<n>.{name,vlan,mac.<k>}     (the same list for a switch identity)
+```
+
+from the site's MAC→VLAN map. **Two gates, and the second is site-wide:**
+`hyFnQ2.supportsMacBasedVlans()` = `hasFirmwareCapability(Integer.MIN_VALUE)` = `fw_caps`
+`0x80000000`, and `bWpcUrDmeyjdNnrWeZ.kCNoUwYXLXMAUl(siteId)`, which requires a ubios gateway
+that either claims the bit or is one of 23 listed models **and** that the set of
+clients-bearing APs and switches in the site minus those claiming the bit is **empty**. One
+AP without the bit therefore disables the feature for the whole site — which is where openUF
+stands today, unclaimed.
+
+The consumers exist: the firmware writes `accept_mac_file=` plus `dynamic_vlan`,
+`vlan_tagged_interface`, `vlan_naming=1` and `vlan_bridge`, and OpenWrt's `iface_macfilter()`
+writes a `maclist` file with `macaddr_acl=1` (hostapd's accept-MAC file takes `MAC VLAN_ID`
+per line) while `iface_vlan()` builds `vlan_file` from `wifi-vlan` sections. **Open, not
+declined:** it needs the dynamic-VLAN plumbing that is also the blocker for a RADIUS-assigned
+VLAN above, so the two want doing together. Whether the home UCG Ultra satisfies the gateway
+half of the gate is unknown and settles with one read of its own `fw_caps`.
+
 ### Where the evidence lives
 
 Extracted rootfs (6.8.2 `u7root`, 4.3.28 `root`), the `ubntbox` key dumps
@@ -5437,6 +5591,12 @@ controller; the jar recipe is in "Decompiling the controller".
   carry them (see feature 26). The feature is now documented as not implemented.
 - **PoE self-reporting** could be reopened if the validation environment ever gains a real
   switch container, or if a non-Parent-Device UI surface for those fields is found.
+- **MAC-based VLANs (`fw_caps` `0x80000000`, `aaa.<n>.accept_mac.*`)** are unclaimed, and the
+  gate is site-wide: every AP and switch in the site must claim the bit, beside a ubios
+  gateway that claims it or is one of 23 listed models. Two unknowns: whether the home UCG
+  Ultra satisfies the gateway half (one read of its own `fw_caps` settles it), and the
+  dynamic-VLAN plumbing the feature shares with a RADIUS-assigned VLAN. See
+  [accept_mac](#aaanaccept_mac--mac-based-vlans-a-feature-found-while-settling-the-above).
 
 ---
 

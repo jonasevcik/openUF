@@ -2009,12 +2009,20 @@ function M.build_json(st, cfg, ufhw)
 		-- ANQP (sysinfo.hs20_supported: the ucode generator knows the
 		-- interworking options AND the binary was built with
 		-- CONFIG_HS20), because the alternative to a dropped WLAN is a
-		-- WLAN that advertises Passpoint and answers nothing. 0x100000
-		-- (RADIUS Dynamic Authorization, CoA/disconnect) stays
-		-- unclaimed: with it the controller would add radius.das.* /
-		-- radius.dad.* to every accounting WLAN with Hotspot 2.0 on,
-		-- and openUF implements no CoA listener.
-		fw_caps          = 0x1110
+		-- WLAN that advertises Passpoint and answers nothing.
+		-- Bit 0x100000 (1048576): RADIUS Dynamic Authorization (RFC 5176
+		-- CoA / Disconnect-Request). The config writer tests this one inline
+		-- rather than through a named Device helper (10.6.106
+		-- com/ubnt/service/config/VAZShipWTNxlo:567), and with it a WLAN
+		-- whose RADIUS profile has accounting on, and which has either
+		-- "RADIUS DAS" or Hotspot 2.0 enabled, gets
+		-- aaa.<n>.radius.das.{status,port,client,secret}. Claimed since
+		-- 2026-10-27: openUF needs no CoA listener of its own, because
+		-- hostapd IS one -- radius_das_port/radius_das_client are real
+		-- wifi-iface options on 25.12, and a Disconnect-Request from the
+		-- RADIUS server then deauthenticates the station. See _wire_radius
+		-- for the keys, and for why radius.dad.* is declined.
+		fw_caps          = 0x101110
 			+ ((M._sysinfo.hs20_supported and M._sysinfo.hs20_supported()) and 0x800000 or 0),
 		-- wifi_caps, the first WiFi bitmask. Bit 0x4 is
 		-- Device.supportBandsteering(): without it the controller never emits
@@ -2381,9 +2389,28 @@ end
 -- eligibility filter (ubntconf/LsyaJoEysWb) puts NO device capability gate on
 -- a WPA2-Enterprise WLAN, so this arrives whether or not openUF asks for it.
 --
+-- Since 2026-10-27 this also carries RADIUS MAC authentication and Dynamic
+-- Authorization; see the macacl and das blocks below.
+--
 -- Deliberately NOT read (and tested for, so nothing downstream keys on them):
---   * radius.das.* / radius.dad.*  -- Dynamic Authorization (CoA/disconnect)
---   * radius.macacl.*              -- RADIUS MAC authentication
+--   * radius.dad.*  -- the SECOND shape of Dynamic Authorization: a top-level
+--     aaa.radius.dad.{status,port,loglevel} plus per-client
+--     aaa.<n>.radius.dad.client.<k>.{cidr,secret}. UAP firmware 6.8.2 turns
+--     those into `radius_das_client=127.0.0.1 <secret>` -- the AP accepts the
+--     request from its OWN mcad, which relays what it received from the
+--     network and does the CIDR check itself. openUF has no such relay, so
+--     pointing hostapd at 127.0.0.1 would make it answer nobody. The das.*
+--     shape names the client directly and is the one openUF implements; the
+--     controller sends both whenever either applies.
+--   * radius.macacl.{format,emptypassword} -- how the AP renders the MAC as
+--     the RADIUS User-Name/User-Password. Both are options of UniFi's own
+--     patched hostapd (6.8.2 writes `macaddr_format=%s` from a printf format
+--     string -- the wire really does carry e.g.
+--     "%.2X-%.2X-%.2X-%.2X-%.2X-%.2X" -- and `mac_acl_empty_passwd=%d`).
+--     Neither string exists in OpenWrt's hostapd binary on either AP, which
+--     always sends lower-case colon-separated for both attributes. A RADIUS
+--     server configured for another format will reject the client, so this is
+--     a real limitation rather than a cosmetic one -- see USAGE.md.
 --   * radius.auth|acct.<k>.{ca_cert,client_cert,private_key,private_key_passwd}
 --     -- RadSec. The controller sends only FILENAMES, for files it transfers
 --     by another channel, so it cannot be completed here. Their presence is
@@ -2438,8 +2465,41 @@ local function _wire_radius(a)
 	local dynamic_vlan = a.dynamic_vlan
 	if dynamic_vlan ~= "1" and dynamic_vlan ~= "2" then dynamic_vlan = nil end
 
+	-- Dynamic Authorization (RFC 5176): the RADIUS server may send a
+	-- Disconnect-Request or a CoA-Request for a station already online. One
+	-- client and one shared secret, which is all hostapd can express
+	-- (radius_das_client holds both, separated by a space), and all the
+	-- controller sends in this shape -- das.client is the FIRST accounting
+	-- server's address, written once (VAZShipWTNxlo:973).
+	local das
+	if _wire_bool(a["radius.das.status"]) then
+		local ip, secret = a["radius.das.client"], a["radius.das.secret"]
+		local why
+		if not netconfig.is_ipv4(ip) then
+			why = "no usable IPv4 client address"
+		elseif type(secret) ~= "string" or secret == "" or #secret > 64 then
+			why = "missing or oversized shared secret"
+		elseif secret:find("%c") then
+			-- The secret is the REST of the radius_das_client line, so a space
+			-- inside it is harmless; a newline would end the line and let what
+			-- follows be read as further hostapd options.
+			why = "a control character in the shared secret"
+		end
+		if why then
+			io.stderr:write(("inform: ignoring RADIUS Dynamic Authorization -- %s\n")
+				:format(why))
+		else
+			-- The controller's own port is 3800 + the WLAN's section index, so
+			-- each BSS gets its own UDP socket. 3799 is the RFC 5176 default and
+			-- what the firmware falls back to.
+			das = {client = ip, secret = secret,
+				port = _wire_posint(a["radius.das.port"]) or "3799"}
+		end
+	end
+
 	return {
 		auth = auth,
+		das = das,
 		acct = servers("acct", "1813"),
 		-- Only when the controller says so: absent means "do not send interim
 		-- accounting updates", not "use 3600".
@@ -2687,7 +2747,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- not move in the diff -- the same decoy shape as
 		-- radio.<n>.bcmc_l2_filter.status was for the broadcast blocker.
 		-- aaa.<n>.radius.macacl.status is the separate RADIUS MAC
-		-- Authentication control.
+		-- Authentication control, read in the vap build below.
 		if not section then section, idx, key, v = line:match("^(macacl)%.(%d+)%.(.+)=(.*)$") end
 		if section then
 			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless)
@@ -2959,8 +3019,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- anywhere. A missing WLAN an admin can diagnose beats a broken one that
 		-- looks provisioned.
 		local is_enterprise = akm:find("EAP", 1, true) ~= nil
+		-- RADIUS MAC authentication (the WLAN's own "MAC Authentication", a
+		-- RADIUS lookup of the client's MAC before it may associate). On the
+		-- wire for EVERY WLAN as radius.macacl.status, so the value is the
+		-- whole discriminator; the writer has no capability gate on it
+		-- (VAZShipWTNxlo:639, `if (radius_mac_auth_enabled)`), and it brings
+		-- the same radius.auth.<k>.* block an Enterprise WLAN gets -- which is
+		-- why the WLAN need not be Enterprise for _wire_radius to have work.
+		local mac_auth = _wire_bool(a["radius.macacl.status"]) or false
 		local radius, radius_err
-		if is_enterprise then radius, radius_err = _wire_radius(a) end
+		if is_enterprise or mac_auth then radius, radius_err = _wire_radius(a) end
 		if is_enterprise and not radius and w.ssid then
 			io.stderr:write(("inform: skipping WLAN %q -- WPA-Enterprise (%s): %s\n")
 				:format(w.ssid, (akm:gsub("^%s+", "")), radius_err))
@@ -2968,11 +3036,29 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- Warn-only. There is no capability bit to gate 802.1X on, so this must
 		-- not change what gets provisioned: a basic wpad brings the BSS up and
 		-- then authenticates nobody, logging nothing of its own.
-		if radius and w.ssid and M._sysinfo and M._sysinfo.eap_supported
-				and not M._sysinfo.eap_supported() then
+		local no_radius_client = M._sysinfo and M._sysinfo.eap_supported
+			and not M._sysinfo.eap_supported()
+		if is_enterprise and radius and w.ssid and no_radius_client then
 			io.stderr:write(("inform: WLAN %q is WPA-Enterprise, but this hostapd has "
 				.. "no RADIUS client (a full wpad is needed) -- clients will not "
 				.. "authenticate\n"):format(w.ssid))
+		end
+		-- MAC authentication fails CLOSED, unlike the warning above. It is an
+		-- access control: provisioning the WLAN without it would let every
+		-- client the admin meant to screen straight on, and on an open WLAN that
+		-- is the only thing standing between the network and anyone in range.
+		-- So the WLAN is dropped instead, loudly. (With no RADIUS client in
+		-- hostapd the BSS would not come up anyway: auth_server_addr is an
+		-- unknown option to a basic wpad, which refuses the whole config.)
+		local mac_auth_broken = false
+		if mac_auth and (not radius or no_radius_client) then
+			mac_auth_broken = true
+			if w.ssid then
+				io.stderr:write(("inform: skipping WLAN %q -- it requires RADIUS MAC "
+					.. "authentication, and %s\n"):format(w.ssid,
+					radius and "this hostapd has no RADIUS client (a full wpad is "
+						.. "needed)" or radius_err))
+			end
 		end
 
 		-- Hotspot 2.0 / Passpoint. Only ever on an EAP WLAN: hostapd refuses
@@ -3012,6 +3098,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 		local wpa3_transition = _wire_bool(a["wpa3.transition"])
 
 		if w.ssid and w.parent and (not is_enterprise or radius) and not radius_psk_only
+				and not mac_auth_broken
 				and not (a.devname and owe_hidden_half[a.devname]) then
 			local security = "open"
 			-- Enhanced Open: the akm is the only marker. It carries no
@@ -3221,8 +3308,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- stray key from ever reaching an EAP BSS.
 				x_passphrase          = (not is_enterprise) and a["wpa.psk"] or nil,
 				-- 802.1X / WPA-Enterprise: see _wire_radius above for the wire
-				-- keys, what is deferred, and why. nil on every non-EAP WLAN.
+				-- keys, what is deferred, and why. Also set on a non-EAP WLAN
+				-- that has RADIUS MAC authentication on, which brings the same
+				-- server block; nil when the WLAN has neither.
 				radius                = radius,
+				-- aaa.<n>.radius.macacl.status: the client's MAC is checked
+				-- against RADIUS before it may associate (hostapd's
+				-- macaddr_acl=2). Independent of the security type -- an
+				-- Enterprise WLAN can carry it too -- and never true without a
+				-- usable `radius` beside it, since the WLAN is dropped instead.
+				mac_auth              = mac_auth or nil,
 				-- Hotspot 2.0 / Passpoint: see _wire_hs20 above for the wire
 				-- keys, what the controller cannot be made to send, and why.
 				-- nil unless this WLAN has a Hotspot 2.0 profile attached.

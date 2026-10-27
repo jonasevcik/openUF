@@ -524,6 +524,18 @@ local function add_bss_option(extra, line)
 	t[#t + 1] = line
 end
 
+-- The encryption values whose auth_type lands in ap.uc's EAP branch, which is
+-- the only place (besides ppsk) that calls iface_authentication_server(). On
+-- any other BSS the auth_server_* wifi-iface options are stored and never
+-- reach hostapd, so a RADIUS MAC ACL there has to go in as raw lines. An
+-- allow-set, so a future encryption value fails to the route that always works.
+local EAP_ENC = {
+	["wpa2+ccmp"]  = true,
+	["wpa3"]       = true,
+	["wpa3-mixed"] = true,
+	["wpa3-192"]   = true,
+}
+
 -- The encryption values that take a `key` (a passphrase or a 64-hex PMK). An
 -- allow-set rather than a "not none, not owe" test: an EAP BSS must never
 -- carry a passphrase, and a future encryption value must fail closed.
@@ -1817,12 +1829,21 @@ function M.apply_config(resp, cfg, opts)
 			-- silently authenticated against the wrong secret.
 			--
 			-- Nothing here is invented: no ownip/dynamic_own_ip_addr,
-			-- eap_reauth_period, radius_request_cui, radius_das_*, eap_server,
-			-- ieee8021x or wpa_key_mgmt. The wire carries none of them, and a
-			-- consumer keyed on a producer that does not exist is this
-			-- codebase's recurring defect.
+			-- eap_reauth_period, radius_request_cui, eap_server, ieee8021x or
+			-- wpa_key_mgmt. The wire carries none of them, and a consumer keyed
+			-- on a producer that does not exist is this codebase's recurring
+			-- defect. (radius_das_* IS on the wire -- see below.)
+			--
+			-- The AUTHENTICATION servers reach hostapd one of two ways. ap.uc
+			-- calls iface_authentication_server() only from its EAP branch (and
+			-- from iface_ppsk), so on a PSK, SAE or open BSS the wifi-iface
+			-- options are stored and silently dropped -- exactly the trap
+			-- CLAUDE.md names -- and raw per-BSS lines are the only route.
+			-- iface_accounting_server() IS called unconditionally, so the
+			-- accounting servers always go through UCI.
+			local eap_bss = EAP_ENC[SECURITY_MAP[vap.security] or ""] or false
 			if vap.radius then
-				local function servers(list, kind, addr_opt, port_opt, secret_opt)
+				local function servers(list, kind, addr_opt, port_opt, secret_opt, raw)
 					local first = list and list[1]
 					if not first then return end
 					local addrs = {first.ip}
@@ -1837,19 +1858,55 @@ function M.apply_config(resp, cfg, opts)
 								:format(tostring(vap.ssid), kind, s.ip, addr_opt))
 						end
 					end
-					extra[addr_opt]   = addrs
-					extra[port_opt]   = first.port
-					extra[secret_opt] = first.secret
+					if not raw then
+						extra[addr_opt]   = addrs
+						extra[port_opt]   = first.port
+						extra[secret_opt] = first.secret
+						return
+					end
+					-- hostapd reads the port and the secret that FOLLOW each
+					-- server address, so the triplet repeats per address -- the
+					-- same shape iface_authentication_server() emits.
+					for _, ip in ipairs(addrs) do
+						add_bss_option(extra, addr_opt .. "=" .. ip)
+						add_bss_option(extra, port_opt .. "=" .. first.port)
+						add_bss_option(extra, secret_opt .. "=" .. first.secret)
+					end
 				end
 				servers(vap.radius.auth, "authentication", "auth_server_addr",
-					"auth_server_port", "auth_server_shared_secret")
+					"auth_server_port", "auth_server_shared_secret", not eap_bss)
 				servers(vap.radius.acct, "accounting", "acct_server_addr",
 					"acct_server_port", "acct_server_shared_secret")
 				if vap.radius.interim_interval then
 					extra.radius_acct_interim_interval = vap.radius.interim_interval
 				end
 				if vap.radius.nas_id then extra.nas_identifier = vap.radius.nas_id end
+				-- RADIUS Dynamic Authorization (CoA / Disconnect-Request). Both
+				-- options are real wifi-iface options, appended by ap.uc for
+				-- EVERY auth type -- but the one place it joins the secret onto
+				-- the client address sits inside the EAP branch, so
+				-- radius_das_secret (and its dae_secret alias) is stored and
+				-- dropped on a PSK or open BSS. openUF therefore joins the two
+				-- itself, which is also exactly what hostapd parses (first token
+				-- the address, the REST of the line the shared secret) and what
+				-- UAP firmware 6.8.2 writes. radius_das_port is defaulted only
+				-- inside that same branch and hostapd's own default is 0 (= no
+				-- listener), so it is always written explicitly.
+				if vap.radius.das then
+					extra.radius_das_client =
+						vap.radius.das.client .. " " .. vap.radius.das.secret
+					extra.radius_das_port = vap.radius.das.port
+				end
 			end
+			-- RADIUS MAC authentication. macaddr_acl=2 is hostapd's "ask the
+			-- RADIUS server whether this MAC may associate"; it has no UCI
+			-- option of its own on 25.12 (the schema declares none, and the only
+			-- producers are macfilter -> 1/0 and ppsk -> 2), so it goes in raw.
+			-- ppsk would set it too, but on a PSK BSS it ALSO sets
+			-- wpa_psk_radius=2 and leaves the passphrase out (ap.uc's
+			-- `case psk`), turning the WLAN into a per-user-PSK one nobody
+			-- could join with the configured key -- a different UniFi feature.
+			if vap.mac_auth then add_bss_option(extra, "macaddr_acl=2") end
 			-- Hotspot 2.0 / Passpoint. Two gates in the ucode generator:
 			-- iw_enabled turns on iface_interworking (the Interworking element
 			-- and the ANQP answers), hs20 turns on iface_hs20 (the HS 2.0
@@ -2137,9 +2194,17 @@ function M.apply_config(resp, cfg, opts)
 			-- met -- they cannot, since EAP and PSK live on disjoint encryption
 			-- values, but "2" (required) alongside PPSK would reject every local
 			-- key that has no VLAN, so the harmless branch is the safe one.
+			--
+			-- The same RADIUS profile reaches a MAC-authenticated PSK or open
+			-- WLAN since 2026-10-27, and there the value is deliberately NOT
+			-- written: hostapd needs a vlan_file (ap.uc builds one from wifi-vlan
+			-- sections, which openUF creates none of) before it can put a station
+			-- on a RADIUS-assigned VLAN, so "2" (required) would reject every
+			-- client on a WLAN that worked a moment earlier. Honouring it needs
+			-- the dynamic-VLAN plumbing, which is its own piece of work.
 			if vap.ppsk then
 				extra.dynamic_vlan = "1"
-			elseif vap.radius and vap.radius.dynamic_vlan then
+			elseif eap_bss and vap.radius and vap.radius.dynamic_vlan then
 				extra.dynamic_vlan = vap.radius.dynamic_vlan
 			end
 

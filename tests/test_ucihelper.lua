@@ -2780,6 +2780,135 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: RADIUS MAC authentication on an open vap goes in as raw lines",
+		fn = function()
+			-- ap.uc calls iface_authentication_server() only from its EAP branch
+			-- (and from iface_ppsk), so on an open BSS the auth_server_* UCI
+			-- options are stored and never reach hostapd. Raw per-BSS lines are
+			-- the only route, and the port and secret repeat after each address
+			-- because that is how hostapd reads them.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "guest", radio = "radio0", security = "open",
+						 mac_auth = true, radius = {
+							auth = {{ip = "192.0.2.10", port = "1812", secret = "a"},
+							        {ip = "192.0.2.11", port = "1812", secret = "a"}},
+							acct = {{ip = "192.0.2.12", port = "1813", secret = "b"}},
+							interim_interval = "600", dynamic_vlan = "2"}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_guest
+				assert_eq(s.encryption, "none", "still an open BSS")
+				assert_eq(table.concat(s.hostapd_bss_options, "\n"),
+					"auth_server_addr=192.0.2.10\nauth_server_port=1812\n"
+					.. "auth_server_shared_secret=a\n"
+					.. "auth_server_addr=192.0.2.11\nauth_server_port=1812\n"
+					.. "auth_server_shared_secret=a\nmacaddr_acl=2",
+					"the server triplets, then the RADIUS MAC ACL")
+				assert_nil(s.auth_server_addr,
+					"and nothing through UCI, where it would be dropped")
+				-- Accounting is different: iface_accounting_server() runs for every
+				-- auth type, so those options work as options.
+				assert_eq(table.concat(s.acct_server_addr, " "), "192.0.2.12",
+					"the accounting server still goes through UCI")
+				assert_eq(s.radius_acct_interim_interval, "600", "and its interval")
+				-- hostapd needs a vlan_file before it can put a station on a
+				-- RADIUS-assigned VLAN, and openUF writes no wifi-vlan sections, so
+				-- "2" (required) here would reject every client on the WLAN.
+				assert_nil(s.dynamic_vlan, "the RADIUS VLAN mode is not honoured")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: MAC authentication on an EAP vap keeps the UCI server options",
+		fn = function()
+			-- The same WLAN setting, on a WLAN whose encryption lands in ap.uc's
+			-- EAP branch: there the generator emits the server block itself, so
+			-- only macaddr_acl needs a raw line.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 mac_auth = true, radius = {
+							auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}, dynamic_vlan = "2"}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10",
+					"the servers go through UCI")
+				assert_eq(table.concat(s.hostapd_bss_options, ","), "macaddr_acl=2",
+					"and only the MAC ACL is raw")
+				assert_eq(s.dynamic_vlan, "2", "an EAP WLAN keeps its RADIUS VLAN mode")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: MAC authentication writes nothing unless the controller asks",
+		fn = function()
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {{ip = "192.0.2.10", port = "1812",
+						  secret = "a"}}, acct = {}}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_corp
+				assert_nil(s.hostapd_bss_options, "no macaddr_acl line")
+				assert_nil(s.macaddr_acl, "and no option of that name either")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: Dynamic Authorization joins the client and the secret",
+		fn = function()
+			-- radius_das_client holds both, separated by a space: hostapd takes the
+			-- first token as the address and the rest of the line as the secret.
+			-- ap.uc would do that join itself, but only inside its EAP branch, so
+			-- radius_das_secret must never be written -- on a PSK or open BSS it
+			-- would be stored and dropped, leaving hostapd a client with no
+			-- secret. Written the same way for every auth type for that reason.
+			for _, sec in ipairs({"wpa2-enterprise", "wpa2", "open"}) do
+				with_ucihelper(function(db)
+					silently(function()
+						ucihelper.apply_config({radio_table = {}, vap_table = {
+							{ssid = "corp", radio = "radio0", security = sec,
+							 x_passphrase = sec == "wpa2" and "hunter22" or nil,
+							 mac_auth = sec ~= "wpa2-enterprise" or nil,
+							 radius = {
+								auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+								acct = {},
+								das = {client = "192.0.2.11", secret = "s3cret too",
+								       port = "3801"}}},
+						}}, nil)
+					end)
+					local s = db.wireless.openuf_radio0_corp
+					assert_eq(s.radius_das_client, "192.0.2.11 s3cret too",
+						sec .. ": address and secret on one line")
+					assert_eq(s.radius_das_port, "3801", sec .. ": the port")
+					assert_nil(s.radius_das_secret,
+						sec .. ": never the option the generator may ignore")
+				end)
+			end
+			-- No das block, no listener: hostapd's own radius_das_port default is
+			-- 0, so leaving both out is the off state.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {{ip = "192.0.2.10", port = "1812",
+						  secret = "a"}}, acct = {}}},
+					}}, nil)
+				end)
+				assert_nil(db.wireless.openuf_radio0_corp.radius_das_client,
+					"no client without a das block")
+				assert_nil(db.wireless.openuf_radio0_corp.radius_das_port, "no port either")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes wpa_group_rekey and leaves it alone when absent",
 		fn = function()
 			for _, c in ipairs({{"3600", "3600"}, {"0", "0"}, {nil, nil}}) do

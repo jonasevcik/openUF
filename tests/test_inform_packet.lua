@@ -1594,35 +1594,146 @@ return {
 		end
 	},
 	{
-		name = "inform packet: the deferred RADIUS keys derive nothing and do not block the WLAN",
+		name = "inform packet: RADIUS MAC authentication comes with its own server block",
 		fn = function()
-			-- Dynamic Authorization (das/dad) and RADIUS MAC authentication are
-			-- deliberately not implemented. This pins that: they must not appear
-			-- as fields anything downstream could key on, and their presence
-			-- must not stop the WLAN being provisioned. (The RadSec cert
-			-- filenames are not implemented either, but they are READ, as the
-			-- only mark of a RadSec server -- see the two tests above.)
-			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
-				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
-				.. "aaa.1.radius.das.status=enabled\naaa.1.radius.das.port=3801\n"
-				.. "aaa.1.radius.das.client=192.0.2.11\naaa.1.radius.das.secret=b\n"
-				.. "aaa.1.radius.dad.status=enabled\n"
-				.. "aaa.1.radius.dad.client.1.cidr=192.0.2.11/32\n"
-				.. "aaa.1.radius.macacl.status=enabled\naaa.1.radius.macacl.format=none\n"
-				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			-- aaa.<n>.radius.macacl.status is on the wire for every WLAN, and the
+			-- writer puts no capability gate on it: the VALUE is the whole
+			-- discriminator. It is not tied to the security type either -- this
+			-- is an OPEN WLAN, and the controller still sends the full
+			-- radius.auth.<k>.* block beside it, verbatim as captured from
+			-- 10.6.106 on 2026-10-27 (an open guest WLAN with "MAC
+			-- Authentication" on and the lab RADIUS profile attached).
+			local sys_cfg = "aaa.3.ssid=guest\naaa.3.devname=ath2\n"
+				.. "aaa.3.radius.auth.1.ip=192.0.2.10\naaa.3.radius.auth.1.port=1812\n"
+				.. "aaa.3.radius.auth.1.secret=a\n"
+				.. "aaa.3.radius.auth.2.ip=192.0.2.11\naaa.3.radius.auth.2.port=1812\n"
+				.. "aaa.3.radius.auth.2.secret=a\n"
+				.. "aaa.3.radius.macacl.status=enabled\n"
+				.. "aaa.3.radius.macacl.emptypassword=enabled\n"
+				.. "aaa.3.radius.macacl.format=%.2X-%.2X-%.2X-%.2X-%.2X-%.2X\n"
+				.. "wireless.3.ssid=guest\nwireless.3.parent=radio0\n"
+			local orig = inform._sysinfo.eap_supported
+			inform._sysinfo.eap_supported = function() return true end
 			local vap_table
-			with_stderr(function()
+			local logged = with_stderr(function()
 				local _
 				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 			end)
-			assert_eq(#vap_table, 1, "the WLAN is still provisioned")
-			local rad = vap_table[1].radius
-			assert_eq(#rad.auth, 1, "only the auth server was read")
-			assert_nil(rad.das, "no das field")
-			assert_nil(rad.dad, "no dad field")
-			assert_nil(rad.macacl, "no macacl field")
-			assert_nil(vap_table[1].mac_filter_policy,
+			inform._sysinfo.eap_supported = orig
+			assert_eq(#vap_table, 1, "the WLAN is provisioned")
+			local v = vap_table[1]
+			assert_eq(v.security, "open", "still an open WLAN")
+			assert_true(v.mac_auth, "MAC authentication is on")
+			assert_eq(#v.radius.auth, 2, "both authentication servers were read")
+			assert_eq(v.radius.auth[1].ip, "192.0.2.10", "in index order")
+			assert_eq(logged, "", "and nothing is complained about")
+			-- The two formatting keys are declines: both are options of UniFi's
+			-- patched hostapd (macaddr_format, mac_acl_empty_passwd), neither
+			-- string exists in OpenWrt's binary, so nothing may key on them.
+			assert_nil(v.radius.macacl, "no macacl field")
+			assert_nil(v.mac_auth_format, "the printf format derives nothing")
+			assert_nil(v.mac_filter_policy,
 				"radius.macacl is not the MAC Address Filter")
+			-- A WLAN the controller leaves alone keeps nothing.
+			local _, plain = inform._parse_wifi_system_cfg(
+				"aaa.1.ssid=open\naaa.1.radius.macacl.status=disabled\n"
+				.. "wireless.1.ssid=open\nwireless.1.parent=radio0\n")
+			assert_nil(plain[1].mac_auth, "macacl.status=disabled claims nothing")
+			assert_nil(plain[1].radius, "and brings no RADIUS block")
+		end
+	},
+	{
+		name = "inform packet: a WLAN needing MAC authentication is dropped, not left open",
+		fn = function()
+			-- MAC authentication is an access control, so it fails CLOSED: a WLAN
+			-- provisioned without it would admit every client the admin meant to
+			-- screen, and on an open WLAN that is the only barrier there is.
+			local function run(cfg, eap_ok)
+				local orig = inform._sysinfo.eap_supported
+				inform._sysinfo.eap_supported = function() return eap_ok end
+				local vt
+				local logged = with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(cfg)
+				end)
+				inform._sysinfo.eap_supported = orig
+				return vt, logged
+			end
+			local tail = "wireless.1.ssid=guest\nwireless.1.parent=radio0\n"
+			-- No usable server: the push names none at all.
+			local vt, logged = run("aaa.1.ssid=guest\n"
+				.. "aaa.1.radius.macacl.status=enabled\n" .. tail, true)
+			assert_eq(#vt, 0, "no server, no WLAN")
+			assert_contains(logged, "requires RADIUS MAC authentication",
+				"the reason is named")
+			assert_contains(logged, "no usable RADIUS authentication server",
+				"and so is what was missing")
+			-- A server, but a hostapd with no RADIUS client: auth_server_addr is
+			-- an unknown option to a basic wpad, which refuses the whole config,
+			-- so the BSS would not come up anyway.
+			vt, logged = run("aaa.1.ssid=guest\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.macacl.status=enabled\n" .. tail, false)
+			assert_eq(#vt, 0, "no RADIUS client, no WLAN")
+			assert_contains(logged, "no RADIUS client", "and that is said plainly")
+			-- The same WLAN without MAC authentication is untouched by any of it.
+			vt = run("aaa.1.ssid=guest\naaa.1.radius.macacl.status=disabled\n" .. tail, false)
+			assert_eq(#vt, 1, "a plain open WLAN is provisioned either way")
+		end
+	},
+	{
+		name = "inform packet: Dynamic Authorization is read in the das shape only",
+		fn = function()
+			-- The controller sends CoA/Disconnect twice over: the das.* shape names
+			-- the client directly, the dad.* shape expects the AP's own daemon to
+			-- relay it from 127.0.0.1. openUF has no relay, so only das.* is read.
+			local base = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+			local tail = "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local function r(extra)
+				local vt, logged
+				logged = with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(base .. extra .. tail)
+				end)
+				assert_eq(#vt, 1, "provisioned")
+				return vt[1].radius, logged
+			end
+			local rad = r("aaa.1.radius.das.status=enabled\naaa.1.radius.das.port=3801\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\naaa.1.radius.das.secret=b\n"
+				.. "aaa.1.radius.dad.status=enabled\n"
+				.. "aaa.1.radius.dad.client.1.cidr=192.0.2.11/32\n"
+				.. "aaa.1.radius.dad.client.1.secret=c\n")
+			assert_eq(rad.das.client, "192.0.2.11", "the client the server will call from")
+			assert_eq(rad.das.secret, "b", "its shared secret")
+			assert_eq(rad.das.port, "3801", "the controller's own port (3800 + index)")
+			assert_nil(rad.dad, "the dad shape derives nothing")
+			-- RFC 5176's default, and the firmware's fallback.
+			assert_eq(r("aaa.1.radius.das.status=enabled\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\n"
+				.. "aaa.1.radius.das.secret=b\n").das.port, "3799", "default port")
+			-- Absence, and an explicit off, are both "no listener".
+			assert_nil(r("").das, "absent is off")
+			assert_nil(r("aaa.1.radius.das.status=disabled\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\n"
+				.. "aaa.1.radius.das.secret=b\n").das, "disabled is off")
+			-- Each refusal is named, and never with the secret in it.
+			local function refused(extra, why)
+				local rad2, logged = r("aaa.1.radius.das.status=enabled\n" .. extra)
+				assert_nil(rad2.das, "nothing is written for: " .. why)
+				assert_contains(logged, why, "the reason is logged")
+				assert_true(logged:find("sekrit", 1, true) == nil,
+					"and the secret is not")
+			end
+			refused("aaa.1.radius.das.client=not-an-ip\naaa.1.radius.das.secret=sekrit\n",
+				"no usable IPv4 client address")
+			refused("aaa.1.radius.das.client=192.0.2.11\naaa.1.radius.das.secret=\n",
+				"missing or oversized shared secret")
+			-- A newline cannot reach here (the tokenizer splits on it), but a
+			-- tab can, and radius_das_client is a single hostapd line.
+			refused('aaa.1.radius.das.client=192.0.2.11\n'
+				.. "aaa.1.radius.das.secret=sek\trit\n",
+				"a control character in the shared secret")
 		end
 	},
 	{
