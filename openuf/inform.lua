@@ -386,6 +386,19 @@ end
 -- what keeps that from becoming a shell.
 local is_mac = util.is_mac
 
+-- The only tokens wireless.<n>.bcfilt.bypass_types can carry (the controller
+-- writes the whole string as one literal, so this is the closed vocabulary,
+-- not a sample). Each maps to one nft exemption in bcfilter.lua; the value is
+-- documentation only, the key is what matters. NSNA is IPv6 Neighbour
+-- Solicitation/Advertisement -- ARP's IPv6 equivalent, which is why the
+-- controller pairs the two.
+local BCFILT_BYPASS_TYPES = {
+	ARP    = "ether type arp",
+	NSNA   = "ICMPv6 neighbour solicitation/advertisement",
+	DHCPV4 = "UDP 67/68 over IPv4",
+	DHCPV6 = "UDP 546/547 over IPv6",
+}
+
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
 -- A native zlib binding, looked up once: a failed require is not remembered
@@ -2080,10 +2093,19 @@ function M.build_json(st, cfg, ufhw)
 		-- here: wifi-device acs_exclude_dfs and chanlist (see
 		-- ucihelper.rf_config).
 		--
+		-- Bit 0x400000: Device.supportsMulticastSuppressor(). Gates the
+		-- WLAN's wireless.<n>.multicast.suppressor key -- the "Multicast
+		-- Suppression" control, which is the same WLAN setting the old
+		-- "Multicast and Broadcast Blocker" was: 10.6.106's own UI bundle
+		-- maps mode=aggressive onto bc_filter_enabled + bc_filter_list (the
+		-- bcfilt.* keys openUF already enforces) and mode=conservative onto
+		-- this key ALONE. Without the bit a WLAN set to Conservative pushes
+		-- nothing at all. See bcfilter.lua for what each mode does.
+		--
 		-- No other bit is claimed: wifi_caps2 also gates real-hardware-only
 		-- features (Mesh MLO parent/child and others, see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
-		wifi_caps2       = 0x70 + (M._assoc_enabled(st, cfg) and 0x2000 or 0),
+		wifi_caps2       = 0x400070 + (M._assoc_enabled(st, cfg) and 0x2000 or 0),
 		-- fw2_caps, a THIRD firmware bitmask (hyFnQ.getFirmware2Capabilities
 		-- reads the field "fw2_caps"), sent only for its one needed bit.
 		--
@@ -3195,6 +3217,39 @@ function M._parse_wifi_system_cfg(sys_raw)
 				end
 			end
 			if bcfilt_macs then table.sort(bcfilt_macs) end
+			-- wireless.<n>.bcfilt.bypass_types: the frame types the blocker must
+			-- let through. CONFIRMED live 2026-10-27 in the lab, as exactly
+			-- "ARP|NSNA|DHCPV4|DHCPV6" -- the controller writes that string as a
+			-- literal (10.6.106, com/ubnt/service/config/ubntconf/EYFcHmSpOqr),
+			-- so those four tokens are the whole vocabulary it can send today.
+			-- It is emitted only for a WLAN whose Multicast Suppression is
+			-- "Aggressive" on a device claiming wifi_caps2 0x400000, which is why
+			-- openUF never saw it before: without it the blocker drops ARP and
+			-- DHCP too, and bcfilter.lua's header called that deliberate fidelity
+			-- to Ubiquiti's older documentation. The controller now says the
+			-- opposite in its own UI -- "Aggressive blocks all except DHCP and
+			-- ARP" -- so the tokens are honoured.
+			--
+			-- Parsed as a set, upper-cased, with unknown tokens named and
+			-- dropped rather than guessed at: each one has to become an nft
+			-- match, so a token with no mapping cannot be silently "allowed".
+			local bcfilt_bypass
+			for raw in tostring(w["bcfilt.bypass_types"] or ""):gmatch("[^|]+") do
+				-- A fresh local, not the loop variable: Lua 5.5 makes the
+				-- generic-for control variable const and refuses the assignment
+				-- outright, while 5.1 (the target) accepts it -- so the dev box
+				-- is the strict one here for once.
+				local tok = raw:gsub("^%s+", ""):gsub("%s+$", ""):upper()
+				if tok ~= "" then
+					if BCFILT_BYPASS_TYPES[tok] then
+						bcfilt_bypass = bcfilt_bypass or {}
+						bcfilt_bypass[tok] = true
+					else
+						io.stderr:write(("inform: bcfilt: ignoring unknown bypass type %q\n")
+							:format(tok))
+					end
+				end
+			end
 
 			-- Private Pre-Shared Keys: several passphrases on one SSID, each
 			-- landing its client on its own VLAN. Pushed only to a device
@@ -3614,6 +3669,30 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- See the bcfilt derivation above the vap literal.
 					bcfilt_enabled        = _wire_bool(w["bcfilt.status"]),
 					bcfilt_macs           = bcfilt_macs,
+					bcfilt_bypass         = bcfilt_bypass,
+					-- wireless.<n>.multicast.suppressor: "Multicast Suppression"
+					-- (Settings -> WiFi -> [WLAN] -> Advanced). CONFIRMED live
+					-- 2026-10-27 in the lab, on both band entries of the WLAN, once
+					-- wifi_caps2 0x400000 is claimed.
+					--
+					-- The control has three positions and the wire carries no mode
+					-- string, so the mode is read off the PAIR of keys. 10.6.106's
+					-- own writer settles it: bcfilt.status (plus bypass_types) is
+					-- emitted when the mode is Aggressive, and this key is emitted
+					-- for Aggressive and Conservative alike, so
+					--   suppressor + bcfilt  -> Aggressive: block all group frames
+					--                           except the four bypass types and the
+					--                           allow-listed senders (bcfilter.lua)
+					--   suppressor, no bcfilt -> Conservative: "prevents storms"
+					--   bcfilt, no suppressor -> an older controller, or the blocker
+					--                           turned on with the mode left Off:
+					--                           today's behaviour, unchanged
+					-- The controller's own description of the two modes is "Limits
+					-- multicast and broadcast traffic to reduce WiFi airtime usage.
+					-- Conservative prevents storms; Aggressive blocks all except DHCP
+					-- and ARP" (10.6.106 en locale,
+					-- SETTINGS_WIFI_FORM_ADVANCED_MULTICAST_SUPPRESSION_DESC).
+					mcast_suppressor      = _wire_bool(w["multicast.suppressor"]),
 					-- Per-VAP disable. Moves with the parent radio's
 					-- radio.<n>.status (disabling a radio disables every VAP
 					-- on it), but is an independent key -- confirmed live

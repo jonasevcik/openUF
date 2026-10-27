@@ -2604,6 +2604,78 @@ return {
 		end
 	},
 	{
+		name = "inform packet: Aggressive multicast suppression carries the bypass types",
+		fn = function()
+			-- Verbatim from the lab, 2026-10-27: both band entries of one WLAN
+			-- after setting multicast_suppressor_mode=aggressive with the
+			-- device claiming wifi_caps2 0x400000. bypass_types is ONE key
+			-- holding the whole pipe-separated list.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.multicast.suppressor=enabled\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+				.. "wireless.1.bcfilt.bypass_types=ARP|NSNA|DHCPV4|DHCPV6\n"
+				.. "wireless.1.bcfilt.1.status=enabled\n"
+				.. "wireless.1.bcfilt.1.mac=00:00:5e:00:53:01\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.mcast_suppressor, true, "the suppressor key is read")
+			assert_eq(v.bcfilt_enabled, true, "and it is the Aggressive pair")
+			for _, tok in ipairs({"ARP", "NSNA", "DHCPV4", "DHCPV6"}) do
+				assert_eq(v.bcfilt_bypass[tok], true, "bypass type " .. tok)
+			end
+			assert_eq(v.bcfilt_macs[1], "00:00:5e:00:53:01", "allow-list still read")
+		end
+	},
+	{
+		name = "inform packet: Conservative multicast suppression arrives without a bcfilt block",
+		fn = function()
+			-- Verbatim from the lab, 2026-10-27, same WLAN set to
+			-- multicast_suppressor_mode=conservative: the suppressor key alone,
+			-- with no bcfilt.* of any kind. That absence IS the mode -- the
+			-- wire never names it -- so it is asserted, not assumed.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.multicast.inspect=false\n"
+				.. "wireless.1.multicast.suppressor=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.mcast_suppressor, true, "suppression is on")
+			assert_eq(v.bcfilt_enabled, nil, "and nothing is blocked")
+			assert_eq(v.bcfilt_bypass, nil, "no bypass types with Conservative")
+			-- multicast.inspect sits in the same block and is a decoy: it is
+			-- constant across the toggle and openUF reads nothing from it.
+			assert_eq(v.mcast_inspect, nil, "multicast.inspect stays unread")
+		end
+	},
+	{
+		name = "inform packet: an unknown bypass type is named and dropped, not guessed at",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+				.. "wireless.1.bcfilt.bypass_types=ARP| dhcpv4 ||IGMP\n"
+			local logged, vap_table
+			local orig, buf = io.stderr, {}
+			io.stderr = {write = function(_, ...)
+				for _, x in ipairs({...}) do buf[#buf + 1] = tostring(x) end
+			end}
+			local ok, err = pcall(function()
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			io.stderr = orig
+			logged = table.concat(buf)
+			if not ok then error(err, 0) end
+			local b = vap_table[1].bcfilt_bypass
+			assert_eq(b.ARP, true, "the known token is kept")
+			assert_eq(b.DHCPV4, true, "case and padding are normalised")
+			assert_eq(b.IGMP, nil, "a token with no nft match is not honoured")
+			assert_true(logged:find("unknown bypass type", 1, true) ~= nil,
+				"and the refusal is logged by name")
+			assert_true(logged:find("IGMP", 1, true) ~= nil, "naming the token")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg leaves bcfilt fields nil when absent",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

@@ -218,4 +218,95 @@ return {
 			assert_true(logged:find("malformed") ~= nil, "and the drop is logged")
 		end
 	},
+
+	{
+		name = "bcfilter: Aggressive exempts the four bypass types, before the drop",
+		fn = function()
+			with_bcfilter(function(cmds)
+				-- The verbatim set the controller sends (one literal string,
+				-- "ARP|NSNA|DHCPV4|DHCPV6"), as the lab captured it.
+				bcfilter.reconcile({{ifname = "wlan0", macs = {"00:00:5e:00:53:01"},
+					bypass = {ARP = true, NSNA = true, DHCPV4 = true, DHCPV6 = true}}})
+				assert_true(contains(cmds, 'oifname "wlan0" ether type arp accept'),
+					"ARP is let through")
+				assert_true(contains(cmds,
+					'oifname "wlan0" ether type ip udp dport { 67, 68 } accept'),
+					"DHCPv4 is let through")
+				assert_true(contains(cmds,
+					'oifname "wlan0" ether type ip6 udp dport { 546, 547 } accept'),
+					"DHCPv6 is let through")
+				assert_true(contains(cmds,
+					'oifname "wlan0" ether type ip6 icmpv6 type ' ..
+					'{ nd-neighbor-solicit, nd-neighbor-advert } accept'),
+					"IPv6 neighbour discovery is let through")
+				-- Order is the whole point: an accept after the drop would never
+				-- be reached, and the rules go in in list order.
+				local all = joined(cmds)
+				assert_true(all:find("ether type arp accept", 1, true)
+					< all:find("ether saddr != @allow_wlan0 drop", 1, true),
+					"every exemption is added before the drop")
+				assert_true(contains(cmds, "add element bridge openuf_bcfilt allow_wlan0 " ..
+					"{ 00:00:5e:00:53:01 }"), "and the allow-list still applies")
+			end)
+		end
+	},
+	{
+		name = "bcfilter: the plain blocker still drops ARP and DHCP",
+		fn = function()
+			-- A controller that sends no bypass_types gets exactly the ruleset it
+			-- got before this existed. Ubiquiti's older documentation described
+			-- that behaviour and told admins to allow-list the DHCP server, so an
+			-- invented exemption would change a working WLAN.
+			with_bcfilter(function(cmds)
+				bcfilter.reconcile({{ifname = "wlan0", macs = {}}})
+				assert_false(contains(cmds, "accept"), "no exemption of any kind")
+				assert_true(contains(cmds, 'oifname "wlan0" meta pkttype ' ..
+					"{ broadcast, multicast } ether saddr != @allow_wlan0 drop"),
+					"and the drop is unchanged")
+			end)
+		end
+	},
+	{
+		name = "bcfilter: Conservative limits the rate instead of blocking",
+		fn = function()
+			with_bcfilter(function(cmds)
+				bcfilter.reconcile({{ifname = "wlan0", limit = true}})
+				assert_true(contains(cmds, 'oifname "wlan0" meta pkttype ' ..
+					"{ broadcast, multicast } limit rate over 100/second " ..
+					"burst 50 packets drop"),
+					"only the excess above the ceiling is dropped")
+				-- `limit rate over` is the form that drops the EXCESS; plain
+				-- `limit rate` matches while UNDER the rate, which with a drop
+				-- verb would discard all the ordinary traffic and pass the storm.
+				assert_true(contains(cmds, "limit rate over"),
+					"`over`, not a bare `limit rate`")
+				assert_false(contains(cmds, "allow_wlan0"),
+					"a rate ceiling needs no allow-list, so no set is created")
+				assert_false(contains(cmds, "ether saddr !="),
+					"and nothing is blocked outright")
+			end)
+		end
+	},
+	{
+		name = "bcfilter: one VAP's exemptions never reach another's",
+		fn = function()
+			with_bcfilter(function(cmds)
+				bcfilter.reconcile({
+					{ifname = "wlan0", macs = {}, bypass = {ARP = true}},
+					{ifname = "wlan1", macs = {}},
+					{ifname = "wlan2", limit = true},
+				})
+				assert_true(contains(cmds, 'oifname "wlan0" ether type arp accept'),
+					"the exempt VAP has its accept")
+				assert_false(contains(cmds, 'oifname "wlan1" ether type arp'),
+					"the blocked VAP does not")
+				assert_true(contains(cmds, 'oifname "wlan1" meta pkttype ' ..
+					"{ broadcast, multicast } ether saddr != @allow_wlan1 drop"),
+					"each VAP keeps its own mode")
+				assert_true(contains(cmds, 'oifname "wlan2" meta pkttype ' ..
+					"{ broadcast, multicast } limit rate over"),
+					"including the rate-limited one")
+			end)
+		end
+	},
 }

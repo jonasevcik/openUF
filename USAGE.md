@@ -30,7 +30,7 @@ the device has.
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
-| `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
+| `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** Multicast Suppression (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
 | `kmod-nft-bridge` | The Multicast/Broadcast Blocker, the L2 hardening (`bridge openuf_l2guard`) and the guest portal (`bridge openuf_guest`, lab-validated only). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally. Client block/unblock matches on `ether saddr` alone and does not need it |
 | `hostapd-utils` | `hostapd_cli` — each client's AKM for `is_11r`, a blocked client's entry in hostapd's deny list on every SSID, immediate deauth of a just-blocked wireless client, the controller's Client → Reconnect (`kick-sta`), client kick (Roaming Assistance), Minimum RSSI's 30 s kick, and restarting a WLAN's beacon when its WiFi Blackout Schedule ends or guest selfrun (`off`) is over |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced. Its `htb`, `fq_codel`, `u32`, `mirred` and `police` are all openUF uses |
@@ -548,7 +548,7 @@ Settings carried through from the controller:
 | Pairwise cipher (`wpa.1.pairwise`, from wlanconf `wpa_enc`, REST only) | the second token of `encryption`: `psk2+gcmp`, `psk2+ccmp256`, `wpa2+gcmp`, … `CCMP` (the controller's `auto` and `ccmp`) writes no suffix, since it is the generator's own default. `gcmp-256` never arrives — the controller refuses the value. **Gated on the radio's cipher suites**, read over `ucode -l nl80211` (`iw` 6.17 prints none): a cipher the phy does not report keeps the default and logs `controller asked for pairwise cipher … -- keeping …`, because hostapd treats an unprogrammable cipher as fatal and the BSS would never come up. Where two radios serve one band the band's set is the intersection; an unknown probe never vetoes. OWE, and the 192-bit suite (which the generator pins to GCMP-256 itself), are left alone |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
-| Multicast and Broadcast Blocker | nftables rules, not a hostapd option. `openuf_bcfilt`/`openuf_bcfilt_macs` on the section are the persisted record: the ruleset dies with a reboot, so openUF rebuilds it from those two options on every start |
+| Multicast Suppression | nftables rules, not a hostapd option. `openuf_bcfilt`, `openuf_bcfilt_macs`, `openuf_bcfilt_bypass` and `openuf_mcast_suppress` on the section are the persisted record: the ruleset dies with a reboot, so openUF rebuilds it from those four options on every start |
 | Proxy ARP | `proxy_arp` — **needs a full `wpad` build** |
 | Client Isolation | `isolate` (hostapd `ap_isolate`) |
 | Network / VLAN assignment | a per-VLAN bridge (`br-openuf<id>`) holding the tagged uplink sub-device (`eth1.<id>`), which the VAP joins — plus a `switch_vlan` trunk on swconfig boards. See below |
@@ -1356,27 +1356,62 @@ Troubleshooting:
 - A connection on a BSS that has no `vap_table` entry yet (right after a config push) is
   dropped rather than filed under the wrong band.
 
-The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
-can suppress group-addressed frames wholesale but has no notion of an allow-list — so
-openUF enforces it with nftables, in its own `bridge openuf_bcfilt` table (separate
-from the client-blocking `bridge openuf` table, which is rebuilt wholesale on every
-block/unblock and would otherwise wipe these rules). Frames leaving a filtered SSID are
-dropped unless the *sender's* MAC is allow-listed.
+**Multicast Suppression** (Settings → WiFi → [WLAN] → Advanced; the control the
+controller used to call "Multicast and Broadcast Blocker") has no hostapd or OpenWrt
+equivalent — hostapd can suppress group-addressed frames wholesale but has no notion of
+an allow-list, a bypass list or a rate — so openUF enforces all of it with nftables, in
+its own `bridge openuf_bcfilt` table (separate from the client-blocking `bridge openuf`
+table, which is rebuilt wholesale on every block/unblock and would otherwise wipe these
+rules).
 
-This needs **`kmod-nft-bridge`**, as does the L2 hardening below. The drop rule is
-a bridge-family `meta` match, and `nft_meta_bridge` is a separate module that
+The control has three positions and **the wire never names the mode**. Both keys need
+`wifi_caps2 0x400000`, which openUF claims:
+
+| Mode | Keys that arrive | What openUF does |
+|---|---|---|
+| Off | nothing | nothing; the table is left empty |
+| Conservative | `wireless.<n>.multicast.suppressor=enabled` **only** | rate-limits group-addressed frames leaving that VAP: `limit rate over 100/second burst 50 packets drop` |
+| Aggressive | that key **plus** `wireless.<n>.bcfilt.status`, `bcfilt.bypass_types=ARP\|NSNA\|DHCPV4\|DHCPV6` and the `bcfilt.<k>.mac` allow-list | drops group-addressed frames leaving that VAP unless the *sender's* MAC is allow-listed, after letting the four bypass types through |
+| (older controller) | `bcfilt.status` with no suppressor key | the pre-2026-10 behaviour, unchanged — see the warning below |
+
+So Aggressive is distinguished from Conservative by the *presence of the `bcfilt` block*,
+not by any value. The allow-list the controller sends is not only the one you typed: it
+adds every UniFi device MAC in the site and the gateway's LAN peers, which is why the UI
+says gateways need not be added by hand.
+
+The four bypass types become four `accept` rules placed **before** the drop, each pinned
+to that VAP's own `oifname`: `ether type arp`, `ether type ip6 icmpv6 type { nd-neighbor-solicit,
+nd-neighbor-advert }`, `ether type ip udp dport { 67, 68 }` and `ether type ip6 udp dport
+{ 546, 547 }`. That is what makes the controller's own description true — "Limits
+multicast and broadcast traffic to reduce WiFi airtime usage. Conservative prevents
+storms; Aggressive blocks all except DHCP and ARP".
+
+**The Conservative rate is openUF's own number, not the controller's.** The wire carries
+a bare `enabled` with no parameters, so 100 packets/second with a 50-packet burst was
+chosen against a measurement: both production bridges carry 1.4–3.6 multicast frames per
+second at idle (read from `/sys/class/net/<br>/statistics/multicast` over 60 s on an
+ath79 and a filogic board), so the ceiling sits roughly 30× above real discovery traffic
+while still capping what a storm can take. It is a ceiling, not a target. If your site
+needs a different one, it is the `LIMIT_RATE`/`LIMIT_BURST` pair at the top of
+`openuf/bcfilter.lua`.
+
+This needs **`kmod-nft-bridge`**, as does the L2 hardening below. The `meta pkttype` rule
+is a bridge-family `meta` match, and `nft_meta_bridge` is a separate module that
 `nftables` does not depend on — absent from a stock filogic *and* ath79 image alike. The
 failure is quiet in the worst way: the table, the chain and the per-VAP allow-list set
-are all created and populated, and only the drop rule is rejected, so the control reads
+are all created and populated, and only that rule is rejected, so the control reads
 as enabled in the controller and `nft list table bridge openuf_bcfilt` shows a table that
-filters nothing. openUF now logs `nft rejected the drop rule for <ifname> -- install
+filters nothing. openUF logs `nft rejected the pkttype rule for <ifname> -- install
 kmod-nft-bridge` when this happens.
 
-> **This deliberately breaks DHCP for wireless clients unless you add the DHCP server's
-> MAC to the excepted-devices list.** That is Ubiquiti's own documented behavior for
-> this control, so openUF reproduces it faithfully rather than adding DHCP/ARP
-> exemptions of its own — a silent exemption would be harder to debug than the
-> documented breakage. Inspect the live rules with `nft list table bridge openuf_bcfilt`.
+> **A controller that sends no bypass types still breaks DHCP for wireless clients
+> unless you add the DHCP server's MAC to the excepted-devices list.** That is Ubiquiti's
+> own documented behaviour for the older control, and openUF reproduces it faithfully
+> rather than inventing an exemption that controller never asked for — a silent exemption
+> would be harder to debug than the documented breakage, and would change a WLAN that was
+> working as documented. Aggressive on a current controller does send the bypass types, so
+> there the carve-out is the controller's instruction, not openUF's guess. Inspect the live
+> rules with `nft list table bridge openuf_bcfilt`.
 
 **Minimum Data Rate** is set per WLAN in the controller but OpenWrt's rate options
 (`basic_rate`, `supported_rates`, `legacy_rates`, `beacon_rate`) are `wifi-device`
@@ -1859,6 +1894,9 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
 | hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed. Re-run `sh install.sh install`, or swap it by hand: `apk add wpad-mbedtls '!wpad-basic-mbedtls'` (opkg: `opkg remove wpad-basic-mbedtls && opkg install wpad-mbedtls`), then `/etc/init.d/wpad restart` |
 | SSIDs stay up after the AP's uplink cable is pulled | Expected, and what UniFi firmware does with the same config. The firmware drops its SSIDs on uplink loss only when the controller pushes `connectivity.status=enabled`, and the controller pushes that only to devices that claim wireless uplink (`wifi_caps` `0x1`). openUF can't do wireless uplink, so it gets `disabled`. See PROTOCOL-VALIDATION.md § `connectivity.*` |
+| Multicast Suppression is on in the controller but nothing is filtered | `nft list table bridge openuf_bcfilt` shows the mode: `limit rate over` rules mean Conservative, `drop` rules mean Aggressive, an empty chain means nothing arrived. An empty chain with the control on means the keys were not pushed — Force Provision, and check `uci show wireless \| grep -E "openuf_mcast_suppress\|openuf_bcfilt"`. A table with the sets and no `meta pkttype` rule is the missing `kmod-nft-bridge`, which openUF logs by name |
+| Aggressive suppression still breaks DHCP or ARP | Check the controller actually sent the carve-out: the push must carry `wireless.<n>.bcfilt.bypass_types`, and the live rules must show four `accept` lines **above** the drop for that VAP. An older controller sends `bcfilt.status` alone, in which case the drop applies to DHCP and ARP too — Ubiquiti's documented behaviour for that control — and the DHCP server's MAC has to go on the excepted-devices list |
+| Conservative suppression drops traffic that was fine before | The ceiling is 100 packets/second with a 50-packet burst, and it is openUF's number, not the controller's — the wire sends none. Measured idle rates are 1.4–3.6 frames/s, so a site hitting it has real group-addressed volume. Raise `LIMIT_RATE`/`LIMIT_BURST` at the top of `openuf/bcfilter.lua`, or set the WLAN to Off |
 | openUF does not start; `logread` says "not starting: /usr/sbin/hostapd has no 802.11v" | Deliberate: with a `wpad-basic-*` build every controller-pushed WLAN would take its radio down, so the init script refuses and the device's own WiFi keeps working. Swap in a full build as in the row above, then `/etc/init.d/openuf start` |
 | An Enhanced Open WLAN is missing from the AP, or a transition one is plain open | The radio does not claim `radio_caps2` bit `0x8`. Check `hostapd -vowe; echo $?` (must print 0; `wpad-basic-*` or `-mini` builds may lack OWE) and that `/usr/share/ucode/wifi/hostapd.uc` exists (OpenWrt 24.10+). Force Provision after fixing it |
 | A WLAN with Private Pre-Shared Keys is missing, or a key does not work | Missing: openUF does not claim `wifi_caps` bit `0x100000` (the controller logs "PPSK is not supported … will be skipped"). `grep -c vlanid= /usr/share/ucode/wifi/ap.uc` and `grep -c "from wpa_psk_file" /usr/sbin/hostapd` must both be non-zero. A VLAN key does not work: `uci show wireless | grep psk` should list it, `cat /var/run/hostapd-<ifname>.psk` should have its `vlanid=` line, and `logread | grep "from wpa_psk_file"` shows the VLAN hostapd assigned. openUF logs a key it left out because the VLAN had no network |

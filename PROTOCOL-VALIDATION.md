@@ -1860,7 +1860,9 @@ WPA-Enterprise WLAN and logs the drop otherwise.
 | `mcast.enhance` | Multicast Enhancement / Multicast-to-Unicast. `0`\|`1`. |
 | `uapsd` | **U-APSD** (WMM power save), from wlanconf `uapsd_enabled`, default `false` (10.x WLAN generator `eWivisHeQsnaqDtx`). `enabled`\|`disabled`, always present. Lab-confirmed 2026-10-11: the REST toggle flips exactly this key on both band entries. Hardware 2026-10-11: a real UCG Ultra (10.6) sends `disabled` on every home WLAN, and after a Force Provision all six BSSes on both APs ran `uapsd_advertisement_enabled=0`. UniFi firmware hands it to the driver unchanged (`ubntbox`: `iwpriv <ath> uapsd %d`, firmware-confirmed for 4.0.15), so `disabled` means off. → OpenWrt `uapsd` (hostapd `uapsd_advertisement_enabled`, whose OpenWrt default is 1). |
 | `minrate_data`, `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg` | **Minimum Data Rate Control.** `minrate_data` is the floor in kb/s; `beacon_rate`/`mgmt_rate` simply mirror it. `minrate_cck_rates.status` and `pureg` are derived consequences on 2.4 GHz (a 12 Mbps floor is OFDM, so CCK goes `false` and `pureg` goes `1`). `minrate_below_disable` is the separate "advertising rates" sub-toggle: on a UAP it becomes `iwpriv <ath> minrate_nobelow 1` (`ubntbox`), which makes the driver advertise only the legacy rates at or above the floor in beacons, probe responses and association responses (firmware-confirmed for 4.0.15, `umac.ko`: the `minrate_nobelow` setparam sets a VAP flag that `ieee80211_beacon_init`, `ieee80211_send_proberesp` and `ieee80211_setup_assocresp` check before swapping in the rate set `ieee80211_set_minrate_to_rateset_format` built; if no rate left in it is basic, `ieee80211_setminratebasicrates` makes the lowest one basic). That is openUF's `supported_rates` reading. The driver also trims the HT MCS set below the floor (keeping MCS 7/15/23), which OpenWrt has no option for. Emitted per band and **absent entirely** when that band's control is off — not band-gated, which an early reading of a 2.4-GHz-only capture suggested. |
-| `bcfilt.status`, `bcfilt.<k>.mac`, `bcfilt.<k>.status` | **Multicast and Broadcast Blocker** (REST `bc_filter_enabled`/`bc_filter_list`). `status` appears whenever the control is on, including with an empty allow-list; the indexed entries only once it is non-empty. `<k>` is 1-based and does **not** follow the REST list's order — adding a second MAC renumbered the first — so the index means nothing beyond grouping. Emitted on both band entries. |
+| `bcfilt.status`, `bcfilt.<k>.mac`, `bcfilt.<k>.status` | **Multicast Suppression**, Aggressive (REST `bc_filter_enabled`/`bc_filter_list`; the control used to be called "Multicast and Broadcast Blocker"). `status` appears whenever the control is on, including with an empty allow-list; the indexed entries only once it is non-empty. `<k>` is 1-based and does **not** follow the REST list's order — adding a second MAC renumbered the first — so the index means nothing beyond grouping. Emitted on both band entries. |
+| `bcfilt.bypass_types` | The frame types the blocker must let through, as one literal string `ARP\|NSNA\|DHCPV4\|DHCPV6`. Emitted only for **Aggressive** suppression on a device claiming `wifi_caps2` `0x400000`. See [Multicast Suppression](#multicast-suppression-the-blocker-renamed-and-a-key-openuf-was-dropping). |
+| `multicast.suppressor` | **Multicast Suppression**, on (`enabled`) for Conservative *and* Aggressive alike, so the mode is the *pair* of keys, not this value. Needs `wifi_caps2` `0x400000`. Not to be confused with `multicast.inspect`, which is a decoy — constant across the toggle. |
 | `l2_isolation` | **Client Isolation.** `enabled`\|`disabled`, always present, emitted on both band entries. → OpenWrt `isolate` (hostapd `ap_isolate`). |
 | `devname` | The Ubiquiti-side netdev for this vap (`ath0`…`ath3`). **The join key for the top-level [`macacl.*`](#macacl--mac-address-filter) section**, whose own indices do not line up with `<n>`. Not a name that exists on OpenWrt — enforcement resolves the real netdev via `ubus`. |
 | `mac_acl.status`, `mac_acl.policy` | ⚠️ **Decoys — not the MAC Address Filter.** Sit at `enabled`/`deny` with the control off and do not move when it is toggled; the real feature is the top-level [`macacl.*`](#macacl--mac-address-filter) section. |
@@ -3084,11 +3086,14 @@ by the controller's own startup log: `firmware[U6IW] new version (6.8.2.15592) i
 | `wifi_caps2` | `0x40` (64) | `Device.supportAdvertisingDeviceNameInBeacon()` = `hasWifiCapability2(64)` | The controller never emits `wireless.<n>.advertise_ap_name` at all, and doesn't even re-push config on the toggle. |
 | `wifi_caps2` | `0x20` (32) | `Device.supportsAssistedRoaming()` = `hasWifiCapability2(32)` | The controller never emits a WLAN's Roaming Assistant (`wireless.<n>.btm_disassoc.*`). Confirmed live in the lab: set, the keys appear on the 5 GHz entry. |
 | `wifi_caps2` | `0x10` (16) | `Device.supportsAcsDfs()` = `hasWifiCapability2(16)` | The controller emits **neither** `radio.<n>.acsdfs` **nor** `radio.<n>.blklst`: one `if (supportsAcsDfs())` in `com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf` guards the block that writes both, so the site's auto-channel DFS switch and its channel blacklist are silently dropped. Confirmed live in the lab: claimed, both appear (and nothing else moves). |
+| `wifi_caps2` | `0x400000` | `Device.supportsMulticastSuppressor()` = `hasWifiCapability2(0x400000)` | The controller emits neither `wireless.<n>.multicast.suppressor` nor `wireless.<n>.bcfilt.bypass_types`, so a WLAN set to **Conservative** Multicast Suppression pushes *nothing at all*, and one set to **Aggressive** pushes a blocker with no ARP/DHCP carve-out. Confirmed live in the lab 2026-10-27, both ways. |
 
 `wifi_caps2` is a **second, entirely separate** bitmask from `wifi_caps` (which gates
 `supportBandsteering()`/`supportZeroHandoff()`; openUF claims `0x4`/`0x8`, `0x10` and `0x20`, see below). Only bits `0x40` and
 `0x20` were the first claimed, joined by `0x2000` (roam topology stats) and, since
-2026-10-27, `0x10` (`supportsAcsDfs()`, the site's auto-channel DFS switch and channel
+2026-10-27, `0x400000` (`supportsMulticastSuppressor()`, Multicast Suppression and the
+blocker's bypass types) since 2026-10-27, `0x10` (`supportsAcsDfs()`, the site's
+auto-channel DFS switch and channel
 blacklist -- see [auto-channel limits](#radionacsdfs--radionblklst--the-sites-auto-channel-limits));
 the mask also gates Mesh MLO, quick/neighbour scan, Green AP and the multicast suppressor,
 which openUF does not implement and must not claim.
@@ -3419,9 +3424,10 @@ implements.
   one openUF does not implement. Settled from the jar; see
   [the walled garden](#the-walled-garden-two-forms-split-by-what-the-entry-looks-like).
 
-- **Multicast Suppressor** (`wifi_caps2` `0x400000` → `wireless.<n>.multicast.suppressor`):
-  could be enforced in nft like the Multicast/Broadcast Blocker, but it is the same feature
-  class that breaks casting. Low priority.
+- **Multicast Suppressor** (`wifi_caps2` `0x400000`): **claimed as of 2026-10-27**, and it
+  turned out not to be a new feature at all but the current encoding of the Multicast and
+  Broadcast Blocker, which openUF already enforced — with one key it was dropping. See
+  [Multicast Suppression](#multicast-suppression-the-blocker-renamed-and-a-key-openuf-was-dropping).
 - **No callers in the controller**, so a bit does nothing: `supportMinRateCtrl` (`wifi_caps`
   `0x200`), `supportMultiAclList` (`0x400`), `supportRadiusMacAuth` (`0x1000`),
   `supportHideChWidth` (`0x10000`), `supportZeroHandoff` (`0x2`), `supportLockAp`
@@ -4599,7 +4605,7 @@ them for measured values.
 | `spectrum_scanning` | `true` only in the inform between the spectrum-scan cmd and its sweep; see [Airtime Scan](#airtime-scan-spectrum-scan) |
 | `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
 | `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
-| `fw_caps` = `0x1110`, `wifi_caps2` = `0x70` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
+| `fw_caps` = `0x1110`, `wifi_caps2` = `0x400070` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
 | `ucihelper` `wps_device_name` / `ap_setup_locked` | Standards-based rather than Ubiquiti-derived — see the beacon row in the [feature matrix](#feature-matrix) |
 | ~~`usteer.lua`'s `USTEER_DEFAULTS`~~ | ✅ **Resolved 2026-09-10.** Verified against the installed package (usteer 2025.10.04) on the Archer C5. `band_steering_threshold` is a real option — it is in the init script's own list of keys fed to `ubus call usteer set_config`. The named `local` section is read too: the loader does `config_foreach uci_usteer usteer`, which visits every section of type `usteer`, named or anonymous. `network` is read from `uci get usteer.@usteer[-1].network`, the last section of that type — openUF's — so both writes reach the daemon. **Corrected 2026-09-27:** reaching the daemon is not the same as doing anything. usteer's source (`policy.c` `below_assoc_threshold`) reads `band_steering_threshold` only when `load_balancing_threshold` is non-zero, and it is 0 on both APs (`ubus call usteer get_config`). So openUF's 5/0 toggle switched nothing. The real switch is `band_steering_interval` (`band_steering.c`: 0 disables, otherwise a BSS Transition request to each steerable 2.4 GHz client every interval). Its default in 2025.10.04 is 120000 ms, read live on both APs, so a running usteer always steered. That included Roaming Assistant with Band Steering off. openUF now writes `band_steering_interval=0` for off and deletes it for on, so the daemon default that steered a real client (#25) applies, and removes the old threshold. |
 
@@ -4856,7 +4862,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 32 | IoT Optimization: Force WiFi 4 Mode | `wireless.<n>.iot` + `wireless.<n>.qbssload` | ✅ Wire signature confirmed live by before/after diff, and both keys now reach UCI (`openuf_iot=1`, `bss_load_update_period=0`). **The hostapd side of `bss_load_update_period` is not verified on real hardware** — it is hostapd's own option name (0 suppresses the QBSS Load IE), assumed to pass through OpenWrt's wifi-iface schema. The rest of the mode is carried by keys openUF already applied. |
 | 33 | Proxy ARP / Client Isolation | `aaa.<n>.proxy_arp` / `wireless.<n>.l2_isolation` | ✅ Confirmed live 2026-07-18 by REST-toggling `wlanconf.proxy_arp` + `l2_isolation` and diffing `system_cfg`: exactly these two keys flipped `disabled`→`enabled`, on **both** the 2.4 GHz and 5 GHz entries of the WLAN, nothing else moved. Both are always present on their block, so "off" is explicit. `proxy_arp` had been visible in the Force WiFi 4 Mode diff all along but was never parsed. |
 | 34 | Minimum Data Rate Control | `wireless.<n>.minrate_data` (+ `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg`) | ✅ Confirmed live 2026-07-18 by REST-setting `minrate_setting_preference=manual` + `minrate_ng_data_rate_kbps=12000` and diffing: `minrate_data`/`beacon_rate`/`mgmt_rate` 1000→12000, `minrate_cck_rates.status` true→false, `pureg` 0→1. Separately confirmed **not band-gated** — enabling `minrate_na` (24 Mbps) made the same keys appear on the 5 GHz entries. **The OpenWrt side is radio-level**, not per-BSS (verified in OpenWrt's `hostapd.sh`: these are `hostapd_common_add_device_config` options), so openUF aggregates a radio's VAPs to the most permissive floor. Note `beacon_rate` is passed to hostapd **verbatim in 100-kbps units** while `basic_rate`/`supported_rates` are divided by 100 by `hostapd_add_rate` — openUF converts only the former. Not verified on real hardware. |
-| 35 | Multicast and Broadcast Blocker | `wireless.<n>.bcfilt.status` + `bcfilt.<k>.mac`/`.status` | ✅ Wire format confirmed live 2026-07-18 across four diffs (on with one MAC, with two MACs, on with an empty list, off). Two keys already on the wire were **excluded** as candidates by the same diffs: `radio.<n>.bcmc_l2_filter.status` (sits at `enabled` with the control off) and `wireless.<n>.multicast.inspect` — neither moved. ✅ Enforcement confirmed on real hardware 2026-09-02 (AX3000T, nftables 1.1.6, kernel 6.12), measured with counter-only probe rules carrying the same predicate: broadcast sourced onto the VLAN from a second AP and flooded out the IoT VAP matched the drop rule **14 of 14** times with that sender absent from the allow-list, and **0 of 15** times after adding it through the controller — both halves of the control, and the `bcfilt.<k>.mac` parse, end to end. ⚠️ Requires `kmod-nft-bridge`: the drop rule is openUF's only bridge-family `meta` match, `nft_meta_bridge` is absent from stock filogic and ath79 images alike, and without it the kernel returns a bare `Could not process rule: No such file or directory` **only for that rule** — table, chain and allow-list set all build, so the control appeared enabled everywhere while filtering nothing. `firewall.lua`'s block-sta matches on `ether saddr` alone, needs no module, and worked throughout, which is what hid this. |
+| 35 | Multicast Suppression (was "Multicast and Broadcast Blocker") | `wifi_caps2` `0x400000` → `wireless.<n>.multicast.suppressor` + `bcfilt.status`/`bcfilt.bypass_types`/`bcfilt.<k>.mac`/`.status` | ✅ Wire format confirmed live 2026-07-18 across four diffs (on with one MAC, with two MACs, on with an empty list, off). Two keys already on the wire were **excluded** as candidates by the same diffs: `radio.<n>.bcmc_l2_filter.status` (sits at `enabled` with the control off) and `wireless.<n>.multicast.inspect` — neither moved. ✅ Enforcement confirmed on real hardware 2026-09-02 (AX3000T, nftables 1.1.6, kernel 6.12), measured with counter-only probe rules carrying the same predicate: broadcast sourced onto the VLAN from a second AP and flooded out the IoT VAP matched the drop rule **14 of 14** times with that sender absent from the allow-list, and **0 of 15** times after adding it through the controller — both halves of the control, and the `bcfilt.<k>.mac` parse, end to end. ⚠️ Requires `kmod-nft-bridge`: the drop rule is openUF's only bridge-family `meta` match, `nft_meta_bridge` is absent from stock filogic and ath79 images alike, and without it the kernel returns a bare `Could not process rule: No such file or directory` **only for that rule** — table, chain and allow-list set all build, so the control appeared enabled everywhere while filtering nothing. `firewall.lua`'s block-sta matches on `ether saddr` alone, needs no module, and worked throughout, which is what hid this. **Three modes, and the wire names none of them** — settled 2026-10-27, see [Multicast Suppression](#multicast-suppression-the-blocker-renamed-and-a-key-openuf-was-dropping). ✅ Both modes captured verbatim in the lab once `wifi_caps2` `0x400000` is claimed; Aggressive now honours `bcfilt.bypass_types=ARP|NSNA|DHCPV4|DHCPV6` (four nft `accept` rules before the drop), Conservative installs `limit rate over 100/second burst 50 packets drop`. ⚠️ The exemptions and the rate limit are **lab-validated only**: every statement was accepted by a real nft 1.0.9 and the ruleset reloads idempotently on both boards, but no frame has been admitted or denied by type — that needs netns (unavailable in the container) or the control on for a live WLAN. ⚠️ The Conservative rate is openUF's own number (the wire sends none), set ~30x above the 1.4-3.6 multicast frames/s measured idle on both production bridges. |
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
 | 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control, implemented since 2026-10-27 as row 45). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
 | 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname`; a client's own profile as `rate-update` | ✅ Wire format confirmed live 2026-07-18 (kbps; the discriminator is the presence of `maxspeed`; needs a profile to exist). **Per client**, both directions queued (firmware-confirmed for 4.0.15; corrected 2026-10-11 from "per-VAP aggregate"). openUF: one HTB class per client per direction (upload on an IFB), live on both APs 2026-10-11: a phone held 1.97 Mbit/s up under 2 and 4.5 down under 5. See "`qos.*` — WiFi Speed Limit" |
@@ -5019,12 +5025,18 @@ All **needs capture**: find the controller setting in the jar, toggle it in the 
 descending promise, with why each is worth the toggle:
 
 - `wireless.<n>.advanced_isolation.{status,<k>.mac}` — a per-MAC **exception list** to client
-  isolation. If the controller emits it, the forced-`ap_isolate` trade behind proxy ARP and
-  Multicast Enhancement (see the hairpin finding) stops being necessary.
+  isolation. **Settled 2026-10-27: declined, no emitter** — zero occurrences in the whole
+  10.6.106 jar. See
+  [advanced_isolation](#wirelessnadvanced_isolation--declined-no-emitter). The
+  forced-`ap_isolate` trade it would have removed was closed from the other end by the
+  hairpin fix. The find next to it was real, though:
+  [Multicast Suppression](#multicast-suppression-the-blocker-renamed-and-a-key-openuf-was-dropping).
 - `wireless.<n>.intelligent_dhcp`, `.dhcp_bcast2ucast.status`, `.bintval`,
   `.ubnt_discovery_filter`, `.signal_led*` — VAP-level behaviour with plausible UCI
   counterparts (`dtim_period`, `beacon_int`); `intelligent_dhcp` and `element_adopt` were
-  already noted as never captured in the audit above.
+  already noted as never captured in the audit above. **Settled 2026-10-27: declined, no
+  emitter**, and `dtim_period`/`qbssload`/`no2ghz_oui` turned out to be already
+  implemented. See [axis 2 closed](#axis-2s-remaining-rows-closed-2026-10-27).
 - `radio.<n>.backup_channel`, `.acsdfs`, `.scan_list.{status,channels}`, `.ch144` — DFS
   fallback and channel-list narrowing. **Settled 2026-10-27:** `.acsdfs` is pushed (with
   `.blklst`) once `wifi_caps2` `0x10` is claimed, and both are implemented; the other three
@@ -5533,6 +5545,155 @@ CoA/Disconnect has been answered on hardware.
 | `aaa.radius.dad.{status,port,loglevel}`, `radius.dad.client.<k>.{cidr,secret}` | **decline: needs a relay openUF does not have.** The firmware turns it into `radius_das_client=127.0.0.1`, accepting the request from its own daemon; hostapd pointed at localhost would answer nobody. The `das.*` shape carries the same information and is implemented |
 | `aaa.<n>.dynamic_vlan` on a non-EAP WLAN | **decline: would break the WLAN.** `2` (required) with no `vlan_file` makes hostapd reject every station, and openUF writes no `wifi-vlan` sections for RADIUS-assigned VLANs. Honouring it needs the dynamic-VLAN plumbing |
 
+#### Multicast Suppression: the blocker renamed, and a key openUF was dropping
+
+Settled 2026-10-27, closing the last implementable row of axis 2. The row asked about
+`wireless.<n>.advanced_isolation.*`; that turned out to be a decline (below), and the
+real find was next to it.
+
+**The control.** 10.6.106's WLAN form has "Multicast Suppression" with three positions,
+whose own description is the whole semantic brief:
+
+> Limits multicast and broadcast traffic to reduce WiFi airtime usage. Conservative
+> prevents storms; Aggressive blocks all except DHCP and ARP
+
+(`SETTINGS_WIFI_FORM_ADVANCED_MULTICAST_SUPPRESSION_DESC`, the `en` locale bundle under
+`webapps/ROOT/app-unifi/react/data/locales/`. Worth remembering as a source: the config
+writer gives the wire format, the locale bundle gives the *intent*, and for a key with
+no readable firmware consumer that is the only statement of what the AP should do.)
+
+The UI's own REST mapping shows it is the **old Multicast and Broadcast Blocker** in new
+clothes, not a new feature:
+
+```js
+bc_filter_enabled:      mode === AGGRESSIVE
+bc_filter_list:         mode === AGGRESSIVE && allowlist
+multicast_suppressor_mode: mode
+```
+
+**The gates.** Two emitters, one capability bit:
+
+| key | emitter | gate |
+|---|---|---|
+| `wireless.<n>.multicast.suppressor` | `VAZShipWTNxlo` (the WLAN writer) | `wlan.isEnhancedIot()`-style single `if`: `supportsMulticastSuppressor()` **and** mode ∈ {conservative, aggressive} **and** `!isServiceWlan()` |
+| `wireless.<n>.bcfilt.*` + `bcfilt.bypass_types` | `com/ubnt/service/config/ubntconf/EYFcHmSpOqr` | emits nothing unless `bc_filter_enabled` **or** that same triple; `bypass_types` only for the triple |
+
+`supportsMulticastSuppressor()` is `hasWifiCapability2(0x400000)` — an unclaimed bit, the
+same shape as the `acsdfs` finding. **So the cost of not claiming it was not a missing
+feature but a wrong one:** a WLAN set to Conservative pushed nothing at all, and a WLAN
+set to Aggressive pushed a blocker with no ARP/DHCP carve-out, which openUF then enforced
+to the letter.
+
+**The mode is not on the wire.** `multicast.suppressor` is a bare `enabled` for
+Conservative and Aggressive alike. What distinguishes them is whether a `bcfilt` block
+comes with it — the *presence* of a block, which is normally this protocol's classic
+decoy. Here it is load-bearing, because the jar proves `bcfilt.status` is written for
+Aggressive and only Aggressive. Both captures, verbatim from the lab:
+
+```
+# multicast_suppressor_mode=conservative -- the key alone, on both band entries
+wireless.1.multicast.inspect=false
+wireless.1.multicast.suppressor=enabled
+wireless.2.multicast.inspect=false
+wireless.2.multicast.suppressor=enabled
+
+# multicast_suppressor_mode=aggressive
+wireless.1.multicast.suppressor=enabled
+wireless.1.bcfilt.status=enabled
+wireless.1.bcfilt.bypass_types=ARP|NSNA|DHCPV4|DHCPV6
+wireless.1.bcfilt.1.status=enabled
+wireless.1.bcfilt.1.mac=00:00:5e:00:53:02
+wireless.1.bcfilt.2.status=enabled
+wireless.1.bcfilt.2.mac=00:00:5e:00:53:01
+```
+
+`multicast.inspect` sits in the same block and stays a decoy: constant across every
+toggle, and `cfg-coverage` still reports it `inert`.
+
+**`bypass_types` is a single literal.** The writer does
+`put("wireless." + n + ".bcfilt.bypass_types", "ARP|NSNA|DHCPV4|DHCPV6")` — one constant
+string, so those four tokens are the closed vocabulary, not a sample. openUF maps each to
+one nft `accept` placed before the drop, and names-and-drops anything else rather than
+treating an unmapped token as "allowed":
+
+| token | nft match |
+|---|---|
+| `ARP` | `ether type arp` |
+| `NSNA` | `ether type ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert }` |
+| `DHCPV4` | `ether type ip udp dport { 67, 68 }` |
+| `DHCPV6` | `ether type ip6 udp dport { 546, 547 }` |
+
+**The allow-list is bigger than the admin's.** `EYFcHmSpOqr` unions
+`bc_filter_list` with every UniFi device MAC in the site *and* the gateway's
+`getLanPeerMacs()`, which is why the UI says gateways need not be added by hand. openUF
+needs no code for this — it consumes whatever MACs arrive.
+
+**Conservative has no parameters, so its rate is openUF's own.** `limit rate over
+100/second burst 50 packets drop`, chosen against a measurement rather than a guess: on
+both production APs, over 60 s, `/sys/class/net/<br>/statistics/multicast` moved 3.2 and
+3.6 frames/s on the main bridge and 1.4 and 1.5 on the IoT VLAN's. 100 pkt/s is ~30×
+that. Recorded as openUF's choice in README and USAGE, not as a controller value.
+`limit rate **over**` is the form that drops the excess; a bare `limit rate ... drop`
+matches while *under* the rate and would discard the ordinary traffic and pass the storm.
+
+**Verification.** Tier 1: 1154 pass, 13 new guards each mutation-tested red (including
+the `over` keyword and the accept-before-drop ordering). Tier 2: both modes captured
+verbatim above, every new key `consumed` in `cfg-coverage` (`multicast.inspect` still
+`inert`), 0 `handle_response failed`, the recording-cursor replay produces the intended
+UCI stamps and nft text, and every generated statement was accepted by a real nft 1.0.9
+and reloaded idempotently against dummy netdevs. Switching the WLAN to Off produced a
+setparam with none of the keys, so teardown is confirmed too. Tier 3: both APs deployed,
+restarted, informing, `wifi_caps2 0x400070` accepted by the production controller with
+steady noops and no new push; no WLAN here uses the control, so both APs show an empty
+`openuf_bcfilt` chain and no stamps — which is the correct outcome and what was checked.
+
+⚠️ **Not claimed:** no frame has been admitted or denied *by type*. Proving that needs
+either network namespaces (unavailable in the validation container — `ip netns add` fails
+with `mount --make-shared /var/run/netns failed: Operation not permitted`) or the control
+switched on for a live WLAN on the production APs, which is a config push to ask for, not
+to take. The earlier source-MAC half of the blocker *was* measured on real hardware
+(14/14 dropped, 0/15 once allow-listed, AX3000T 2026-09-02) and is unchanged.
+
+#### `wireless.<n>.advanced_isolation.*` — declined, no emitter
+
+`wireless.%d.advanced_isolation.{,%d.mac,status}` is consumed by **both** readable
+firmware builds (U7LR 6.8.2 and BZ2 4.3.28) and was axis 2's most promising row: a
+per-MAC exception list to client isolation would have made the forced-`ap_isolate` trade
+behind proxy ARP and Multicast Enhancement unnecessary.
+
+**It has zero occurrences anywhere in 10.6.106's `internal-dependencies.jar`** — not in a
+class, not in `api/fields/*.json`, not in the properties bundles. So no controller
+setting can emit it, the same verdict as `backup_channel`/`scan_list.*`/`ch144`. The only
+isolation key the WLAN writer emits is `wireless.<n>.l2_isolation` (defaulting to
+`is_guest`), which openUF already maps to `isolate`/`ap_isolate`; the WLAN schema holds
+only `l2_isolation` and `isolation_enabled`, and the site-level `acl_device_isolation` /
+`acl_l3_isolation` / `enable_isolated_wlan` belong to the gateway's ACL and devmgr paths,
+with no AP config writer among their callers.
+
+Separately, the trade this row existed to remove was already closed from the other end:
+the hairpin fix restores station-to-station reachability on a force-isolated BSS
+(`l2guard.lua`), so nothing is outstanding here.
+
+#### Axis 2's remaining rows, closed 2026-10-27
+
+Every never-captured key left in the axis-2 list was crossed against the jar by literal
+grep. Only six families had any hit at all, and five of those were already implemented:
+
+| family | verdict |
+|---|---|
+| `advanced_isolation.*` | **decline, no emitter** (above) |
+| `intelligent_dhcp`, `dhcp_bcast2ucast.*`, `bintval`, `ubnt_discovery_filter`, `signal_led*` | **decline, no emitter** — zero hits in the jar |
+| `rsn_preauth_uplinks`, `reauth_period`, `rsn_group_cipher`, `disable_na_mcast_to_ucast`, `strict_specification` | **decline, no emitter** — zero hits, joining the `rsn_preauth`/`wpa.*_rekey`/`fils.*` declines already recorded |
+| `qbssload`, `dtim_period`, `no2ghz_oui` | live emitters, **already implemented** (IoT Optimization, DTIM, Band Steering) |
+| `owe_devname`, `element_adopt` | live emitters, already-recorded declines (mesh scope; Elements adoption) |
+| `connectivity.*` | **decline, gated on `wifi_caps` `0x1`** (`supportVwire()`), the wireless-uplink capability openUF deliberately does not claim — `connectivity.status=disabled` in every capture follows from exactly that. The enabled form is all vwire/mesh anyway (`uplink_wds=vwirewan0`, `uplink_ssid`, `uplink_key`). Already documented under `connectivity.*`. |
+
+**So axis 2 is closed.** The technique that did it is the one from step 4, and it is the
+cheap one: grep the key literal over the extracted classes first — a family with zero
+hits needs no capture at all, and the same grep is what surfaced `multicast.suppressor`
+and `bcfilt.bypass_types`.
+
+
 #### `aaa.<n>.accept_mac.*` — MAC-based VLANs, a feature found while settling the above
 
 Not RADIUS at all, though the sweep's axis-2 table had filed it next to MAC auth. Its emitter
@@ -5575,6 +5736,16 @@ controller; the jar recipe is in "Decompiling the controller".
 - ~~**`linkscore` and `multicast`** have no known source or reference.~~ ✅ Resolved 2026-10-11:
   the firmware sends neither, and the controller reads them only off a mesh uplink. They are no longer sent,
   and neither are `capacity` or `throughput` (see the sta_table field table).
+- **What Conservative Multicast Suppression means on a real UniFi AP.** The controller
+  sends a bare `enabled` and describes it only as "prevents storms", and the key is absent
+  from every readable firmware build (6.8.2 `ubntbox` does not consume it; the U6 ARM64
+  image is still opaque), so no source states the rate UniFi uses. openUF's 100 pkt/s
+  ceiling is its own, measured against real idle traffic and documented as a choice. If an
+  ARM64 image is ever decrypted, this is one to check.
+- **Whether the four `bcfilt.bypass_types` exemptions select the right frames on the air.**
+  Every nft expression is accepted by a real nft and the ruleset loads on both boards, but
+  frame-level selection is unproven: the validation container cannot create network
+  namespaces, and the alternative is enabling the control on a live WLAN.
 - **`bootrom_version`** has no counterpart in the device schema. The firmware sends it (the
   U-Boot version, see *Top level*), so keeping it is right. Whether the controller reads it is unknown.
 - **What the plaintext firmware cannot settle.** UAP BZ2 4.0.15 (Jan 2019) predates OWE, PPSK,

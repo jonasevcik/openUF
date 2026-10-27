@@ -1189,6 +1189,134 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: Aggressive suppression carries the bypass types through to nft",
+		fn = function()
+			with_ucihelper(function(db)
+				local got
+				ucihelper._bcfilter = {reconcile = function(rules) got = rules end}
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper.get_ifnames_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return {"wlan0"} end
+					return {}
+				end
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22", bcfilt_enabled = true,
+					 mcast_suppressor = true,
+					 bcfilt_macs = {"00:00:5e:00:53:01"},
+					 bcfilt_bypass = {DHCPV4 = true, ARP = true}},
+				}}, nil)
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._bcfilter = nil
+
+				local s = db.wireless.openuf_radio0_corp
+				-- Stamped sorted, so the startup reapply rebuilds the identical
+				-- ruleset and `uci show` reads the same twice.
+				assert_eq(s.openuf_bcfilt_bypass, "ARP DHCPV4", "bypass types recorded sorted")
+				assert_eq(s.openuf_mcast_suppress, "1", "suppression recorded")
+				assert_eq(#got, 1, "one rule")
+				assert_eq(got[1].bypass.ARP, true, "ARP reaches bcfilter")
+				assert_eq(got[1].bypass.DHCPV4, true, "DHCPv4 reaches bcfilter")
+				assert_eq(got[1].limit, nil, "Aggressive blocks, it does not rate-limit")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: Conservative suppression reconciles a rate limit, not a block",
+		fn = function()
+			with_ucihelper(function(db)
+				local got
+				ucihelper._bcfilter = {reconcile = function(rules) got = rules end}
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper.get_ifnames_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return {"wlan0"} end
+					return {}
+				end
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22", mcast_suppressor = true},
+				}}, nil)
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._bcfilter = nil
+
+				assert_eq(db.wireless.openuf_radio0_corp.openuf_mcast_suppress, "1",
+					"recorded on")
+				assert_eq(#got, 1, "one rule")
+				assert_eq(got[1].limit, true, "and it is the rate ceiling")
+				assert_eq(got[1].macs, nil, "no allow-list is involved")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a shrunk allow-list or withdrawn bypass list leaves no stamp behind",
+		fn = function()
+			-- These options are the ONLY record reapply_runtime_rules has, so a
+			-- stale one would come back after a reboot as rules the admin had
+			-- just removed. What prevents it is that apply_config wlan_clear()s
+			-- every openuf_ section and rebuilds it, rather than any delete here
+			-- -- which is worth pinning, since it is what lets the stamps above
+			-- be written conditionally.
+			with_ucihelper(function(db)
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper.get_ifnames_for_vap = function() return {"wlan0"} end
+				ucihelper._bcfilter = {reconcile = function() end}
+				local function push(vap) ucihelper.apply_config(
+					{radio_table = {}, vap_table = {vap}}, nil) end
+
+				push({ssid = "corp", radio = "radio0", security = "wpa2",
+					x_passphrase = "hunter22", bcfilt_enabled = true,
+					bcfilt_macs = {"00:00:5e:00:53:01"},
+					bcfilt_bypass = {ARP = true}})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_bcfilt_macs, "00:00:5e:00:53:01", "stamped first")
+				assert_eq(s.openuf_bcfilt_bypass, "ARP", "stamped first")
+
+				push({ssid = "corp", radio = "radio0", security = "wpa2",
+					x_passphrase = "hunter22", bcfilt_enabled = true})
+				s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_bcfilt_macs, nil, "emptied allow-list is removed")
+				assert_eq(s.openuf_bcfilt_bypass, nil, "withdrawn bypass types are removed")
+				assert_eq(s.openuf_bcfilt, "1", "the control itself is untouched")
+
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._bcfilter = nil
+			end)
+		end
+	},
+	{
+		name = "ucihelper: reapply_runtime_rules rebuilds both suppression modes from UCI",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				for _, v in ipairs({{"corp", "1", "ARP DHCPV4 DHCPV6 NSNA", "1"},
+						{"iot", "0", nil, "1"}}) do
+					local sec = "openuf_radio0_" .. v[1]
+					c:set("wireless", sec, "wifi-iface")
+					c:set("wireless", sec, "device", "radio0")
+					c:set("wireless", sec, "ssid", v[1])
+					c:set("wireless", sec, "openuf_bcfilt", v[2])
+					if v[3] then c:set("wireless", sec, "openuf_bcfilt_bypass", v[3]) end
+					c:set("wireless", sec, "openuf_mcast_suppress", v[4])
+				end
+				local bc
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper.get_ifnames_for_vap = function(_, ssid)
+					if ssid == "corp" then return {"wlan0"} end
+					if ssid == "iot" then return {"wlan1"} end
+					return {}
+				end
+
+				ucihelper.reapply_runtime_rules()
+
+				local by = {}
+				for _, r in ipairs(bc) do by[r.ifname] = r end
+				assert_eq(by.wlan0.limit, nil, "the Aggressive VAP still blocks")
+				assert_eq(by.wlan0.bypass.NSNA, true, "with its bypass types restored")
+				assert_eq(by.wlan1.limit, true, "the Conservative VAP rate-limits")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config reconciles an empty ruleset when the blocker is off",
 		fn = function()
 			with_ucihelper(function(db)
