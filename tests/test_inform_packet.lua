@@ -912,6 +912,44 @@ return {
 		end
 	},
 	{
+		name = "inform packet: the site's auto-channel DFS switch and channel blacklist reach the radio",
+		fn = function()
+			-- Verbatim shape from 10.6.106 once wifi_caps2 0x10 is claimed:
+			-- acsdfs only on the 5 GHz radio, blklst only while that radio is
+			-- on Auto, and the 2.4 GHz blacklist is the default site's
+			-- "conservative" preset (everything but 1/6/11).
+			local radio_table = inform._parse_wifi_system_cfg(
+				"radio.status=enabled\n"
+				.. "radio.1.phyname=radio0\nradio.1.channel=auto\n"
+				.. "radio.1.blklst=12,2,13,3,14,4,5,7,8,9,10\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=auto\n"
+				.. "radio.2.acsdfs=disabled\n")
+			assert_nil(radio_table[1].acs_exclude_dfs,
+				"2.4 GHz never carries acsdfs -- nil, not false")
+			-- Verbatim wire order: the controller builds the list from a Java
+			-- Set, so it arrives unsorted. The channels are kept as sent;
+			-- rf_config walks the band's own ascending channel list, so the
+			-- chanlist it writes is ordered whatever order this arrives in.
+			assert_eq(table.concat(radio_table[1].acs_blacklist, ","),
+				"12,2,13,3,14,4,5,7,8,9,10", "every blacklisted channel, as sent")
+			assert_eq(radio_table[2].acs_exclude_dfs, true, "DFS excluded from ACS")
+			assert_nil(radio_table[2].acs_blacklist, "no blacklist on this band")
+			-- enabled is an explicit false, so it can undo an earlier disable.
+			local on = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.acsdfs=enabled\n")
+			assert_eq(on[1].acs_exclude_dfs, false, "DFS allowed -> explicit false")
+			-- Absent keys leave UCI alone; the teardown of a chanlist openUF
+			-- wrote earlier happens in rf_config, off its own stamp.
+			local none = inform._parse_wifi_system_cfg("radio.1.phyname=radio0\n")
+			assert_nil(none[1].acs_exclude_dfs, "no acsdfs -> nil")
+			assert_nil(none[1].acs_blacklist, "no blklst -> nil")
+			-- A blklst with nothing parseable in it is not an empty blacklist.
+			local junk = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.blklst=\n")
+			assert_nil(junk[1].acs_blacklist, "empty blklst -> nil")
+		end
+	},
+	{
 		name = "inform packet: the unindexed countrycode is used when radios carry none",
 		fn = function()
 			local radio_table = inform._parse_wifi_system_cfg(

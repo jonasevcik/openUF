@@ -255,7 +255,7 @@ local function parse_phy_caps(out, ciphers_by_phy)
 		elseif line:match("^\tBand %d+:") then
 			cur = {ht40 = false, vht = false, he = false, eht = false,
 				w160 = false, w320 = false, freq = nil, txpower = nil,
-				phy = phy}
+				channels = {}, phy = phy}
 			bands[#bands + 1] = cur
 			if phy then phy.bands[#phy.bands + 1] = cur end
 		elseif line:match("^\t[^\t]") then
@@ -287,6 +287,19 @@ local function parse_phy_caps(out, ciphers_by_phy)
 			local mhz, dbm = line:match("^%s*%*%s+([%d%.]+) MHz.*%(([%d%.]+) dBm%)")
 			if mhz and not line:match("disabled") then
 				cur.freq = cur.freq or tonumber(mhz)
+				-- The channel number in brackets, for the ACS candidate list
+				-- (rf_config's chanlist). The regdomain decides which channels
+				-- `iw phy` prints at all and which it marks disabled, so this
+				-- list is already the legal set -- which is what makes
+				-- inverting the controller's blacklist possible. "no IR" is
+				-- excluded on top: the radio may not initiate radiation there,
+				-- so it is legal to hear but never a channel an AP can beacon
+				-- on. (It still counts toward max_txpower above, which is a
+				-- reported capability and not a channel choice.)
+				local ch = tonumber(line:match("%[(%d+)%]") or "")
+				if ch and not line:match("no IR") then
+					cur.channels[#cur.channels + 1] = ch
+				end
 				-- `iw` prints one decimal ("23.0 dBm"); floored to an integer
 				-- so the payload carries 23 rather than 23.0 -- max_txpower is
 				-- a whole-dBm field, and flooring never claims more than the
@@ -328,6 +341,11 @@ local function parse_phy_caps(out, ciphers_by_phy)
 				-- cipher_ok() treats nil as "unknown, don't veto".
 				ciphers = (b.phy and b.phy.name and ciphers_by_phy
 					and ciphers_by_phy[b.phy.name]) or nil,
+				-- Channels this band can legally use, ascending. nil (not an
+				-- empty table) when `iw` said nothing, so rf_config can tell
+				-- "no channels" from "unknown" and skip narrowing ACS rather
+				-- than narrowing it to nothing.
+				channels = (b.channels and #b.channels > 0) and b.channels or nil,
 			}
 			if prev then
 				caps[key].max_kind  = math.max(prev.max_kind, caps[key].max_kind)
@@ -336,6 +354,23 @@ local function parse_phy_caps(out, ciphers_by_phy)
 					caps[key].max_txpower or 0)
 				if caps[key].max_txpower == 0 then caps[key].max_txpower = nil end
 				caps[key].beacon_rate = prev.beacon_rate or caps[key].beacon_rate
+				-- Channels fold as a UNION: either phy could end up hosting
+				-- the band, and a channel the one that does cannot use is
+				-- dropped by ACS itself, while a channel missing from the
+				-- candidate list is one ACS can never pick.
+				if prev.channels or caps[key].channels then
+					local seen, merged = {}, {}
+					for _, src in ipairs({prev.channels or {}, caps[key].channels or {}}) do
+						for _, ch in ipairs(src) do
+							if not seen[ch] then
+								seen[ch] = true
+								merged[#merged + 1] = ch
+							end
+						end
+					end
+					table.sort(merged)
+					caps[key].channels = merged
+				end
 				-- Ciphers fold the other way from every capability above:
 				-- the INTERSECTION, because a WLAN on this band may land on
 				-- either radio and a cipher one of them cannot program is a
@@ -1172,7 +1207,7 @@ end
 -- collapsed from the per-WLAN aaa.<n>.country_beacon by apply_config. nil
 -- leaves UCI alone (no WLAN on this radio carried the key).
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
-		disabled, country, maxsta, country_beacon)
+		disabled, country, maxsta, country_beacon, acs_exclude_dfs, acs_blacklist)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Every write below is cursor:set on a named section, which in UCI CREATES
@@ -1301,6 +1336,85 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 				.. " not applicable on 5 GHz -- 802.11h (DFS) requires 802.11d,"
 				.. " and hostapd refuses the interface without it\n")
 		end
+	end
+	-- Auto-channel narrowing (the site's Radio settings, see
+	-- _parse_wifi_system_cfg). Both land on wifi-device options that only
+	-- hostapd's ACS reads, so writing them on a radio pinned to a fixed
+	-- channel is inert -- and keeps UCI showing what the controller asked for
+	-- the day the user switches that radio back to Auto.
+	if acs_exclude_dfs ~= nil then
+		cursor:set("wireless", radio, "acs_exclude_dfs", acs_exclude_dfs and "1" or "0")
+	end
+	-- The controller sends a BLACKLIST (radio.<n>.blklst, what ACS may not
+	-- pick); hostapd has no blacklist, only `chanlist`, the candidate list. So
+	-- the blacklist is inverted against the channels this band may legally
+	-- use, which is exactly what phy_caps reads out of `iw phy` -- the
+	-- regdomain has already removed everything else, and disabled channels are
+	-- skipped there.
+	local chanlist = nil
+	if acs_blacklist then
+		local section = {
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel") or chan,
+		}
+		-- band_for_device falls back to the channel number, and its documented
+		-- trap is that "auto" is not one: it answers "na" for a 2.4 GHz radio
+		-- on ACS. Everywhere else that costs a mis-clamped width; here it
+		-- would hand a 2.4 GHz radio a candidate list of 5 GHz channels --
+		-- i.e. an ACS with nothing it can tune. So a guess is not good enough:
+		-- the band has to come from the section's own band/hwmode, or from a
+		-- channel that is actually a number.
+		local band = (section.band or section.hwmode or tonumber(section.channel))
+			and band_for_device(section) or nil
+		local caps = band and M.phy_caps()[band]
+		local legal = caps and caps.channels
+		if not legal then
+			-- Unknown channel set (no `iw`, unparseable output): leave ACS
+			-- alone. A guessed candidate list can contain nothing the radio
+			-- can actually use, and an ACS with no usable candidate is a radio
+			-- that does not come up -- strictly worse than ignoring the
+			-- blacklist.
+			io.stderr:write(string.format(
+				"openuf: %s: cannot read the %s channel list -- ignoring the"
+				.. " controller's channel blacklist\n", tostring(radio),
+				band or "radio's own"))
+		else
+			local blocked = {}
+			for _, ch in ipairs(acs_blacklist) do blocked[ch] = true end
+			local keep, dropped = {}, 0
+			for _, ch in ipairs(legal) do
+				if blocked[ch] then
+					dropped = dropped + 1
+				else
+					keep[#keep + 1] = tostring(ch)
+				end
+			end
+			if dropped == 0 then
+				-- The blacklist names nothing this radio could have used anyway,
+				-- because the regdomain already excludes it. Writing the band's
+				-- entire channel list as a "candidate list" is a no-op that would be
+				-- churned into UCI on every push, so this counts as no narrowing at
+				-- all -- and tears down a narrowing openUF wrote earlier.
+			elseif #keep == 0 then
+				io.stderr:write(string.format(
+					"openuf: %s: the controller blacklists every %s channel this"
+					.. " radio has -- leaving auto-channel unrestricted\n",
+					tostring(radio), tostring(band)))
+			else
+				chanlist = keep
+			end
+		end
+	end
+	if chanlist then
+		cursor:set("wireless", radio, "chanlist", chanlist)
+		-- Same ledger shape as openuf_rates below: the blacklist going empty
+		-- is the key simply vanishing from the wire, which is otherwise
+		-- indistinguishable from a chanlist the user set by hand.
+		cursor:set("wireless", radio, "openuf_chanlist", "1")
+	elseif cursor:get("wireless", radio, "openuf_chanlist") == "1" then
+		cursor:delete("wireless", radio, "chanlist")
+		cursor:delete("wireless", radio, "openuf_chanlist")
 	end
 	if rates then
 		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives
@@ -1499,7 +1613,8 @@ function M.apply_config(resp, cfg, opts)
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
 				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled,
 				radio.country, radio.loadbalance_maxsta,
-				country_beacon_by_radio[radio.name])
+				country_beacon_by_radio[radio.name],
+				radio.acs_exclude_dfs, radio.acs_blacklist)
 		end
 	end
 

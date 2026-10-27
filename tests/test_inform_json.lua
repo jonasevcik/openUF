@@ -2275,7 +2275,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: wifi_caps2 claims exactly advertise-name (0x40) and assisted roaming (0x20)",
+		name = "inform json: wifi_caps2 claims exactly advertise-name (0x40), assisted roaming (0x20) and ACS DFS (0x10)",
 		fn = function()
 			-- Confirmed via decompiling the controller: Device.
 			-- supportAdvertisingDeviceNameInBeacon() is hasWifiCapability2(64)
@@ -2283,10 +2283,12 @@ return {
 			-- wireless.<n>.advertise_ap_name is ever pushed to system_cfg at
 			-- all for "Show Access Point Name in Beacon". supportsAssistedRoaming()
 			-- is hasWifiCapability2(32) and gates wireless.<n>.btm_disassoc
-			-- (Roaming Assistant). No other bit is claimed (see
+			-- (Roaming Assistant). supportsAcsDfs() is hasWifiCapability2(16)
+			-- and gates radio.<n>.acsdfs AND radio.<n>.blklst, the site's
+			-- auto-channel DFS switch and channel blacklist. No other bit is claimed (see
 			-- PROTOCOL-VALIDATION.md for the ones this device does not implement).
 			local d = build()
-			assert_eq(d.wifi_caps2, 0x60, "wifi_caps2 is exactly 0x40|0x20")
+			assert_eq(d.wifi_caps2, 0x70, "wifi_caps2 is exactly 0x40|0x20|0x10")
 		end
 	},
 	{
@@ -2296,13 +2298,13 @@ return {
 		-- asked for connection notifs and conf.lua has not vetoed them.
 		name = "inform json: wifi_caps2 adds 0x2000 only while roam reports are sent",
 		fn = function()
-			assert_eq(build().wifi_caps2, 0x60, "not asked: no claim")
-			assert_eq(build({st = {notif_assoc_stat = true}}).wifi_caps2, 0x2060, "asked: claimed")
+			assert_eq(build().wifi_caps2, 0x70, "not asked: no claim")
+			assert_eq(build({st = {notif_assoc_stat = true}}).wifi_caps2, 0x2070, "asked: claimed")
 			inject_sysinfo()
 			local st = {authkey = state.DEFAULT_KEY, inform_url = "http://10.0.0.1:8080/inform",
 				mac = "aa:bb:cc:dd:ee:ff", notif_assoc_stat = true}
 			local d = cjson.decode(inform.build_json(st, {config = {assoc_tracker = false}}, ufhw))
-			assert_eq(d.wifi_caps2, 0x60, "assoc_tracker = false: no claim")
+			assert_eq(d.wifi_caps2, 0x70, "assoc_tracker = false: no claim")
 		end
 	},
 	{

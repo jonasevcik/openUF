@@ -3145,6 +3145,150 @@ return {
 				assert_eq(caps.na.max_txpower, 30, "5GHz max dBm across usable channels")
 				assert_eq(tostring(caps.na.max_txpower), "30",
 					"whole dBm, not the 30.0 float `iw` prints")
+				-- The ACS candidate list (rf_config's chanlist). 169 is "no
+				-- IR": it still counts toward max_txpower above, but an AP may
+				-- not beacon there, so it is not a channel ACS may pick.
+				assert_eq(table.concat(caps.ng.channels, ","), "1,6,13",
+					"every usable 2.4GHz channel, in order")
+				assert_eq(table.concat(caps.na.channels, ","), "36,52,149",
+					"'no IR' is excluded from the candidate channels")
+			end)
+		end
+	},
+	{
+		-- radio.<n>.acsdfs / radio.<n>.blklst, the site's auto-channel DFS
+		-- switch and channel blacklist (wifi_caps2 0x10). hostapd has no
+		-- blacklist, so the blacklist is inverted against the band's own legal
+		-- channel list -- read from the same `iw phy` output phy_caps parses.
+		name = "ucihelper: rf_config turns the controller's channel blacklist into a chanlist",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				cursor:set("wireless", "radio1", "band", "5g")
+				-- 2.4GHz: the default "conservative" site preset blacklists
+				-- everything but 1/6/11, and this phy only has 1, 6 and 13.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, {2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14})
+				local cl = db.wireless.radio0.chanlist
+				assert_eq(#cl, 2, "only the channels this radio has and the site allows")
+				assert_eq(cl[1], "1", "channel 1 kept")
+				assert_eq(cl[2], "6", "channel 6 kept")
+				assert_eq(db.wireless.radio0.openuf_chanlist, "1", "openUF stamps what it wrote")
+				-- A blacklist that names only channels the regdomain already
+				-- withholds narrows nothing, so it writes nothing rather than
+				-- churning the band's whole channel list into UCI every push.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, {14})
+				assert_nil(db.wireless.radio0.chanlist,
+					"a blacklist this radio has nothing in common with writes no chanlist")
+				assert_nil(db.wireless.radio0.openuf_chanlist, "and clears the stamp")
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, {2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14})
+				-- 5GHz, same push: acsdfs=disabled is its own hostapd flag,
+				-- not part of the candidate list.
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, true, nil)
+				assert_eq(db.wireless.radio1.acs_exclude_dfs, "1", "ACS must skip DFS")
+				assert_nil(db.wireless.radio1.chanlist, "no blacklist, no chanlist")
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, false, nil)
+				assert_eq(db.wireless.radio1.acs_exclude_dfs, "0", "DFS allowed again")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the chanlist is torn down when the blacklist leaves the wire",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, {6})
+				assert_eq(db.wireless.radio0.chanlist[1], "1", "narrowed")
+				-- The site clearing its blacklist is the key simply vanishing.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, nil)
+				assert_nil(db.wireless.radio0.chanlist, "chanlist removed with the blacklist")
+				assert_nil(db.wireless.radio0.openuf_chanlist, "stamp removed too")
+				-- A chanlist openUF never wrote is the user's own and stays.
+				cursor:set("wireless", "radio0", "chanlist", {"11"})
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, nil)
+				assert_eq(db.wireless.radio0.chanlist[1], "11", "hand-set chanlist untouched")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: two radios on one band contribute their channels to one candidate list",
+		fn = function()
+			with_ucihelper(function()
+				-- The mirror image of the cipher intersection below: a channel
+				-- the hosting radio cannot use is dropped by ACS itself, but a
+				-- channel missing from the list is one ACS can never pick.
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY .. [[
+Wiphy phy2
+	Band 1:
+		Capabilities: 0x11ef
+			HT20/HT40
+		Frequencies:
+			* 2462.0 MHz [11] (20.0 dBm)
+]]
+				end
+				ucihelper._phy_caps_cache = nil
+				assert_eq(table.concat(ucihelper.phy_caps().ng.channels, ","), "1,6,11,13",
+					"both phys' channels, deduped and sorted")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an unknown or fully blacklisted channel set leaves auto-channel alone",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				-- No `iw` output at all: narrowing on a guess could hand ACS a
+				-- list with nothing usable on it. Distinguished from the
+				-- fully-blacklisted case below by what it logs -- the outcome
+				-- is the same, the cause is not.
+				ucihelper._popen = function() return "" end
+				local real, log = io.stderr, {}
+				io.stderr = {write = function(_, ...)
+					for _, s in ipairs({...}) do log[#log + 1] = s end
+				end}
+				local ok, err = pcall(ucihelper.rf_config, "radio0", nil, "auto", nil,
+					nil, nil, nil, nil, nil, nil, nil, nil, {2})
+				io.stderr = real
+				assert_true(ok, "rf_config survives an unreadable channel list: " .. tostring(err))
+				assert_true(table.concat(log):find("cannot read", 1, true) ~= nil,
+					"logged as unreadable, not as a blacklist that covers everything")
+				assert_nil(db.wireless.radio0.chanlist, "unknown channel set: no chanlist")
+				assert_nil(db.wireless.radio0.openuf_chanlist, "and nothing stamped")
+				-- A radio on ACS whose section declares no band: band_for_device
+				-- falls back to the channel number, and "auto" is not one, so
+				-- it answers "na" for any radio. Narrowing on that guess would
+				-- hand a 2.4 GHz radio a list of 5 GHz channels -- an ACS with
+				-- nothing it can tune.
+				ucihelper._phy_caps_cache = nil
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				local cur = ucihelper._uci.cursor()
+				cur:delete("wireless", "radio0", "band")
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, {2})
+				assert_nil(db.wireless.radio0.chanlist, "a guessed band writes nothing")
+				cur:set("wireless", "radio0", "band", "2g")
+
+				-- Every channel the radio has, blacklisted.
+				ucihelper._phy_caps_cache = nil
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil,
+					nil, nil, nil, nil, {1, 6, 13})
+				assert_nil(db.wireless.radio0.chanlist, "empty candidate list is never written")
 			end)
 		end
 	},

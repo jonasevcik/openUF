@@ -2059,10 +2059,23 @@ function M.build_json(st, cfg, ufhw)
 		-- Assistant and Minimum RSSI tags). Claimed only while those are
 		-- sent: without the reports the bit would make roams vanish.
 		--
+		-- Bit 0x10 (16): Device.supportsAcsDfs(). It gates TWO per-radio keys
+		-- at once -- the whole block that emits them sits behind this one
+		-- check (10.6.106,
+		-- com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf): the 5 GHz
+		-- radio's radio.<n>.acsdfs (may auto-channel land on a DFS channel)
+		-- and, for any radio on Auto, radio.<n>.blklst (the site's channel
+		-- blacklist for that band). Without it a site that excludes channels
+		-- -- which the DEFAULT "conservative" preset does, blacklisting
+		-- everything but 1/6/11 on 2.4 GHz -- is silently dropped and ACS
+		-- picks whatever it likes. Claimed because both have real consumers
+		-- here: wifi-device acs_exclude_dfs and chanlist (see
+		-- ucihelper.rf_config).
+		--
 		-- No other bit is claimed: wifi_caps2 also gates real-hardware-only
 		-- features (Mesh MLO parent/child and others, see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
-		wifi_caps2       = 0x60 + (M._assoc_enabled(st, cfg) and 0x2000 or 0),
+		wifi_caps2       = 0x70 + (M._assoc_enabled(st, cfg) and 0x2000 or 0),
 		-- fw2_caps, a THIRD firmware bitmask (hyFnQ.getFirmware2Capabilities
 		-- reads the field "fw2_caps"), sent only for its one needed bit.
 		--
@@ -2784,6 +2797,40 @@ function M._parse_wifi_system_cfg(sys_raw)
 			local maxsta = sm ~= nil and sm["loadbalance.status"] == "true"
 				and tonumber(sm["loadbalance.maxsta"])
 			entry.loadbalance_maxsta = (maxsta and maxsta > 0) and math.floor(maxsta) or false
+			-- Auto-channel narrowing, both keys emitted only to a device
+			-- claiming wifi_caps2 0x10 (Device.supportsAcsDfs(), see
+			-- build_json) and both from the site's Radio settings, not the
+			-- WLAN's. Decompiled from 10.6.106
+			-- (com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf) and
+			-- cross-read against U7LR 6.8.2's own consumers:
+			--
+			--   radio.<n>.acsdfs=enabled|disabled -- 5 GHz radio only, from
+			--     radios_configuration[radio=na].dfs. Firmware: with it off,
+			--     wifitool block_acs_channel over the whole DFS list.
+			--     openUF: wifi-device acs_exclude_dfs, hostapd's own flag.
+			--   radio.<n>.blklst=2,3,4,...        -- only while the radio is
+			--     on Auto, from the site's channels_blacklist for this band
+			--     (the "conservative" preset blacklists everything but 1/6/11
+			--     on 2.4 GHz, which is what a default site carries). Firmware:
+			--     wifitool block_acs_channel <list>. hostapd has no blacklist,
+			--     only chanlist, so ucihelper inverts it against the phy's own
+			--     channel list.
+			--
+			-- Tri-state like the rest of this block: absent acsdfs leaves UCI
+			-- alone (it never arrives for 2.4 GHz), and an absent blklst is
+			-- the wire's "nothing excluded" -- which has to tear down a
+			-- chanlist openUF wrote earlier, so it reaches rf_config as nil
+			-- and is handled there against openUF's own stamp.
+			if r.acsdfs == "enabled" or r.acsdfs == "disabled" then
+				entry.acs_exclude_dfs = (r.acsdfs == "disabled")
+			end
+			if r.blklst then
+				local blocked = {}
+				for ch in tostring(r.blklst):gmatch("%d+") do
+					blocked[#blocked + 1] = tonumber(ch)
+				end
+				if #blocked > 0 then entry.acs_blacklist = blocked end
+			end
 			radio_table[#radio_table + 1] = entry
 		end
 	end

@@ -1161,6 +1161,43 @@ runs `iw dev <if> scan ap-force` on the requested radio or band before the next 
 Each request is logged, e.g. `inform: scan_band: scanned 1 of 1 radio(s)`, and an iw
 refusal is logged as `iw refused to scan <if>`.
 
+### Auto-channel limits: the site's DFS switch and channel blacklist
+
+Settings → Radios carries two things that only matter while a radio is on **Auto**: whether
+auto-channel may land on a DFS channel, and a per-band list of channels it must not pick.
+The controller sends both per radio, and only to a device claiming `wifi_caps2` `0x10`
+(`supportsAcsDfs()`), which openUF does since 2026-10-27.
+
+| Wire key | When it is sent | UCI (`wifi-device`) | hostapd |
+|---|---|---|---|
+| `radio.<n>.acsdfs=enabled\|disabled` | 5 GHz radio, always | `acs_exclude_dfs` 0/1 | `acs_exclude_dfs` |
+| `radio.<n>.blklst=12,2,13,…` | any radio, only while its channel is `auto` | `chanlist` (+ `openuf_chanlist`) | `chanlist` |
+
+`blklst` is a **blacklist**, and hostapd has no blacklist — only `chanlist`, the list ACS may
+choose from. So openUF inverts it against the channels the radio's regdomain actually allows,
+read from `iw phy` (which already drops what the domain forbids, and openUF drops "no IR"
+channels on top: an AP may not beacon there). The order the controller sends does not matter;
+the list is written ascending.
+
+Three deliberate refusals, each logged:
+
+- **A blacklist that excludes nothing the radio could have used** (say channel 14 in a
+  regdomain without it) writes no `chanlist` at all, instead of churning the band's whole
+  channel list into UCI on every push.
+- **Every channel of the band blacklisted** leaves auto-channel unrestricted: an ACS with no
+  candidate is a radio that does not come up.
+- **A radio on Auto whose UCI declares no `band`/`hwmode`** is left alone. The band would
+  have to be guessed from the channel, and `auto` is not a channel — the guess answers
+  "5 GHz" for every radio, which would hand a 2.4 GHz radio a list of 5 GHz channels.
+
+`openuf_chanlist` records that openUF wrote the list, so when the site clears its blacklist
+(the key simply vanishes) the `chanlist` is removed again — while a `chanlist` set by hand on
+an unstamped radio is never touched.
+
+Both keys are inert on a radio pinned to a fixed channel: they are written, visible in UCI,
+and read by nothing until that radio is switched back to Auto. U7LR 6.8.2 does the same work
+through `wifitool <dev> block_acs_channel`, with the DFS list hardcoded for `acsdfs=disabled`.
+
 ### DFS radar reporting
 
 On a DFS channel (52–144) the radio must leave the channel for 30 minutes when it detects
@@ -1774,6 +1811,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | The Passpoint WLAN's BSS does not come up at all after a profile change | A malformed value in a hostapd config is a **parse error, and hostapd then refuses the whole BSS**, not just the line. `logread | grep -i "Line \|Invalid"` right after a provision names the offending line. If it is one openUF wrote, report it: every mapped line is validated against a real hostapd, so a rejected one is a bug, not a setting |
 | EAP clients authenticate but are then refused | The RADIUS profile has "RADIUS assigned VLAN: required" (`dynamic_vlan=2` in `hostapd-phy*.conf`) and the server returned a VLAN this AP has no network for — `cat /var/run/hostapd-<ifname>.vlan` lists the only ones it can honour. Set the mode to optional, or put the WLAN on a network that already carries those VLANs |
 | A 5 GHz radio is on the wrong channel after a radar hit and stays there | `sed -n '/openuf-cron-begin/,/openuf-cron-end/p' /etc/crontabs/root` must carry `0 2 * * * /usr/bin/syswrapper.sh dfs-reset`; if it does not, the controller is not pushing the job — it only does so for a radio pinned to a DFS channel the site's country allows (`uci get wireless.<radio>.channel` must be a number, not `auto`). Run `/usr/bin/syswrapper.sh dfs-reset` to ask for it now; `logread \| grep dfs-reset` gives the reason it was left alone. The commonest one is the non-occupancy list: `iw phy phy<N> channels` shows the channel as `DFS state: unavailable` with the time left, and openUF waits for that rather than announce a switch the kernel will refuse |
+| Auto-channel still picks a DFS or blacklisted channel | Both keys only arrive for a radio whose channel is `auto`, and the blacklist half only then. `uci show wireless | grep -E "acs_exclude_dfs|chanlist"` shows what landed: the 5 GHz radio should carry `acs_exclude_dfs` matching Settings → Radios, and a radio on Auto in a site with a channel blacklist should carry a `chanlist` plus `openuf_chanlist=1`. Missing entirely: the controller is not sending them — `tools/heartbeat-probe.lua` must show `wifi_caps2` with bit `0x10` set (`0x2070` with roam reports on), and new wifi-device options need a **Force Provision**. Present in UCI but ACS ignores them: `grep -E "acs_exclude_dfs|chanlist" /var/run/hostapd-phy*.conf` — options reach hostapd only on a WiFi reload. `logread | grep -E "channel blacklist|auto-channel unrestricted"` names the three cases where openUF deliberately writes nothing (§ Auto-channel limits) |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Airtime Fairness switch does nothing | `ls /sys/kernel/debug/ieee80211/phy*/airtime_flags` must list a file per radio. Without it openUF does not claim `wifi_caps` bit `0x20` and the controller sends no `atf.*` at all (debugfs not mounted, or a kernel without `CONFIG_MAC80211_DEBUGFS`). `cat` it after a push: two flag names for on, none for off. A driver that does not schedule through mac80211 TXQs ignores the flags |
 | No "Possible interference" warning, ever | Only ath9k radios report the counters it needs. `cat /sys/kernel/debug/ieee80211/phy*/ath9k/interrupt` shows `GTT` (tx timeouts) and `CST` (carrier-sense timeouts); the controller warns when either rises faster than 10 per second, at most every 5 minutes per radio. A healthy radio stays far below that. ath10k and mt76 keep no such counters, so their radios never warn. Debugfs must be mounted, as it is on OpenWrt by default |

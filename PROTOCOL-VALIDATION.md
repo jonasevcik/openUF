@@ -3083,12 +3083,15 @@ by the controller's own startup log: `firmware[U6IW] new version (6.8.2.15592) i
 | `wifi_caps` | `0x10` (16) | `Device.supportSpectrumScan()` = `hasWifiCapability(16)` | REST `cmd/devmgr spectrum-scan` is refused (`api.err.InvalidTarget`) and `stat/spectrum-scan` leaves the AP out, so Airtime Scan does nothing. Claimed since 2026-10-10. |
 | `wifi_caps2` | `0x40` (64) | `Device.supportAdvertisingDeviceNameInBeacon()` = `hasWifiCapability2(64)` | The controller never emits `wireless.<n>.advertise_ap_name` at all, and doesn't even re-push config on the toggle. |
 | `wifi_caps2` | `0x20` (32) | `Device.supportsAssistedRoaming()` = `hasWifiCapability2(32)` | The controller never emits a WLAN's Roaming Assistant (`wireless.<n>.btm_disassoc.*`). Confirmed live in the lab: set, the keys appear on the 5 GHz entry. |
+| `wifi_caps2` | `0x10` (16) | `Device.supportsAcsDfs()` = `hasWifiCapability2(16)` | The controller emits **neither** `radio.<n>.acsdfs` **nor** `radio.<n>.blklst`: one `if (supportsAcsDfs())` in `com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf` guards the block that writes both, so the site's auto-channel DFS switch and its channel blacklist are silently dropped. Confirmed live in the lab: claimed, both appear (and nothing else moves). |
 
 `wifi_caps2` is a **second, entirely separate** bitmask from `wifi_caps` (which gates
 `supportBandsteering()`/`supportZeroHandoff()`; openUF claims `0x4`/`0x8`, `0x10` and `0x20`, see below). Only bits `0x40` and
-`0x20` are claimed; the mask also gates Mesh MLO, quick/neighbour scan, roam topology stats,
-Green AP, ACS-DFS and the multicast suppressor, which openUF does not implement and must not
-claim.
+`0x20` were the first claimed, joined by `0x2000` (roam topology stats) and, since
+2026-10-27, `0x10` (`supportsAcsDfs()`, the site's auto-channel DFS switch and channel
+blacklist -- see [auto-channel limits](#radionacsdfs--radionblklst--the-sites-auto-channel-limits));
+the mask also gates Mesh MLO, quick/neighbour scan, Green AP and the multicast suppressor,
+which openUF does not implement and must not claim.
 
 #### Full sweep of the capability gates (controller 10.6.101, 2026-09-27)
 
@@ -3365,7 +3368,7 @@ Gated, and not to be claimed:
   - `wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`: vwire, mesh, meshv3, multi-vport and Element. `0x1` also gates
     `connectivity.status=enabled`, the firmware's uplink monitor (see [`connectivity.*`](#connectivity-ssids-on-uplink-loss-nothing-to-do-2026-10-10)).
   - `wifi_caps` `0x2000` "open hostapd", `0x4000000` low-performance mode.
-  - `wifi_caps2` `0x4` Green AP, `0x10` ACS-DFS, `0x80` quick scan, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear).
+  - `wifi_caps2` `0x4` Green AP, `0x80` quick scan, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear).
   - `fw_caps` `0x20000000` RADIUS `filter_id`.
   - `fw2_caps` `0x20` `port_table.mac_table_ipv6`, `0x80` device command retry.
 Four entries moved out of that list on 2026-10-26, after reading the 6.8.2 firmware's own
@@ -4595,7 +4598,7 @@ them for measured values.
 | `spectrum_scanning` | `true` only in the inform between the spectrum-scan cmd and its sweep; see [Airtime Scan](#airtime-scan-spectrum-scan) |
 | `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
 | `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
-| `fw_caps` = `0x1110`, `wifi_caps2` = `0x60` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
+| `fw_caps` = `0x1110`, `wifi_caps2` = `0x70` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
 | `ucihelper` `wps_device_name` / `ap_setup_locked` | Standards-based rather than Ubiquiti-derived — see the beacon row in the [feature matrix](#feature-matrix) |
 | ~~`usteer.lua`'s `USTEER_DEFAULTS`~~ | ✅ **Resolved 2026-09-10.** Verified against the installed package (usteer 2025.10.04) on the Archer C5. `band_steering_threshold` is a real option — it is in the init script's own list of keys fed to `ubus call usteer set_config`. The named `local` section is read too: the loader does `config_foreach uci_usteer usteer`, which visits every section of type `usteer`, named or anonymous. `network` is read from `uci get usteer.@usteer[-1].network`, the last section of that type — openUF's — so both writes reach the daemon. **Corrected 2026-09-27:** reaching the daemon is not the same as doing anything. usteer's source (`policy.c` `below_assoc_threshold`) reads `band_steering_threshold` only when `load_balancing_threshold` is non-zero, and it is 0 on both APs (`ubus call usteer get_config`). So openUF's 5/0 toggle switched nothing. The real switch is `band_steering_interval` (`band_steering.c`: 0 disables, otherwise a BSS Transition request to each steerable 2.4 GHz client every interval). Its default in 2025.10.04 is 120000 ms, read live on both APs, so a running usteer always steered. That included Roaming Assistant with Band Steering off. openUF now writes `band_steering_interval=0` for off and deletes it for on, so the daemon default that steered a real client (#25) applies, and removes the old threshold. |
 
@@ -4942,9 +4945,9 @@ that already demoted `mac_acl.status`, `bcmc_l2_filter.status` and `multicast.in
 | `aaa.<n>.p2p`, `.p2p_cross_connect` | `disabled` | `manage_p2p=` / `allow_cross_connection=` | same names in hostapd | needs capture |
 | `aaa.<n>.filter_id` | not seen | RADIUS `Filter-Id` handling | — | needs capture (arrives with a RADIUS profile variant we have not built) |
 | `wireless.<n>.wmm` | `enabled` | WMM/WME on the VAP | `wmm` (wifi-iface) | needs capture — WMM off is a real UI control on some builds |
-| `qos.mode` | `1` | selects the qos engine | `shaper.lua`'s own choice | decline unless a toggle moves it: openUF's HTB/IFB path is not the firmware's, and the value has been `1` in every capture |
-| `radio.<n>.antenna.gain` | `3` | antenna gain, feeds the tx-power ceiling | `wifi-device.antenna_gain` | implement if a board with external antennas ever matters; today both boards are fixed-gain — **needs capture** of a non-default value first |
-| `radio.outdoor` | `disabled` | regulatory/outdoor channel set | no OpenWrt equivalent (country code carries it) | decline: no consumer |
+| `qos.mode` | `1` | selects the qos engine | `shaper.lua`'s own choice | **declined 2026-10-27: constant by construction** — the controller writes the literal `"mode", "1"` (`config/VAZShipWTNxlo:2078`). See [axis 1/2, settled](#axis-12-radio-and-system-keys-settled-2026-10-27) |
+| `radio.<n>.antenna.gain` | `3` | antenna gain, feeds the tx-power ceiling (`iwpriv ant_gain`) | `wifi-device.antenna_gain` | **declined 2026-10-27:** the value describes the impersonated U6-IW's antennas, and UCI `antenna_gain` is in the schema but has no consumer in 25.12's generator. See [axis 1/2, settled](#axis-12-radio-and-system-keys-settled-2026-10-27) |
+| `radio.outdoor` | `disabled` | regulatory/outdoor channel set (`iwpriv outdoor`) | `country3` is the nearest, and not equivalent | **declined 2026-10-27:** a real site toggle, but the only mac80211 knob changes the Country IE's environment octet, not the radio's channel/power table. See [axis 1/2, settled](#axis-12-radio-and-system-keys-settled-2026-10-27) |
 | `radio.<n>.ampdu.status`, `.rate.auto`, `.rate.mcs`, `.acktimeout`, `.ack.auto`, `.cwm.enable`, `.bgscan.status`, `.hard_noisefloor.status`, `.clksel` | `enabled`/`auto`/`64`/`disabled`/`0` | airMAX-era radio tuning, mostly `iwpriv` on QCA | nothing in mac80211 takes them per-radio | decline: airMAX/QCA-specific, constant in every capture (`cwm.mode` was already documented as a decoy) |
 | `wireless.<n>.authmode`, `.puren`, `.pureg`, `.element_adopt`, `.autowds`, `.vwire`, `.addmtikie` | `1`/`0`/`disabled` | legacy AirOS VAP flags | — | decline: legacy; `pureg` is already consumed as part of Minimum Data Rate |
 | `switch.port.<n>.{name,opmode}`, `switch.{status,vlan.status,dot1x.status,jumboframes}` | `PoE Out + Data`, `switch`, `disabled` | the in-wall's own 5 ports | openUF's per-port VLAN path | already correct: openUF keeps only ports carrying a real override (`inform.lua:3493`); the name/opmode-only rows are the U6-IW identity's port list, not an override |
@@ -5021,8 +5024,10 @@ descending promise, with why each is worth the toggle:
   counterparts (`dtim_period`, `beacon_int`); `intelligent_dhcp` and `element_adopt` were
   already noted as never captured in the audit above.
 - `radio.<n>.backup_channel`, `.acsdfs`, `.scan_list.{status,channels}`, `.ch144` — DFS
-  fallback and channel-list narrowing; `channel`/`channels` exist in OpenWrt, so these are
-  implementable if pushed.
+  fallback and channel-list narrowing. **Settled 2026-10-27:** `.acsdfs` is pushed (with
+  `.blklst`) once `wifi_caps2` `0x10` is claimed, and both are implemented; the other three
+  have **no emitter anywhere in the 10.6.106 jar**. See
+  [axis 1/2, settled](#axis-12-radio-and-system-keys-settled-2026-10-27).
 - `aaa.<n>.{rsn_preauth,rsn_preauth_uplinks,reauth_period,psk.sha256,sha1,sha256,rsn_group_cipher,wpa.group_update_count,wpa.strict_rekey,wpa.gmk_rekey,disable_na_mcast_to_ucast,strict_specification,log_level,verbose}`
   — the audit above already found **no occurrence in the 10.6.106 jar** for `rsn_preauth`,
   `wpa.{strict_rekey,gmk_rekey,group_update_count}` and `fils.*`: those stay **declined, no
@@ -5040,7 +5045,10 @@ descending promise, with why each is worth the toggle:
   would need the whole vwire/WDS peering path plus `is_wireless_uplink` reporting.
 - `ble.*` (12 keys: iBeacon, Eddystone, `ble.mode`) — **decline:** neither board has Bluetooth.
 - `system.monitor.<x>.{host,poll_interval,status,threshold}`, `system.{resetbtn,kernel.panic,kernel.panic_on_oops,boot_sound.status,analytics.*}` — device-level monitors and knobs; only
-  `system.analytics.status` has ever been captured. Needs capture.
+  `system.analytics.status` has ever been captured. **Settled 2026-10-27:** the controller
+  writes only `system.monitor.{memory,critical_memory}.threshold`, and only for gateway
+  models; the ping monitor has no emitter. See
+  [axis 1/2, settled](#axis-12-radio-and-system-keys-settled-2026-10-27).
 - `switch.*` beyond the U6-IW port rows (177 keys: ACLs, STP/MSTP, IGMP, LAG, SNMP, dot1x,
   routing interfaces, DHCP server/relay, storm control, port mirroring) — **decline, wrong
   product:** these are UniFi *switch* keys in a shared `ubntbox`; the only `switch.*` an AP
@@ -5320,6 +5328,83 @@ Not claimed: no live radar hit, so the CSA itself has never run in anger. What w
 checked on hardware is everything up to it — the state read, the generated arguments
 against what the live hostapd reports for its own channel, and the job doing nothing
 while both radios are where they belong.
+
+#### Axis 1/2 radio and system keys, settled 2026-10-27
+
+The last of the four axes' leftovers: `qos.mode`, `radio.<n>.antenna.gain`, `radio.outdoor`,
+`backup_channel`, `scan_list.*`, `ch144` and `system.monitor.*`. Settled from the controller
+side first, which is cheap and decisive: a key the 10.6.106 jar never writes cannot arrive,
+whatever the firmware does with it. Method: `grep -rl` each key literal over the 21 629
+extracted classes (the writer builds keys as `"radio." + n` plus a literal suffix, so the
+suffix is searchable), then decompile the hits with CFR.
+
+| Key | In the jar? | Verdict |
+|---|---|---|
+| `radio.<n>.acsdfs`, `radio.<n>.blklst` | yes, `config/ubntconf/PFljhxhmKJyhpeIhf` | **implemented** — see below |
+| `qos.mode` | yes, `config/VAZShipWTNxlo:2078` | **decline: constant by construction.** The writer emits the literal `"mode", "1"` — there is no setting behind it, like `wireless.<n>.wmm`. |
+| `radio.<n>.antenna.gain`, `radio.<n>.antenna` | yes, `config/VAZShipWTNxlo:510` | **decline: no consumer, and the value is not about this hardware.** It comes from the controller's own radio config document (`antenna_gain`, default 6; a U6-IW identity gets 3 with `antenna_id=-1`, i.e. built-in), so it describes the *impersonated* AP's antennas, not the host board's. 6.8.2 feeds it to a QCA vendor ioctl (`iwpriv <dev> ant_gain <n>`). UCI `antenna_gain` is in 25.12's `wireless.wifi-device.json` schema but appears **nowhere** in `/usr/share/ucode/wifi/` or `/lib/netifd/` on either AP — a stored-and-dropped option, the shape CLAUDE.md warns about. |
+| `radio.outdoor` | yes, `config/VAZShipWTNxlo:492` | **decline: no equivalent consumer.** A real toggle (site `outdoor_mode_enabled`, with a per-device override; `devmgr/kDxteQiUX:114-119`), but 6.8.2 applies it as `iwpriv <dev> outdoor <0\|1>`, a QCA regulatory switch. mac80211's nearest knob is `country3` — the Country IE's environment octet — which only changes what clients are *told*, not the channel/power table the radio uses. Not a trade to make blind on a 5 GHz radio: `ieee80211d`/`h` already took both APs' 5 GHz down once. |
+| `radio.<n>.backup_channel`, `radio.<n>.scan_list.{status,channels}`, `radio.<n>.ch144` | **no hits at all** | **decline: no emitter.** Consumed by `ubntbox` (the strings are right beside `blklst`), but nothing in the controller writes them, so they can never reach an AP. |
+| `system.monitor.*` | only `memory.threshold` and `critical_memory.threshold`, `config/lwueNrOWUBYJX:802-806` | **decline: gateway-only.** They are written from a per-model enum (`config/kYktyHCkPVCBdJC`) whose entries are UDM/UDR/UCG/UXG — `ifPresent`, so an AP identity gets nothing. The firmware's `system.monitor.<x>.{host,poll_interval,status}` ping monitor has no emitter whatsoever. |
+
+#### `radio.<n>.acsdfs` / `radio.<n>.blklst` — the site's auto-channel limits
+
+Both keys sit inside one `if (hyFnQ2.supportsAcsDfs())` in
+`com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf`, and `supportsAcsDfs()` is
+`hasWifiCapability2(16)`. So one unclaimed capability bit was hiding two real settings:
+
+```java
+if (hyFnQ2.supportsAcsDfs()) {
+    // BAND_NA only: enabled/disabled from radios_configuration[radio=na].dfs
+    OWIoHe.kCNoUwYXLXMAUl(stringBuilder, "radio." + n, "acsdfs", string);
+    if ("auto".equals(channel)) {           // only while the radio is on Auto
+        // channels_blacklist, grouped by band
+        OWIoHe.kCNoUwYXLXMAUl(stringBuilder, "radio." + n, "blklst", String.join(",", set));
+    }
+}
+```
+
+Both come from the site's **Radio AI** setting (`get/setting/radio_ai`): `radios_configuration`
+carries a `dfs` boolean per band, `channels_blacklist` a list of `{radio, channel,
+channel_width}`. A default site is not empty — the `conservative` preset blacklists every
+2.4 GHz channel but 1/6/11, which is what the lab controller shipped with.
+
+U7LR 6.8.2's side, from `sbin/ubntbox`: `blklst` becomes `wifitool <dev> block_acs_channel
+<list>` (and `block_acs_channel 0` to clear), and `acsdfs=disabled` the same call over the
+hardcoded DFS list `52,56,…,144`. Neighbouring strings show the firmware also narrows 2.4 GHz
+ACS to 1/6/11 unless `acs_2g_allch` is set, which has no controller key.
+
+openUF's equivalents, both `wifi-device` options read by hostapd's ACS:
+
+- `acsdfs` → `acs_exclude_dfs` (hostapd's own flag; written as explicit 0/1).
+- `blklst` → `chanlist`. hostapd has **no blacklist**, only the candidate list, so the
+  blacklist is inverted against the channels the radio's regdomain allows, taken from the
+  `iw phy` output `ucihelper.phy_caps` already parses (minus `no IR` channels: an AP may not
+  beacon there). `openuf_chanlist` is the ledger that lets the list be removed again when the
+  key vanishes from the wire, without touching a hand-set `chanlist`.
+
+Three cases where openUF deliberately writes nothing, each logged: a blacklist that excludes
+nothing this radio could have used (no churn), a blacklist covering the whole band (an ACS
+with no candidate never comes up), and a radio on Auto whose UCI declares no `band`/`hwmode`
+— `band_for_device` would fall back to the channel number, and `auto` is not one, so its
+answer is "na" for every radio, which would hand a 2.4 GHz radio a list of 5 GHz channels.
+
+Lab, 10.6.106, 2026-10-27: claiming the bit made both keys appear, and flipping the site's
+DFS switch produced a **one-key diff** (`radio.2.acsdfs` `disabled` → `enabled`, nothing else
+in 668 lines moved) with `acs_exclude_dfs` following it 1 → 0. `blklst` arrives unsorted
+(`12,2,13,3,…` — a Java `Set`), which is why the parser keeps what it is given and the
+ordering comes from the band's own channel list. `tools/cfg-coverage.lua` puts both in
+**consumed**.
+
+Hardware, 2026-10-27, both boards: the real site has DFS off for auto-channel, and after a
+Force Provision `acs_exclude_dfs=1` was in UCI on the 5 GHz radio of each AP and in its live
+`/var/run/hostapd-phy*.conf` (the 2.4 GHz BSS carries the schema default 0, which
+`hostapd.uc` emits for every radio). Both radios here are pinned, so no `blklst` is pushed at
+all; the inversion was instead run against each board's real channel list through the real
+`rf_config` with a mock cursor, giving `36,40,44,48,149,153,157,161,165,169,173` for a DFS
+blacklist on 5 GHz — exactly the non-DFS channels CZ allows, on ath10k and on mt76 — and the
+teardown clearing both the list and its stamp. Not claimed: no radio here runs on Auto, so no
+ACS has actually chosen under the restriction.
 
 ### Where the evidence lives
 
