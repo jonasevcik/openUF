@@ -19,6 +19,18 @@
 	scan code stays in one place and each result rides out on that heartbeat's
 	scan_table.
 
+	The whole 10.6.106 controller pushes exactly four cron commands, and this
+	is the complete list (PROTOCOL-VALIDATION.md, "Axis 4"):
+
+	  syswrapper.sh schedule-action        1-59/5 * * * *   any WLAN scheduled
+	  syswrapper.sh refresh-walled-garden 1  */10 * * * *   guest portal, no ipset
+	  syswrapper.sh dfs-reset                0 2 * * *      fixed DFS channel
+	  syswrapper.sh 11k-scan                 0 4 * * *      fast roaming on
+
+	The first two openUF already does on its own heartbeat (CRON_IN_DAEMON),
+	so they need no crontab line; the other two are real crontab lines into
+	the hook.
+
 	Timezone -> UCI system.@system[0].timezone (the wire string IS a POSIX TZ
 	string, which is exactly what that option holds); NTP -> system.ntp.server.
 	Both stamp what they replaced (openuf_timezone_orig, openuf_ntp_orig) so
@@ -60,7 +72,8 @@ M.END_MARK   = "# openuf-cron-end"
 
 -- Wire command -> what crond runs. Extend only alongside the verb itself.
 M.CRON_COMMANDS = {
-	["syswrapper.sh 11k-scan"] = "/usr/bin/syswrapper.sh 11k-scan",
+	["syswrapper.sh 11k-scan"]  = "/usr/bin/syswrapper.sh 11k-scan",
+	["syswrapper.sh dfs-reset"] = "/usr/bin/syswrapper.sh dfs-reset",
 }
 
 -- Wire commands openUF's inform loop already does on its own, so they need

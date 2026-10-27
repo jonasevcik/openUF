@@ -9,6 +9,7 @@
 	  syswrapper.sh set-inform <inform_url>
 	  syswrapper.sh reset-inform
 	  syswrapper.sh 11k-scan          -- the controller's nightly cron job
+	  syswrapper.sh dfs-reset         -- its other one: back onto a fixed DFS channel
 
 	authkey_hex32: exactly 32 hex characters (= 16 bytes, AES-128 key).
 	inform_url:    http(s)://host:port/inform
@@ -62,6 +63,7 @@ local function usage()
 		"       syswrapper.sh set-inform <url>\n" ..
 		"       syswrapper.sh reset-inform\n" ..
 		"       syswrapper.sh 11k-scan\n" ..
+		"       syswrapper.sh dfs-reset\n" ..
 		"\n" ..
 		"key32hex: exactly 32 hexadecimal characters (16 bytes, AES-128)\n"
 	)
@@ -189,6 +191,34 @@ local function cmd_11k_scan()
 	return true
 end
 
+-- dfs-reset
+-- The controller's other pushed cron job (02:00 nightly, see sysconf.lua),
+-- scheduled whenever the site has a 5 GHz radio pinned to a fixed DFS
+-- channel. After a radar hit the radio leaves that channel for another one
+-- and never comes back on its own; this job puts it back once the 30-minute
+-- non-occupancy list has expired.
+--
+-- Like 11k-scan, the work belongs to the inform daemon -- it owns the radios'
+-- netdev names, the live channel and the control sockets -- so this only
+-- leaves a request file that inform._maybe_service_dfs_reset reads on its
+-- next heartbeat. No randomisation here, unlike the scan: the firmware's
+-- dfs_reset has none either, and a channel switch is not an off-channel sweep
+-- that neighbouring APs can spoil for each other.
+local dfs_request_file = "/tmp/openuf-dfs-reset-request"
+
+local function cmd_dfs_reset()
+	local f = io.open(dfs_request_file, "w")
+	if not f then
+		io.stderr:write("syswrapper: cannot write " .. dfs_request_file .. "\n")
+		return false
+	end
+	f:write(tostring(now()), "\n")
+	f:close()
+	io.stdout:write("syswrapper: DFS channel reset requested; the inform daemon"
+		.. " checks each 5 GHz radio on its next heartbeat\n")
+	return true
+end
+
 -- ─── Entry point ─────────────────────────────────────────────────────────────
 
 local function main(args)
@@ -205,6 +235,8 @@ local function main(args)
 		cmd_reset_inform()
 	elseif cmd == "11k-scan" then
 		if not cmd_11k_scan() then os.exit(1) end
+	elseif cmd == "dfs-reset" then
+		if not cmd_dfs_reset() then os.exit(1) end
 	else
 		io.stderr:write("syswrapper: unknown command: " .. tostring(cmd) .. "\n")
 		usage()
@@ -225,7 +257,9 @@ return {
 	cmd_set_inform = cmd_set_inform,
 	cmd_reset_inform = cmd_reset_inform,
 	cmd_11k_scan = cmd_11k_scan,
+	cmd_dfs_reset = cmd_dfs_reset,
 	_set_scan_request_file = function(p) scan_request_file = p end,
+	_set_dfs_request_file = function(p) dfs_request_file = p end,
 	_set_rand = function(f) rand_below = f or urandom_below end,
 	_set_clock = function(f) now = f or os.time end,
 	_urandom_below = urandom_below,

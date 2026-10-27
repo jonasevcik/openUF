@@ -1,4 +1,4 @@
--- Tests for openuf/hook/syswrapper.lua (set-adopt, set-inform, reset-inform, 11k-scan).
+-- Tests for openuf/hook/syswrapper.lua (set-adopt, set-inform, reset-inform, 11k-scan, dfs-reset).
 -- Run from project root: lua tests/run_tests.lua
 
 SYSWRAPPER_TEST_MODE = true
@@ -240,6 +240,37 @@ return {
 			io.stderr = rs
 			assert_contains(err, "cannot write", "says so")
 			sw._set_scan_request_file("/tmp/openuf-scan-request")
+		end
+	},
+	{
+		name = "syswrapper: dfs-reset leaves a stamped request for the daemon",
+		fn = function()
+			local FILE = "/tmp/openuf_test_sysw_dfs"
+			os.remove(FILE)
+			sw._set_dfs_request_file(FILE)
+			sw._set_clock(function() return 1000000 end)
+			local real = io.stdout
+			io.stdout = {write = function() end}
+			local ok = sw.cmd_dfs_reset()
+			io.stdout = real
+			local f = io.open(FILE, "r")
+			local body = f and f:read("*a")
+			if f then f:close() end
+			os.remove(FILE)
+			sw._set_clock(nil)
+			assert_true(ok, "succeeds")
+			-- One timestamp and nothing else: the hook does no radio work and
+			-- holds no policy, so there is nothing else to pass on.
+			assert_eq(body, "1000000\n", "the request is the time it was made")
+
+			sw._set_dfs_request_file("/nonexistent-dir/x")
+			local err = ""
+			local rs = io.stderr
+			io.stderr = {write = function(_, s) err = err .. s end}
+			assert_false(sw.cmd_dfs_reset(), "an unwritable path fails")
+			io.stderr = rs
+			assert_contains(err, "cannot write", "and says so")
+			sw._set_dfs_request_file("/tmp/openuf-dfs-reset-request")
 		end
 	},
 }

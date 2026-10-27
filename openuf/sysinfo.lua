@@ -1208,6 +1208,22 @@ function M.radio_caps(ifname)
 	return caps
 end
 
+-- The raw `iw phy phyN channels` dump for ifname's radio, which is the only
+-- place mac80211 exposes the per-channel DFS state machine (and so the
+-- non-occupancy list a radar hit creates). Parsed by
+-- rrmscan.parse_dfs_states; returned as text so the parse is testable without
+-- a radio. Not cached: the one caller is the nightly dfs-reset job, and the
+-- state it asks about is exactly the thing that changes with time.
+function M.phy_channels(ifname)
+	if not ifname then return nil end
+	local dev_info = iw_dev_info(ifname)
+	local phy = dev_info and dev_info:match("wiphy%s+(%d+)")
+	if not phy then return nil end
+	local text = M._run_cmd("iw phy phy" .. phy .. " channels")
+	if not text or text == "" then return nil end
+	return text
+end
+
 -- First-seen timestamps for wired hosts, keyed by "<source> mac" -- used to
 -- derive `uptime` in M.mac_table()/M.switch_mac_table() the same way
 -- sta_table's connected_sec comes from iw (which has no equivalent concept

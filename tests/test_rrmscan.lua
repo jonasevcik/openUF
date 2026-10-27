@@ -865,6 +865,98 @@ return {
 		end
 	},
 	{
+		name = "rrmscan: parse_dfs_states reads the per-channel DFS state machine",
+		fn = function()
+			-- Verbatim shape of `iw phy phy1 channels` on the AX3000T
+			-- (OpenWrt 25.12, mt76), with one channel put on the
+			-- non-occupancy list by hand -- which is the state no live read
+			-- can be made to show on demand.
+			local blob = table.concat({
+				"Band 2:",
+				"\t* 5180 MHz [36] ",
+				"\t  Maximum TX power: 23.0 dBm",
+				"\t  Channel widths: 20MHz HT40+ VHT80 VHT160",
+				"\t* 5500 MHz [100] ",
+				"\t  Maximum TX power: 26.0 dBm",
+				"\t  Radar detection",
+				"\t  Channel widths: 20MHz HT40+ VHT80 VHT160",
+				"\t  DFS state: available (for 349821 sec)",
+				"\t  DFS CAC time: 60000 ms",
+				"\t* 5520 MHz [104] ",
+				"\t  Maximum TX power: 26.0 dBm",
+				"\t  Radar detection",
+				"\t  DFS state: unavailable (for 1766 sec)",
+				"\t  DFS CAC time: 60000 ms",
+				"\t* 5540 MHz [108] ",
+				"\t  Radar detection",
+				"\t  DFS state: usable (for 0 sec)",
+			}, "\n") .. "\n"
+			local s = rrmscan.parse_dfs_states(blob)
+			assert_eq(s[100].state, "available", "CAC done, may beacon")
+			assert_eq(s[100].secs, 349821, "and for how long")
+			assert_eq(s[104].state, "unavailable", "on the NOL after a radar hit")
+			assert_eq(s[104].secs, 1766, "the NOL has 1766 s left")
+			assert_eq(s[108].state, "usable", "a DFS channel awaiting CAC")
+			-- A non-DFS channel is absent rather than claimed usable, so
+			-- "not a DFS channel" stays distinguishable from "free".
+			assert_nil(s[36], "36 has no DFS state at all")
+			assert_eq(rrmscan.channel_in_nol(s, 104), true, "104 is blocked")
+			assert_eq(rrmscan.channel_in_nol(s, "104"), true, "a string channel")
+			assert_eq(rrmscan.channel_in_nol(s, 100), false, "100 is not")
+			assert_eq(rrmscan.channel_in_nol(s, 108), false,
+				"CAC pending is not the NOL -- hostapd does the CAC itself")
+			assert_eq(rrmscan.channel_in_nol(s, 36), false, "no state, not blocked")
+			assert_eq(rrmscan.channel_in_nol(nil, 100), false, "no dump at all")
+			assert_eq(next(rrmscan.parse_dfs_states(nil)), nil, "no blob")
+			assert_eq(next(rrmscan.parse_dfs_states("")), nil, "empty blob")
+		end
+	},
+	{
+		name = "rrmscan: chan_switch_args rebuilds a CSA for each 5 GHz width",
+		fn = function()
+			local A = rrmscan.chan_switch_args
+			-- 80 MHz on channel 100: the live values read off the AX3000T's
+			-- own hostapd (secondary_channel=1, centr_freq_seg0_idx=106).
+			assert_eq(A(100, 80),
+				"5500 sec_channel_offset=1 center_freq1=5530 bandwidth=80 vht",
+				"ch 100 at 80 MHz")
+			-- 104 is the upper half of the same 40 MHz pair, so its
+			-- secondary sits below it, and the 80 MHz centre is unchanged.
+			assert_eq(A(104, 80),
+				"5520 sec_channel_offset=-1 center_freq1=5530 bandwidth=80 vht",
+				"ch 104 at 80 MHz")
+			assert_eq(A(36, 80),
+				"5180 sec_channel_offset=1 center_freq1=5210 bandwidth=80 vht",
+				"ch 36 at 80 MHz")
+			assert_eq(A(149, 80),
+				"5745 sec_channel_offset=1 center_freq1=5775 bandwidth=80 vht",
+				"the UNII-3 block anchors on 149")
+			assert_eq(A(100, 160),
+				"5500 sec_channel_offset=1 center_freq1=5570 bandwidth=160 vht",
+				"160 MHz spans 100-128, centre 5570")
+			assert_eq(A(100, 40),
+				"5500 sec_channel_offset=1 center_freq1=5510 bandwidth=40 ht",
+				"40 MHz: ht, and the centre is between the pair")
+			assert_eq(A(104, 40),
+				"5520 sec_channel_offset=-1 center_freq1=5510 bandwidth=40 ht",
+				"the same pair from the other side")
+			-- 20 MHz carries nothing but the frequency: no secondary, no
+			-- centre, and no ht/vht token to mis-declare the width with.
+			assert_eq(A(100, 20), "5500", "20 MHz")
+			assert_eq(A(100, nil), "5500", "unknown width is read as 20 MHz")
+			-- 165 sits alone: no 40 MHz partner, so no bonded width at all.
+			assert_nil(A(165, 40), "165 has no partner")
+			assert_nil(A(165, 80), "and no 80 MHz block")
+			assert_eq(A(165, 20), "5825", "but it is a perfectly good 20 MHz channel")
+			assert_eq(rrmscan.block_center(149, 80), 155,
+				"UNII-3's centre is 155, not the 154 an anchor-on-36 formula gives")
+			assert_nil(A(11, 80), "2.4 GHz has no DFS and no block anchor")
+			assert_nil(A(100, 60), "not a width hostapd knows")
+			assert_nil(A("auto", 80), "auto is not a channel")
+			assert_nil(A(nil, 80), "nil")
+		end
+	},
+	{
 		name = "rrmscan: parse_dfs reads a radar detection, and only a radar detection",
 		fn = function()
 			-- hostapd's own wording, as the hook stamps it:

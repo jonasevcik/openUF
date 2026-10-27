@@ -6110,6 +6110,118 @@ function M._maybe_service_scan_request(cfg)
 	return n > 0
 end
 
+-- ─── dfs-reset ───────────────────────────────────────────────────────────────
+-- The controller's 02:00 cron job, pushed whenever the site has a 5 GHz radio
+-- pinned to a fixed DFS channel (the gate is decompiled in
+-- PROTOCOL-VALIDATION.md, "Axis 4"). What it is for: a radar hit takes the
+-- radio off that channel and nothing brings it back, so the carefully planned
+-- cell quietly stays on whatever channel the driver picked -- until the next
+-- Force Provision, which may be months away.
+--
+-- U7LR 6.8.2's own dfs_reset is the model, verb for verb (bin/syswrapper.sh):
+-- for each 5 GHz radio's first VAP in Master mode, compare the live channel
+-- against the one the controller configured, skip `auto` and `0`, skip when
+-- they already agree, skip while the configured channel is still on the
+-- non-occupancy list ("still in nol_channel, wait next time"), and otherwise
+-- put the radio back. The firmware uses `radartool chknol` and `iwconfig
+-- channel`; the equivalents here are mac80211's per-channel DFS state and a
+-- CSA through hostapd's control socket.
+--
+-- Deliberately a channel switch announcement rather than a `wifi reload`: the
+-- BSS is never torn down, associated clients are told where it is going, and
+-- UCI is not touched (it already holds the configured channel -- that is what
+-- makes this a *reset*). The radio still goes quiet for the CAC on arrival,
+-- which is the price of a DFS channel and the reason this runs at 02:00.
+M.DFS_RESET_REQUEST_FILE = "/tmp/openuf-dfs-reset-request"
+-- A request the daemon never saw (it was down, or the whole AP was) is not
+-- carried out hours later, when the clock has moved on and the controller
+-- would schedule a fresh one the next night anyway.
+M.DFS_RESET_MAX_AGE = 1800
+
+-- True when the hook left a request that is still fresh. The file is removed
+-- either way, so one request is served at most once.
+function M._dfs_reset_requested()
+	local raw = M._read_file(M.DFS_RESET_REQUEST_FILE)
+	if not raw then return false end
+	os.remove(M.DFS_RESET_REQUEST_FILE)
+	local at = tonumber(raw:match("%d+"))
+	if not at then return false end
+	local late = M._time() - at
+	if late > M.DFS_RESET_MAX_AGE or late < -60 then
+		io.stderr:write("inform: ignoring a stale dfs-reset request\n")
+		return false
+	end
+	return true
+end
+
+-- One radio: put it back on `want` if it is somewhere else and allowed to be
+-- there. Returns "moved", or nil plus the reason it was left alone.
+function M._dfs_reset_radio(radio, ifname)
+	local rrm, si = M._rrmscan, M._sysinfo
+	local want = tonumber(radio.channel)
+	if not want then return nil, "channel is not pinned" end
+
+	local caps = si.radio_caps(ifname) or {}
+	local live = tonumber(caps.channel)
+	if not live then return nil, "no live channel" end
+	if live == want then return nil, nil end
+
+	if rrm.is_dfs_channel(want) then
+		local states = rrm.parse_dfs_states(si.phy_channels(ifname))
+		if rrm.channel_in_nol(states, want) then
+			local s = states[want] or {}
+			io.stderr:write(("inform: dfs-reset: %s is on channel %d, wants %d,"
+				.. " but %d is still on the non-occupancy list%s -- waiting for"
+				.. " the next run\n"):format(ifname, live, want, want,
+				s.secs and (" for another " .. s.secs .. " s") or ""))
+			return nil, "in the non-occupancy list"
+		end
+	end
+
+	local args = rrm.chan_switch_args(want, caps.width)
+	if not args then
+		io.stderr:write(("inform: dfs-reset: %s: cannot express channel %d at %s"
+			.. " MHz as a channel switch -- leaving it on %d\n")
+			:format(ifname, want, tostring(caps.width), live))
+		return nil, "not expressible as a channel switch"
+	end
+	local cmd = "hostapd_cli -i " .. ifname .. " chan_switch "
+		.. rrm.CS_COUNT .. " " .. args
+	local out = M._run_cmd(cmd .. " 2>&1") or ""
+	if not out:find("OK", 1, true) then
+		io.stderr:write(("inform: dfs-reset: %s: hostapd refused the switch to"
+			.. " channel %d (%s): %s\n"):format(ifname, want, args,
+			(out:gsub("%s+$", ""))))
+		return nil, "hostapd refused the switch"
+	end
+	io.stderr:write(("inform: dfs-reset: %s switching back from channel %d to"
+		.. " the configured %d (%s)\n"):format(ifname, live, want, args))
+	return "moved"
+end
+
+-- Serve a pending dfs-reset request. Returns how many radios were moved.
+function M._maybe_service_dfs_reset(cfg)
+	if not M._dfs_reset_requested() then return 0 end
+	local ufuci, rrm, si = M._ucihelper, M._rrmscan, M._sysinfo
+	if not (ufuci and rrm and si and si.phy_channels) then return 0 end
+	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
+	if not ok_r or type(radios) ~= "table" then return 0 end
+	local moved = 0
+	for _, radio in ipairs(radios) do
+		-- 5 GHz only, as the firmware's own list_first_vaps_ifs 5 does: no
+		-- other band has DFS, so no other band can have been pushed off a
+		-- channel by radar.
+		if radio.radio == "na" and not radio.disabled then
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+			if ok_if and ifname then
+				local ok_m, what = pcall(M._dfs_reset_radio, radio, ifname)
+				if ok_m and what == "moved" then moved = moved + 1 end
+			end
+		end
+	end
+	return moved
+end
+
 -- One heartbeat: build, send, dispatch. Returns the number of seconds the
 -- caller should wait before the next one -- 0 means "again, now", the
 -- config-applied case, where a real AP re-informs immediately. ctx carries the
@@ -6308,6 +6420,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- The controller's nightly scan (syswrapper.sh 11k-scan), also before
 	-- build_json so the fresh scan dump is what this inform reports.
 	pcall(M._maybe_service_scan_request, cfg)
+	pcall(M._maybe_service_dfs_reset, cfg)
 	pcall(M._l2guard_resync, st)
 	pcall(M._guest_resync, st)
 	pcall(M._guest_wg_resync, st)

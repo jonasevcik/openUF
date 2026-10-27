@@ -193,6 +193,123 @@ function M.is_dfs_channel(ch)
 	return (ch ~= nil) and ch >= 52 and ch <= 144
 end
 
+-- Per-channel DFS state out of `iw phy phyN channels` (sysinfo.phy_channels).
+-- mac80211 keeps the regulatory state machine per channel and `iw` prints it
+-- under each channel's entry:
+--
+--   * 5500 MHz [100]
+--     Maximum TX power: 26.0 dBm
+--     Radar detection
+--     Channel widths: 20MHz HT40+ VHT80 VHT160
+--     DFS state: available (for 349821 sec)
+--     DFS CAC time: 60000 ms
+--
+-- The three states are `usable` (CAC not done), `available` (CAC done, may
+-- beacon) and `unavailable` -- the last being the non-occupancy list a radar
+-- hit puts the channel on for 30 minutes. This is openUF's equivalent of the
+-- `radartool -i <radio> chknol <ch>` the UniFi firmware's dfs_reset consults
+-- (firmware-confirmed for U7LR 6.8.2), and the only reason it is consulted:
+-- switching back onto a channel still in the NOL is refused by the kernel,
+-- and the job simply waits for the next run.
+--
+-- Channels with no DFS state (the whole 2.4 GHz band, UNII-1, UNII-3) are
+-- absent from the table rather than reported as usable, so a caller can tell
+-- "not a DFS channel" from "a DFS channel that is free".
+function M.parse_dfs_states(blob)
+	local out = {}
+	if type(blob) ~= "string" then return out end
+	local ch = nil
+	for line in blob:gmatch("[^\n]+") do
+		local c = line:match("^%s*%*%s+%d+%s+MHz%s+%[(%d+)%]")
+		if c then
+			ch = tonumber(c)
+		elseif ch then
+			local state = line:match("DFS state:%s*(%a+)")
+			if state then
+				out[ch] = {state = state, secs = tonumber(line:match("%(for%s+(%d+)%s*sec"))}
+				ch = nil
+			end
+		end
+	end
+	return out
+end
+
+-- True when the channel is on the non-occupancy list and must not be switched
+-- onto yet. A channel the dump does not mention is not blocked: it either has
+-- no DFS state at all, or this driver does not report one, and in both cases
+-- the switch itself is the authority.
+function M.channel_in_nol(states, ch)
+	local s = states and states[tonumber(ch)]
+	return (s ~= nil) and s.state == "unavailable"
+end
+
+-- How many beacons the CSA counts down before the switch. Five is hostapd's
+-- own default for a user-requested switch and a little over half a second at
+-- the usual 100 TU beacon interval: long enough for associated clients to see
+-- the announcement, short enough not to matter to the job.
+M.CS_COUNT = 5
+
+-- The centre channel of every bonded 5 GHz block, in IEEE's own numbering.
+-- A table rather than arithmetic because the blocks are NOT evenly spaced:
+-- UNII-3 starts at 149, which is not 36 + 16k, so an anchor-on-36 formula
+-- puts the 149-161 block's centre one channel (5 MHz) too low -- a wrong
+-- center_freq1 hostapd would accept and then beacon a 20 MHz-wide lie.
+M.BLOCK_CENTERS = {
+	[40]  = {38, 46, 54, 62, 102, 110, 118, 126, 134, 142, 151, 159},
+	[80]  = {42, 58, 74, 90, 106, 122, 138, 155},
+	[160] = {50, 114, 163},
+}
+
+-- The centre channel of the `width` MHz block holding `ch`, or nil when the
+-- channel is not in one (165 at 40 MHz, say: it has no partner).
+function M.block_center(ch, width)
+	local centers = M.BLOCK_CENTERS[width]
+	if not centers then return nil end
+	-- Half the block, in channel numbers: 2 either side at 40 MHz, 6 at
+	-- 80 MHz, 14 at 160 MHz.
+	local reach = width / 10 - 2
+	for _, c in ipairs(centers) do
+		if ch >= c - reach and ch <= c + reach then return c end
+	end
+	return nil
+end
+
+-- The arguments for `hostapd_cli chan_switch <count> ...` that put a 5 GHz BSS
+-- on channel `ch` at `width` MHz, or nil when the pair cannot be expressed.
+--
+-- Grammar, verified against the hostapd in OpenWrt 25.12 (`hostapd_cli help`):
+--   chan_switch <cs_count> <freq> [sec_channel_offset=] [center_freq1=]
+--               [center_freq2=] [bandwidth=] [blocktx] [ht|vht]
+-- The build's help lists only ht|vht, so an HE or EHT BSS is switched with
+-- `vht` and keeps the HE/EHT operation elements from its own config; passing a
+-- token this hostapd does not parse would fail the whole command.
+--
+-- 5 GHz only, and deliberately: 2.4 GHz has no DFS, so the job that uses this
+-- never asks about it.
+function M.chan_switch_args(ch, width)
+	ch, width = tonumber(ch), tonumber(width) or 20
+	if not ch or ch < 32 then return nil end
+	local freq = M.freq_of_channel(ch)
+	if not freq then return nil end
+	if width == 20 then return tostring(freq) end
+
+	local center = M.block_center(ch, width)
+	if not center then return nil end
+	-- Which side of the primary its 40 MHz partner sits on. The 5 GHz
+	-- channels step by 4 and the pairs are (36,40), (44,48), ..., so the
+	-- lower member of each pair takes its secondary above it. Derived from
+	-- the 40 MHz block's own centre, which keeps UNII-3 right as well.
+	local pair = M.block_center(ch, 40)
+	if not pair then return nil end
+	return table.concat({
+		tostring(freq),
+		"sec_channel_offset=" .. (ch < pair and 1 or -1),
+		"center_freq1=" .. M.freq_of_channel(center),
+		"bandwidth=" .. width,
+		(width == 40) and "ht" or "vht",
+	}, " ")
+end
+
 -- DFS radar detections among the drained collector lines. hostapd prints
 -- "DFS-RADAR-DETECTED freq=5500 ht_enabled=0 chan_offset=0 chan_width=1
 -- cf1=5500 cf2=0" on the BSS control socket; the hook prefixes the uptime and

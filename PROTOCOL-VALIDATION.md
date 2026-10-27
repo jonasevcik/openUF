@@ -5205,6 +5205,122 @@ Already declined by product scope within that list: the speaker/IR verbs (`set-v
 `set-stream*`, `do-ir-send`), `lte_prov`, the mesh/WDS verbs (axis 2), and the U-Boot and
 partition verbs, which openUF deliberately never flashes.
 
+#### Axis 4, settled 2026-10-27
+
+The jar check is done, and it settles the whole axis. Method, reproducible: extract
+`internal-dependencies.jar` inside the lab controller container (`/tmp/idep`, 21 629
+classes), decompile the command packages with CFR, and read the two ways a verb can
+reach an AP.
+
+**Route 1 — a `cmd` message.** The controller's device-command endpoint is one class per
+command under `com/ubnt/service/devmgr/b/g/`, each carrying a `@…(…="<name>")`
+annotation; the 48 names are the whole `cmd/devmgr` API surface
+(`adv-adopt`, `build-ssh-session`, `cancel-migrate`, `clear-all-switch-counters`,
+`clear-switch-port-counters`, `clone-config`, `close-ssh-session`, `esim-add`,
+`esim-delete`, `force-provision`, `get-sdp-offer`, `hide-lcm-tracker`, `locate`,
+`lte-set-profile`, `lte-verify-pin`, `migrate`, `outlet-ctl`, `port-recovery`,
+`power-cycle`, `query-dpi-stats`, `quick-scan`, `read-inactive-slot-sim-card`,
+`reset-usage`, `restart`, `rps-port-recovery`, `scan`, `set-alignment`, `set-locate`,
+`set-port-locate`, `set-priority-uplink`, `set-rollupgrade`, `set-vwire-uplink`,
+`setup-firewall`, `show-lcm-tracker`, `spectrum-scan`, `speedtest`, `speedtest-status`,
+`ssh-sdp-answer`, `terminate-remote-user-vpn`, `unset-alignment`, `unset-locate`,
+`unset-port-locate`, `unset-priority-uplink`, `unset-rollupgrade`, `unset-vwire-uplink`,
+`upgrade`, `upgrade-all`, `upgrade-external`, `verify-pin`). The strings those handlers
+actually put on the wire as `{"cmd": …}` are a smaller set:
+`spectrum-scan`, `scan`, `kick-sta`, `block-sta`, `unblock-sta`, `rate-update`,
+`authorize-guest`, `unauthorize-guest`, `set-locate`, `unset-locate`,
+`clear-all-counters`, `clear-counters`, `clear-crashlog`, `clear-recovery`,
+`clear-trace`, `send-crashlog`, `send-recovery`, `send-trace`, `query-dpi-stats`,
+`clear-all-dpi-counters`, `power-cycle`, `rps-port-recovery`, `relayctl`,
+`show-lcm-tracker`, `hide-lcm-tracker`, `build-ssh-session`, `close-ssh-session`,
+`ssh-sdp-answer`, `set-element-payload`, `set-meshv3-payload`, `mesh-halt`, `unpair`,
+plus the firmware-update enum (`fwupdate`, `get-udapi-blocks`, `probe-dhcpv6`,
+`probe-slaac`, `shadow-mode-adopt`, `speed-test-udapi-start`/`-stop`,
+`teleport-connect`/`-disconnect`, `wg-genkeypair`, all gateway/UDAPI).
+**Not one of the ~50 triage verbs above is in either list.** They are declined, with the
+reason named once for all of them: *not a controller command* — `mcad` invokes them from
+its own state machine, from its cron, or over SSH. That closes `vlan-detected`,
+`scan-rrm`, `airtime-scan`, `11k-boot`/`11k-stop`, `set-channel`, `get-support-file`,
+`pcap-start`/`-stop`, `read-crash-log`, `dump-radar-log`, `mca-custom-alert`,
+`schedule-action` *as a command*, `probe-lan-iface`, `ip-changed`, `soft-restart`,
+`wireless-vlan-add`/`-del`, `del-bridge-vlans`, `get-tmpfs-usage`,
+`install-runtime-package`, `netconsole`, `sensitive-data-filter` and the rest. The
+counters/crashlog/SSH-console commands openUF already answers with `_note_unhandled`
+stay no-ops on purpose (nothing here keeps per-port counters or a crash log).
+
+**Route 2 — the pushed crontab.** This is the one that pays. Every `syswrapper.sh`
+string in the whole jar, verbatim:
+
+```
+syswrapper.sh 11k-scan                 cron, 0 4 * * *
+syswrapper.sh dfs-reset                cron, 0 2 * * *
+syswrapper.sh refresh-walled-garden 1  cron, */10 * * * *
+syswrapper.sh schedule-action          cron, 1-59/5 * * * *
+/usr/bin/syswrapper.sh %s              over SSH: "set-adopt <url> <key> [mac]"
+/usr/bin/syswrapper.sh unpair          over SSH
+.../syswrapper.sh upgrade %s, upgrade2 over SSH, firmware download
+```
+
+The four cron jobs are emitted together by one method (`com/ubnt/service/config/`
+`lwueNrOWUBYJX`, called from the AP config generator `VAZShipWTNxlo:2426`), each behind
+its own gate, decompiled:
+
+| Job | Gate as decompiled |
+|---|---|
+| `schedule-action` | any WLAN with `isScheduleEnabled()` |
+| `refresh-walled-garden 1` | the guest-portal condition **and** `!device.supportIPSet()` |
+| `dfs-reset` | the site's country resolves to a regdomain with DFS channels, **and** some radio with `radio == "na"` and `has_fccdfs` (country 840/124) or `has_dfs` (everyone else) has a `channel` that is not `auto` and is in that DFS list |
+| `11k-scan` | any WLAN with `fast_roaming_enabled` |
+
+So `dfs-reset` is pushed to a device **only because openUF reports `has_dfs` honestly**
+off `iw phy` — the field added for the Radios tab's capability filters turns out to gate
+this job too. Confirmed live, not inferred: the office AP (5 GHz pinned to channel 100,
+country CZ) was being pushed the job and openUF was declining it by name —
+`sysconf: cron job not installed -- not a command this build provides:
+"syswrapper.sh dfs-reset"`, twice on 2026-10-27 — while the living-room AP (channel 36,
+non-DFS) is pushed only `11k-scan`, which is the gate working exactly as decompiled.
+
+#### `dfs-reset`: what the firmware does with it
+
+`bin/syswrapper.sh` → `dfs_reset()` (firmware-confirmed for U7LR 6.8.2; `dfs_reset_mtk`
+is the same logic through a different `iwconfig` field):
+
+1. `is_wds` → "Downlink AP doesn't neet to do dfs reset action", return.
+2. For each 5 GHz radio's first VAP (`list_first_vaps_ifs 5`) in `Mode:Master`.
+3. Actual channel from `iwlist <if> frequency | grep Current`; configured channel from
+   `radio.<n>.channel` in `/tmp/running.cfg` — the pushed `system.cfg` itself.
+4. `-z`, `auto` or `0` → skip. Equal → skip.
+5. `radartool -i <radio> chknol <ch>` = `true` → log "dfs <ch> still in nol_channel,
+   wait next time" and skip.
+6. Otherwise `iwconfig <if> channel <ch>`, logging `OK` or `FAIL(<rc>)`.
+
+openUF's equivalent, verb for verb: the live channel from `iw dev <if> info`
+(`sysinfo.radio_caps`), the configured one from `wireless.<radio>.channel`, the NOL from
+mac80211's own per-channel state (`iw phy phyN channels` → `DFS state: unavailable (for
+N sec)`, parsed by `rrmscan.parse_dfs_states`), and the move as a CSA on the BSS control
+socket (`hostapd_cli chan_switch 5 <freq> sec_channel_offset=± center_freq1=<c>
+bandwidth=<w> ht|vht`, built by `rrmscan.chan_switch_args` from the live width) instead
+of a driver-level channel set. `is_wds` has no analogue: openUF does no wireless uplink.
+
+Two things worth keeping:
+
+- **The bonded-block centres are not evenly spaced.** UNII-3 starts at 149, which is not
+  `36 + 16k`, so an anchor-on-36 formula gives the 149-161 block a centre of channel 154
+  instead of 155 — a `center_freq1` hostapd accepts and then beacons a 5 MHz-shifted
+  operation element with. `rrmscan.BLOCK_CENTERS` is therefore a table of the real
+  centres (40 MHz: 38…159, 80 MHz: 42…155, 160 MHz: 50/114/163), and a channel belongs
+  to the block whose centre is within `width/10 - 2` channels.
+- **`iw phy … channels` is the only place the NOL is visible.** Verified on both boards
+  2026-10-27: each radio's own 80 MHz block reads `available` (CAC done) and every other
+  DFS channel `usable`, on ath10k and mt76 alike; non-DFS channels have no DFS state
+  line at all, which is why `channel_in_nol` treats an absent entry as "not blocked"
+  rather than as usable. `logread` never shows the NOL; nor does `hostapd_cli status`.
+
+Not claimed: no live radar hit, so the CSA itself has never run in anger. What was
+checked on hardware is everything up to it — the state read, the generated arguments
+against what the live hostapd reports for its own channel, and the job doing nothing
+while both radios are where they belong.
+
 ### Where the evidence lives
 
 Extracted rootfs (6.8.2 `u7root`, 4.3.28 `root`), the `ubntbox` key dumps

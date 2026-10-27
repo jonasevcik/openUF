@@ -7775,4 +7775,135 @@ return {
 			assert_true(out:find("<redacted>") ~= nil, "and says it was redacted")
 		end
 	},
+	{
+		name = "inform packet: dfs-reset only moves a 5 GHz radio that is off its pinned channel",
+		fn = function()
+			local orig = {
+				uci = inform._ucihelper, si = inform._sysinfo,
+				run = inform._run_cmd, read = inform._read_file,
+				time = inform._time, stderr = io.stderr,
+			}
+			local said, cmds, request = "", {}, nil
+			io.stderr = {write = function(_, s) said = said .. s end}
+			-- The AX3000T's own layout: 2.4 on radio0, the DFS 5 GHz on radio1.
+			local live, width, nol = 36, 80, nil
+			inform._ucihelper = {
+				get_radio_table = function()
+					return {
+						{name = "radio0", radio = "ng", channel = 11},
+						{name = "radio1", radio = "na", channel = 100},
+					}
+				end,
+				get_ifname_for_radio = function(r)
+					return r == "radio0" and "phy0-ap0" or "phy1-ap0"
+				end,
+			}
+			inform._sysinfo = {
+				radio_caps = function(ifname)
+					if ifname == "phy1-ap0" then return {channel = live, width = width} end
+					-- The 2.4 radio is deliberately off ITS pinned channel
+					-- too (1, configured 11): the only thing keeping it out
+					-- of this job is the band gate.
+					return {channel = 1, width = 20}
+				end,
+				phy_channels = function()
+					return "\t* 5500 MHz [100] \n\t  Radar detection\n\t  DFS state: "
+						.. (nol and "unavailable (for 1766 sec)" or "available (for 86400 sec)")
+						.. "\n"
+				end,
+			}
+			inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "OK\n" end
+			inform._read_file = function(p)
+				if p == inform.DFS_RESET_REQUEST_FILE then return request end
+				return nil
+			end
+			inform._time = function() return 1000000 end
+
+			local ok, err = pcall(function()
+				-- No request: nothing is read, nothing runs.
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "no request, no work")
+				assert_eq(#cmds, 0, "and no command")
+
+				-- Off its channel, the channel is free: one CSA, on the 5 GHz
+				-- radio only. The 2.4 radio is never even looked at -- no band
+				-- but 5 GHz has DFS.
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 1, "one radio moved")
+				assert_eq(#cmds, 1, "one command")
+				assert_contains(cmds[1], "hostapd_cli -i phy1-ap0 chan_switch 5 "
+					.. "5500 sec_channel_offset=1 center_freq1=5530 bandwidth=80 vht",
+					"a CSA back to the configured channel, at the live width")
+				assert_contains(said, "switching back from channel 36 to the configured 100",
+					"and says what it did")
+				assert_eq(said:find("phy0%-ap0"), nil,
+					"the 2.4 radio is off its channel too and is still not touched")
+
+				-- Already there: the firmware's own first check, and the state
+				-- openUF is in on every night but the one after a radar hit.
+				cmds, live = {}, 100
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "nothing to do")
+				assert_eq(#cmds, 0, "no switch when the channel already agrees")
+
+				-- Still on the non-occupancy list: wait, do not ask hostapd.
+				-- This is the case that makes the NOL read worth doing --
+				-- the kernel would refuse and the AP would have announced a
+				-- switch it cannot complete.
+				cmds, live, nol, said = {}, 36, true, ""
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "left alone")
+				assert_eq(#cmds, 0, "no switch attempted")
+				assert_contains(said, "still on the non-occupancy list",
+					"and the reason is named")
+				assert_contains(said, "another 1766 s", "with the time left")
+
+				-- hostapd refusing is reported, not swallowed.
+				cmds, nol, said = {}, nil, ""
+				inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "FAIL\n" end
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "not counted as moved")
+				assert_contains(said, "hostapd refused the switch", "and is logged")
+				inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "OK\n" end
+
+				-- A stale request (the daemon was down when crond fired) is
+				-- dropped rather than acted on hours later.
+				cmds, said = {}, ""
+				request = tostring(1000000 - inform.DFS_RESET_MAX_AGE - 1) .. "\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "stale, ignored")
+				assert_eq(#cmds, 0, "no switch")
+				assert_contains(said, "stale dfs-reset request", "and says so")
+
+				-- An unpinned radio is left to the driver: "auto" is the
+				-- controller's intent, not a channel to return to. Silently:
+				-- every site that lets the controller pick a channel is in
+				-- this case, and it is not a problem to report.
+				cmds, said = {}, ""
+				inform._ucihelper.get_radio_table = function()
+					return {{name = "radio1", radio = "na", channel = "auto"}}
+				end
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "auto is not pinned")
+				assert_eq(#cmds, 0, "no switch")
+				assert_eq(said, "", "and nothing logged")
+				-- Asserted on the reason, not just the silence: "auto" has to
+				-- be refused before anything reads the radio, or the live
+				-- channel gets compared against nothing.
+				local _, why = inform._dfs_reset_radio({channel = "auto"}, "phy1-ap0")
+				assert_eq(why, "channel is not pinned", "and refused up front")
+
+				-- A radio the controller turned off is not woken up.
+				cmds, said = {}, ""
+				inform._ucihelper.get_radio_table = function()
+					return {{name = "radio1", radio = "na", channel = 100, disabled = true}}
+				end
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "a disabled radio is skipped")
+				assert_eq(#cmds, 0, "no switch")
+			end)
+			inform._ucihelper, inform._sysinfo = orig.uci, orig.si
+			inform._run_cmd, inform._read_file = orig.run, orig.read
+			inform._time, io.stderr = orig.time, orig.stderr
+			if not ok then error(err, 0) end
+		end
+	},
 }

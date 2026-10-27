@@ -1582,10 +1582,20 @@ a steady state cost no flash writes. Malformed values (a timezone with a quote, 
 server name with a space, a schedule that is not five plain fields) are logged and
 refused.
 
-**Cron runs only commands openUF provides.** The one the controller pushes today is
-`syswrapper.sh 11k-scan` at `0 4 * * *`, the nightly neighbour scan. Anything else is
-logged as `not a command this build provides` and never written: crond runs it as
-root. The pushed `cron.<n>.user` is ignored, since that account does not exist here.
+**Cron runs only commands openUF provides.** 10.6.106 can push exactly four, and this
+is the whole list (every `syswrapper.sh` string in the controller — see
+PROTOCOL-VALIDATION.md § *Axis 4*):
+
+| Pushed command | Schedule | Pushed when | openUF |
+|---|---|---|---|
+| `syswrapper.sh schedule-action` | `1-59/5 * * * *` | any WLAN has a schedule | **No crontab line:** the WiFi Blackout Schedule is re-checked on every heartbeat (`wlansched.lua`) |
+| `syswrapper.sh refresh-walled-garden 1` | `*/10 * * * *` | a guest portal with a walled garden | **No crontab line:** the garden's domains are re-resolved on the same ten minutes (`inform._guest_wg_resync`) |
+| `syswrapper.sh dfs-reset` | `0 2 * * *` | a 5 GHz radio pinned to a DFS channel the site's country allows | **Installed** — see below |
+| `syswrapper.sh 11k-scan` | `0 4 * * *` | Fast Roaming on any WLAN | **Installed** — see below |
+
+Anything else is logged as `not a command this build provides` and never written: crond
+runs it as root. The pushed `cron.<n>.user` is ignored, since that account does not
+exist here.
 
 `syswrapper.sh 11k-scan` does not scan by itself. As UniFi firmware does (`elevenk_scan`),
 it picks two scan times within the next hour: the first 10 s plus a random delay out,
@@ -1605,6 +1615,45 @@ as the only line:
 ```sh
 date +%s > /tmp/openuf-scan-request
 logread -e openuf | grep 11k-scan   # "11k-scan requested -- scanned 2 radio(s)"
+```
+
+#### `dfs-reset`: back onto a pinned DFS channel
+
+A radar detection takes a 5 GHz radio off its channel for at least 30 minutes, and
+nothing brings it back: the radio keeps serving clients on whatever channel the driver
+moved to, so a planned DFS cell quietly stays wrong until someone re-provisions the AP.
+That is what this job is for, and the controller schedules it on its own as soon as a
+radio is pinned to a DFS channel — no configuration here.
+
+Like `11k-scan`, the hook does no radio work. It writes one timestamp to
+`/tmp/openuf-dfs-reset-request` and the inform daemon acts on the next heartbeat; a
+request older than 30 minutes (the daemon or the AP was down when crond fired) is
+dropped rather than carried out hours late. Per enabled 5 GHz radio, in the order the
+UniFi firmware's own `dfs_reset` checks:
+
+1. the radio must be **pinned**: a channel of `auto` (or `0`) is the controller's
+   intent to let the driver choose, and is left alone, silently;
+2. the live channel (`iw dev <if> info`) is compared with the configured one
+   (`wireless.<radio>.channel`) — equal means there is nothing to do, which is the
+   case on every night but the one after a radar hit;
+3. if the configured channel is a DFS channel, mac80211's per-channel state
+   (`iw phy phyN channels`) must not be `unavailable` — that is the non-occupancy
+   list, and the kernel would refuse the switch. The job logs how long is left and
+   waits for the next night;
+4. otherwise the BSS is told to move: `hostapd_cli -i <bss> chan_switch 5 <freq>
+   sec_channel_offset=± center_freq1=<c> bandwidth=<w> ht|vht`, rebuilt from the live
+   operating width so an 80 MHz cell comes back as 80 MHz.
+
+UCI is never written — it already holds the configured channel. The radio does go
+quiet for the channel-availability check on arrival (60 s on most DFS channels), which
+is why the controller schedules this at 02:00.
+
+```sh
+/usr/bin/syswrapper.sh dfs-reset               # ask for it now
+logread -e openuf | grep dfs-reset
+# "phy1-ap0 switching back from channel 36 to the configured 100 (5500 ...)"
+# "100 is still on the non-occupancy list for another 1766 s -- waiting for the next run"
+iw phy phy1 channels | grep -A5 "5500 MHz"     # the kernel's own DFS state
 ```
 
 To take a board back from the controller's timezone, copy `openuf_timezone_orig` back
@@ -1724,6 +1773,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | A Passpoint WLAN is on the air but clients see no ANQP data | Read hostapd's own truth: `grep -E "^(interworking|hs20|nai_realm|venue_name|venue_url|roaming_consortium|domain_name|anqp_3gpp_cell_net|hs20_oper_friendly_name|hs20_conn_capab|hs20_wan_metrics)=" /var/run/hostapd-phy*.conf`. New wifi-iface options need a **Force Provision** from the controller; a restart alone does not apply them. Plain `iw` will not show you the elements — ANQP answers are sent on request, not beaconed |
 | The Passpoint WLAN's BSS does not come up at all after a profile change | A malformed value in a hostapd config is a **parse error, and hostapd then refuses the whole BSS**, not just the line. `logread | grep -i "Line \|Invalid"` right after a provision names the offending line. If it is one openUF wrote, report it: every mapped line is validated against a real hostapd, so a rejected one is a bug, not a setting |
 | EAP clients authenticate but are then refused | The RADIUS profile has "RADIUS assigned VLAN: required" (`dynamic_vlan=2` in `hostapd-phy*.conf`) and the server returned a VLAN this AP has no network for — `cat /var/run/hostapd-<ifname>.vlan` lists the only ones it can honour. Set the mode to optional, or put the WLAN on a network that already carries those VLANs |
+| A 5 GHz radio is on the wrong channel after a radar hit and stays there | `sed -n '/openuf-cron-begin/,/openuf-cron-end/p' /etc/crontabs/root` must carry `0 2 * * * /usr/bin/syswrapper.sh dfs-reset`; if it does not, the controller is not pushing the job — it only does so for a radio pinned to a DFS channel the site's country allows (`uci get wireless.<radio>.channel` must be a number, not `auto`). Run `/usr/bin/syswrapper.sh dfs-reset` to ask for it now; `logread \| grep dfs-reset` gives the reason it was left alone. The commonest one is the non-occupancy list: `iw phy phy<N> channels` shows the channel as `DFS state: unavailable` with the time left, and openUF waits for that rather than announce a switch the kernel will refuse |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Airtime Fairness switch does nothing | `ls /sys/kernel/debug/ieee80211/phy*/airtime_flags` must list a file per radio. Without it openUF does not claim `wifi_caps` bit `0x20` and the controller sends no `atf.*` at all (debugfs not mounted, or a kernel without `CONFIG_MAC80211_DEBUGFS`). `cat` it after a push: two flag names for on, none for off. A driver that does not schedule through mac80211 TXQs ignores the flags |
 | No "Possible interference" warning, ever | Only ath9k radios report the counters it needs. `cat /sys/kernel/debug/ieee80211/phy*/ath9k/interrupt` shows `GTT` (tx timeouts) and `CST` (carrier-sense timeouts); the controller warns when either rises faster than 10 per second, at most every 5 minutes per radio. A healthy radio stays far below that. ath10k and mt76 keep no such counters, so their radios never warn. Debugfs must be mounted, as it is on OpenWrt by default |
