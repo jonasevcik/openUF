@@ -772,6 +772,70 @@ return {
 		end
 	},
 	{
+		name = "inform packet: per-BSS okc, tdls_prohibit, country_beacon and the pairwise cipher",
+		fn = function()
+			-- Verbatim shapes from a 10.6.106 capture (lab, 2026-10-26),
+			-- diffed across the wlanconf's auth_cache / tdls_prohibit /
+			-- country_beacon / wpa_enc fields -- every one of them changed,
+			-- so none is a decoy. auth_cache rides only the WPA-Enterprise
+			-- branch of the generator, which is why the PSK vap below has
+			-- none: see the vap table's comments.
+			local psk = "aaa.1.ssid=net\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.1.wpa.psk=secret\naaa.1.tdls_prohibit=enabled\n"
+				.. "aaa.1.country_beacon=enabled\naaa.1.wpa.1.pairwise=GCMP\n"
+				.. "wireless.1.ssid=net\nwireless.1.parent=radio0\n"
+			local rt, vt = inform._parse_wifi_system_cfg(psk)
+			assert_nil(vt[1].okc, "no auth_cache on a PSK WLAN -> nil, not false")
+			assert_not_nil(rt, "radio_table comes back too")
+			assert_true(vt[1].tdls_prohibit, "tdls_prohibit=enabled")
+			assert_true(vt[1].country_beacon, "country_beacon=enabled")
+			assert_eq(vt[1].pairwise, "gcmp", "GCMP -> the encryption suffix token")
+
+			local off = psk:gsub("=enabled", "=disabled")
+				:gsub("pairwise=GCMP", "pairwise=CCMP")
+			rt, vt = inform._parse_wifi_system_cfg(off)
+			assert_false(vt[1].tdls_prohibit, "tdls_prohibit=disabled")
+			assert_false(vt[1].country_beacon, "country_beacon=disabled")
+			assert_nil(vt[1].pairwise,
+				"CCMP is OpenWrt's own default -- no suffix is written for it")
+
+			-- The other three values the generator's enum can reach. GCMP-256
+			-- is refused by the controller's validator today and mapped only
+			-- because the enum carries it; "TKIP CCMP" (a WPA1 WLAN) is
+			-- declined outright.
+			for wire, token in pairs({["CCMP-256"] = "ccmp256",
+					["GCMP-256"] = "gcmp256"}) do
+				rt, vt = inform._parse_wifi_system_cfg(
+					(psk:gsub("pairwise=GCMP", "pairwise=" .. wire)))
+				assert_eq(vt[1].pairwise, token, wire .. " -> " .. token)
+			end
+			for _, wire in ipairs({"TKIP CCMP", "TKIP", "", "AES"}) do
+				rt, vt = inform._parse_wifi_system_cfg(
+					(psk:gsub("pairwise=GCMP", "pairwise=" .. wire)))
+				assert_nil(vt[1].pairwise, "declined on the wire: " .. wire)
+			end
+		end
+	},
+	{
+		name = "inform packet: auth_cache rides the WPA-Enterprise branch and becomes okc",
+		fn = function()
+			-- The one WLAN kind the controller sends auth_cache on, captured
+			-- 2026-10-26: default enabled, and it flips with the field.
+			local eap = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.auth_cache=enabled\naaa.1.tdls_prohibit=disabled\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\n"
+				.. "aaa.1.radius.auth.1.port=1812\n"
+				.. "aaa.1.radius.auth.1.secret=shh\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local rt, vt = inform._parse_wifi_system_cfg(eap)
+			assert_eq(vt[1].security, "wpa2-enterprise", "the EAP branch")
+			assert_true(vt[1].okc, "auth_cache=enabled -> okc on")
+			rt, vt = inform._parse_wifi_system_cfg(
+				(eap:gsub("auth_cache=enabled", "auth_cache=disabled")))
+			assert_false(vt[1].okc, "auth_cache=disabled -> okc off, not nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg reads Roaming Assistant (btm_disassoc) per vap",
 		fn = function()
 			-- Wire format from the decompiled 10.6.101 generator: status is the

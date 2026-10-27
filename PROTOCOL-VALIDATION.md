@@ -1498,6 +1498,10 @@ an **absent block means disabled** — there is generally no explicit `status=fa
 | `bss_transition` | 802.11v. Present on every band's block, flips independently of Fast Roaming. |
 | `br.devname` | `br0` untagged, **`br0.<vlan>`** when the WLAN is assigned to a VLAN network — CONFIRMED live 2026-08-01, the first capture of a tagged WLAN on real hardware. This suffix is the *only* per-WLAN VLAN signal; there is no `network_table`/`networkconf_id` join anywhere in the wire format. |
 | `sae.anti_clogging` / `sae.sync` | Plain integers, emitted only when > 0 **and** the WLAN is genuinely WPA3 (see below). |
+| `auth_cache` | Opportunistic key caching, from the wlanconf's `auth_cache` — `is("auth_cache", true)`, so **default enabled**. REST-only; the 10.6 UI has no control. Emitted **only in the generator branch that also writes `wpa.key.1.mgmt` + `wpa.psk`**, and only ever observed on a WPA-Enterprise WLAN: a WPA2-PSK WLAN's `aaa` block carries no `auth_cache` at all, consistent with OKC being an 802.1X notion. Lab-confirmed 2026-10-26 against 10.6.106: flipping the field flipped `enabled`/`disabled` on both band entries. → OpenWrt `okc` (schema-confirmed on 25.12; `ap.uc`'s own default is on for sae/owe and for FT). |
+| `tdls_prohibit` | Forbid direct station-to-station (TDLS) links, from the wlanconf's `tdls_prohibit` (REST-only), default disabled, on **every** `aaa` block. Lab-confirmed 2026-10-26 the same way. → OpenWrt `tdls_prohibit`, 1:1 (schema-confirmed on 25.12). |
+| `country_beacon` | Advertise the regulatory domain in beacons (the 802.11d Country IE), from the wlanconf's `country_beacon` — `is("country_beacon", false)`, REST-only, on every `aaa` block. Lab-confirmed 2026-10-26 the same way. OpenWrt's counterpart `ieee80211d` is a **wifi-device** option, so openUF collapses the per-BSS key to one setting per radio: *any* WLAN on the radio asking for it turns it on. The element is an advertisement, not a restriction, so the permissive fold costs the other WLANs nothing. No guard on a country being configured is needed — `hostapd.uc`'s `device_country_append()` returns before emitting `ieee80211d` when no radio declares a country, so the option cannot reach hostapd unaccompanied (hostapd itself treats it as fatal). |
+| `wpa.1.pairwise` | The pairwise cipher the controller chose, from the wlanconf's `wpa_enc` through `com.ubnt.i.b.aL.kYktyHCkPVCBdJC`: the enum is `{auto, ccmp, gcmp, ccmp-256, gcmp-256}`, `auto` becomes `CCMP` (or `TKIP CCMP` on a WPA1 WLAN) and every other value is the name upper-cased. Lab-confirmed 2026-10-26: `ccmp`, `ccmp-256` and `gcmp` all reach the wire; **`gcmp-256` is refused by the controller's own validator** and normalised back to `auto`, on both a PSK and an EAP WLAN. → the second `+` token of OpenWrt's `encryption` (`psk2+gcmp`), which is where `iface.uc` reads a cipher from. `CCMP` deliberately writes nothing: it is `iface.uc`'s own final default, so a suffix for it would change nothing and mask a genuine default. `TKIP CCMP` is declined — it appears only on a WPA1 WLAN, openUF maps no security value to WPA1, and TKIP is forbidden by WPA2 and WPA3 certification. **Gated on the radio's cipher suites** — see below. |
 | `driver` | `madwifi` — confirms the controller is talking to this model as madwifi-era firmware, which explains several value encodings below. |
 
 A VLAN assignment also produces companion `vlan.*`, `bridge.*` and `netconf.*` blocks.
@@ -1545,6 +1549,64 @@ WLAN therefore never emits these keys. Wrong: the WLAN-side gate passes; what su
 whole SAE block is the *per-device radio* capability check described in the WPA3 section.)
 openUF maps them to hostapd's `sae_anti_clogging_threshold` / `sae_sync` through `hostapd_bss_options` (feature 27).
 Neither is a wifi-iface UCI option; the radio-level `hostapd_options` is ignored for a BSS.
+
+**A pairwise cipher must be gated on the radio, not on the band or the board.**
+`iw` 6.17 on 25.12 prints no Supported Ciphers block at all, so openUF reads the suites
+from nl80211 directly (`ucode -l nl80211`, `NL80211_CMD_GET_WIPHY` → `cipher_suites`,
+IEEE 802.11 Table 12-4's `0x000FAC<n>`). Read on hardware 2026-10-26:
+
+| Board | 2.4 GHz phy | 5 GHz phy |
+|---|---|---|
+| Archer C5 v1 (ath9k + ath10k) | CCMP, CCMP-256, GCMP, GCMP-256 | **CCMP only** |
+| Xiaomi AX3000T (mt76) | CCMP, CCMP-256, GCMP, GCMP-256 | CCMP, CCMP-256, GCMP, GCMP-256 |
+
+The Archer C5 is the case that matters and is not what anyone would guess: its *older*
+ath9k 2.4 GHz radio has GCMP and its newer ath10k 5 GHz radio does not. hostapd treats a
+pairwise cipher the driver cannot program as fatal, so writing `psk2+gcmp` on that 5 GHz
+BSS takes the WLAN off the air entirely — strictly worse than running the default CCMP.
+openUF therefore keeps the default and logs the refusal. Where two radios serve one band
+the band's set is the **intersection**: a WLAN there can land on either radio. An unknown
+or failed probe is treated as unknown and never vetoes, like every other clamp.
+
+**Confirmed end to end on the production APs, 2026-10-27.** A `force-provision` through the
+real UCG Ultra (10.6, `POST cmd/devmgr` from the logged-in UI session) put the new keys into
+real UCI and through the live generator on **both** boards — the one thing the Docker lab
+cannot show, since it has no radios, no hostapd and no `uci`:
+
+| Read back | Archer C5 (ath79) | AX3000T (filogic/DSA) |
+|---|---|---|
+| `wireless.<vap>.tdls_prohibit` | `'0'` on all 3 WLANs | `'0'` on all 3 WLANs |
+| `wireless.radio{0,1}.ieee80211d` | `'0'` | `'0'` |
+| `/var/run/hostapd-phy*.conf` | `tdls_prohibit=0` in every BSS block | same |
+| hostapd config errors in `logread` | 0 | 0 |
+
+So both options survive netifd's schema gate and reach hostapd: this is the live proof that
+the step-1 options are not among the "stored and silently dropped" class. Two caveats, stated
+plainly. `country_beacon` is `disabled` site-wide here, so `ieee80211d='0'` is the only value
+proven on hardware; and `hostapd-phy*.conf` carries `okc=1`/`okc=0` lines that openUF did
+**not** write — `uci show wireless` has no `okc` at all, so those are the 25.12 generator's own
+defaults. Neither AP runs a WPA-Enterprise WLAN, so the `auth_cache` → `okc` path stays
+lab-only. The push also carried `wpa.1.pairwise=CCMP`, and openUF correctly wrote no suffix:
+hostapd kept `wpa_pairwise=CCMP`.
+
+**Three keys on this block are declines, each for a named reason** (10.6.106 generator
+`com.ubnt.service.config.VAZShipWTNxlo`, read 2026-10-26):
+
+- `wireless.<n>.wmm` — a hardcoded `"enabled"` **string literal** in the generator's
+  62-element `wireless.<n>` array, not read from the wlanconf at all. A constant is a
+  decoy by definition. OpenWrt has no `wmm_enabled` in `wireless.wifi-iface.json` either,
+  and hostapd defaults it on for any HT/VHT/HE BSS.
+- `aaa.<n>.eapol_version` — derived, not configured: the generator writes
+  `securityProtocol.eapolVersion()`, which is `1` for `wpa_mode=wpa1` and `2` for
+  everything else. openUF maps no controller security value to WPA1, so the only value it
+  can ever receive is `2`, which is hostapd's own default.
+- `aaa.<n>.p2p` and `aaa.<n>.p2p_cross_connect` — genuine settings (wlanconf `p2p` /
+  `p2p_cross_connect`, default disabled, **lab-confirmed 2026-10-26 to flip on the wire**),
+  but there is no consumer: hostapd's `manage_p2p` / `allow_cross_connection` are absent
+  from the OpenWrt 25.12 binary (`grep` over `/usr/sbin/hostapd` on both boards finds
+  neither string — built without `CONFIG_P2P_MANAGER`), and absent from the netifd schema.
+  Writing them as raw BSS lines would make hostapd reject its own config file. Revisit only
+  if an OpenWrt release ships the P2P manager.
 
 ### `aaa.<n>.radius.*` — WPA-Enterprise (802.1X)
 

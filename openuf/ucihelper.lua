@@ -193,7 +193,52 @@ end
 -- actually lists, NOT by its "Band N:" index -- that index is assigned per
 -- driver (this project's ath9k radio reports 2.4GHz as Band 1, its ath10k
 -- radio reports 5GHz as Band 2) and means nothing on its own.
-local function parse_phy_caps(out)
+-- The pairwise cipher suite selectors nl80211 reports per wiphy
+-- (IEEE 802.11 Table 12-4: 0x000FAC<n>), keyed by the token OpenWrt's
+-- `encryption` string names them with -- iface.uc's second `+` token. Only the
+-- ciphers the controller can actually ask for are listed; TKIP and the WEP
+-- selectors are deliberately absent (see _wire_pairwise in inform.lua).
+local CIPHER_SELECTOR = {
+	ccmp    = 1027076,   -- 0x000FAC04
+	gcmp    = 1027080,   -- 0x000FAC08
+	gcmp256 = 1027081,   -- 0x000FAC09
+	ccmp256 = 1027082,   -- 0x000FAC0A
+}
+
+-- `iw phy` does NOT list cipher suites on this target (iw 6.17 on 25.12 prints
+-- no Supported Ciphers block at all, verified on both boards 2026-10-26), so
+-- the one reliable local source is nl80211 itself. ucode and its nl80211
+-- binding ship with the wifi stack on 25.12 and are present on both boards.
+-- Output is one line per phy: "<phyname> <selector> <selector> ...".
+local CIPHER_PROBE = "ucode -l nl80211 -e '"
+	.. "let r = nl80211.request(nl80211.const.NL80211_CMD_GET_WIPHY, "
+	.. "nl80211.const.NLM_F_DUMP, {}); "
+	.. "for (let w in r) print(w.wiphy_name + \" \" "
+	.. "+ join(\" \", w.cipher_suites || []) + \"\\n\");' 2>/dev/null"
+
+-- "phy0 1027076 1027080 ..." -> {phy0 = {ccmp = true, gcmp = true, ...}}.
+-- A phy that reports no suites at all is left OUT of the result rather than
+-- recorded as an empty set: "the probe told us nothing" must not read as "this
+-- radio supports no cipher", which would veto every override.
+local function parse_cipher_suites(out)
+	local by_phy = {}
+	for line in (tostring(out) .. "\n"):gmatch("([^\n]*)\n") do
+		local name, rest = line:match("^(phy%w+)%s+(.*)$")
+		if name and rest ~= "" then
+			local set = {}
+			for sel in rest:gmatch("%d+") do
+				local n = tonumber(sel)
+				for token, want in pairs(CIPHER_SELECTOR) do
+					if n == want then set[token] = true end
+				end
+			end
+			if next(set) then by_phy[name] = set end
+		end
+	end
+	return by_phy
+end
+
+local function parse_phy_caps(out, ciphers_by_phy)
 	local bands, cur, phy = {}, nil, nil
 	for line in (tostring(out) .. "\n"):gmatch("([^\n]*)\n") do
 		-- Phy-level lines carry exactly one leading tab; a Band block's
@@ -202,7 +247,10 @@ local function parse_phy_caps(out)
 		-- extended-feature list below) would be attributed to whichever band
 		-- happened to be last.
 		if line:match("^%s*Wiphy%s") then
-			phy = {beacon_rate = false, bands = {}}
+			-- The name is kept so the cipher probe, which is keyed by phy and
+			-- not by band, can be attributed to the right radio.
+			phy = {beacon_rate = false, bands = {},
+				name = line:match("^%s*Wiphy%s+(%S+)")}
 			cur = nil
 		elseif line:match("^\tBand %d+:") then
 			cur = {ht40 = false, vht = false, he = false, eht = false,
@@ -276,6 +324,10 @@ local function parse_phy_caps(out)
 				max_width = width,
 				max_txpower = b.txpower,
 				beacon_rate = (b.phy and b.phy.beacon_rate) or false,
+				-- nil, not {}, when the probe said nothing about this phy --
+				-- cipher_ok() treats nil as "unknown, don't veto".
+				ciphers = (b.phy and b.phy.name and ciphers_by_phy
+					and ciphers_by_phy[b.phy.name]) or nil,
 			}
 			if prev then
 				caps[key].max_kind  = math.max(prev.max_kind, caps[key].max_kind)
@@ -284,6 +336,20 @@ local function parse_phy_caps(out)
 					caps[key].max_txpower or 0)
 				if caps[key].max_txpower == 0 then caps[key].max_txpower = nil end
 				caps[key].beacon_rate = prev.beacon_rate or caps[key].beacon_rate
+				-- Ciphers fold the other way from every capability above:
+				-- the INTERSECTION, because a WLAN on this band may land on
+				-- either radio and a cipher one of them cannot program is a
+				-- hostapd that refuses to start. Unknown on either side
+				-- (nil) means unknown for the band.
+				if prev.ciphers and caps[key].ciphers then
+					local both = {}
+					for token in pairs(prev.ciphers) do
+						if caps[key].ciphers[token] then both[token] = true end
+					end
+					caps[key].ciphers = next(both) and both or nil
+				else
+					caps[key].ciphers = nil
+				end
 			end
 		end
 	end
@@ -304,10 +370,30 @@ function M.phy_caps()
 		end
 	end
 	if not M._phy_caps_cache or stale then
-		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "")
+		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "",
+			parse_cipher_suites(M._popen(CIPHER_PROBE) or ""))
 		M._phy_caps_read_at = now
 	end
 	return M._phy_caps_cache
+end
+
+-- Whether the given band's hardware can program the pairwise cipher the
+-- controller asked for (a token from _wire_pairwise / CIPHER_SELECTOR).
+--
+-- Unknown capabilities return true, like every other clamp here: openUF must
+-- not refuse a controller's request because a probe failed. But a KNOWN set
+-- that lacks the cipher returns false, and the caller keeps the default --
+-- hostapd treats a pairwise cipher the driver cannot program as fatal
+-- ("Failed to set beacon parameters"), so the BSS never comes up at all, which
+-- is strictly worse than running the default CCMP. This is not theoretical on
+-- the documented targets: the Archer C5's 5GHz ath10k phy reports neither GCMP
+-- nor CCMP-256 while its 2.4GHz ath9k phy reports both, and the AX3000T's
+-- mt76 phys report both on both bands (verified on hardware 2026-10-26).
+function M.cipher_ok(band, token)
+	if not token then return true end
+	local caps = M.phy_caps()[band]
+	if not caps or not caps.ciphers then return true end
+	return caps.ciphers[token] == true
 end
 
 -- The best PHY generation the given band's hardware can run ("HT"/"VHT"/
@@ -656,7 +742,11 @@ end
 --           aaa.<n>.id), stashed the same way so get_vap_table() can echo it
 --           back as the vap's "id" -- required for the controller to accept
 --           the vap (and its sta_table) at all.
-function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id)
+-- pairwise: optional pairwise-cipher token ("gcmp", "ccmp256", ...) from
+--           inform.lua's _wire_pairwise, appended to the encryption string
+--           when this radio's hardware can program it. nil keeps the default.
+function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id,
+		pairwise)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Section name includes the radio, not just the SSID: broadcasting the
@@ -697,6 +787,34 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_")
 		.. "_" .. safe_ssid
 	local enc = SECURITY_MAP[security] or "psk2"
+	-- The controller's own pairwise cipher (aaa.<n>.wpa.1.pairwise), as the
+	-- second `+` token of `encryption` -- which is where iface.uc reads a
+	-- cipher from. The base is taken first because SECURITY_MAP already
+	-- carries a suffix for the EAP values ("wpa2+ccmp"), and a second one
+	-- appended after it would be ignored outright.
+	--
+	-- "wpa3-192" is left alone on purpose: iface.uc pins that auth_type to
+	-- GCMP-256 itself, which is what the 192-bit suite requires, so a cipher
+	-- from the wire can only contradict it.
+	local enc_base = enc:match("^([^+]+)") or enc
+	if pairwise and enc_base ~= "none" and enc_base ~= "owe"
+			and enc_base ~= "wpa3-192" then
+		-- The radio's band comes from its own UCI declaration, as in
+		-- apply_config's htmode clamp: the band is fixed by hardware.
+		local band = band_for_device({
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel"),
+		})
+		if M.cipher_ok(band, pairwise) then
+			enc = enc_base .. "+" .. pairwise
+		else
+			io.stderr:write(string.format(
+				"openuf: %s: controller asked for pairwise cipher %s, %s hardware "
+				.. "does not support it -- keeping %s\n",
+				tostring(ssid), pairwise, tostring(band), enc))
+		end
+	end
 	cursor:set("wireless", section_name, "wifi-iface")
 	cursor:set("wireless", section_name, "device", radio)
 	cursor:set("wireless", section_name, "mode", "ap")
@@ -706,7 +824,10 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	if wlanconf_id then
 		cursor:set("wireless", section_name, "openuf_wlanconf_id", wlanconf_id)
 	end
-	if password and PASSPHRASE_ENC[enc] then
+	-- Keyed on the BASE value: PASSPHRASE_ENC is an allow-set of security
+	-- values, and a cipher suffix must not turn a WLAN that takes a
+	-- passphrase into one that silently drops it.
+	if password and PASSPHRASE_ENC[enc_base] then
 		cursor:set("wireless", section_name, "key", password)
 	end
 	-- 802.11r/k/v
@@ -1047,8 +1168,11 @@ end
 -- maxsta: Load balance's per-radio client cap (openuf/loadbalance.lua), kept
 -- in the openUF-only option loadbalance_maxsta; false deletes it (off), nil
 -- leaves UCI alone.
+-- country_beacon: advertise the 802.11d Country IE in this radio's beacons,
+-- collapsed from the per-WLAN aaa.<n>.country_beacon by apply_config. nil
+-- leaves UCI alone (no WLAN on this radio carried the key).
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
-		disabled, country, maxsta)
+		disabled, country, maxsta, country_beacon)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Every write below is cursor:set on a named section, which in UCI CREATES
@@ -1136,6 +1260,19 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		cursor:set("wireless", radio, "loadbalance_maxsta", tostring(maxsta))
 	elseif maxsta == false then
 		cursor:delete("wireless", radio, "loadbalance_maxsta")
+	end
+	-- 802.11d Country IE. Written as an explicit 0 rather than deleted when
+	-- off: hostapd.uc gates `ieee80211d` on its own truthiness, so 0 and
+	-- absent behave identically to hostapd, and writing it keeps the applied
+	-- state visible in UCI -- the same reason the iot flag is recorded.
+	--
+	-- No guard on a country being configured is needed: hostapd itself treats
+	-- ieee80211d=1 without country_code as fatal, but hostapd.uc's
+	-- device_country_append() returns before emitting ieee80211d at all when
+	-- no radio declares a country (read from 25.12's live generator), so the
+	-- option cannot reach hostapd unaccompanied.
+	if country_beacon ~= nil then
+		cursor:set("wireless", radio, "ieee80211d", country_beacon and "1" or "0")
 	end
 	if rates then
 		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives
@@ -1275,6 +1412,26 @@ function M.apply_config(resp, cfg, opts)
 	-- and lock out clients the controller fully intended to admit -- a
 	-- silent, on-air-only failure. VAPs with no floor (the key is absent
 	-- whenever that band's control is off) contribute nothing.
+	-- aaa.<n>.country_beacon arrives per WLAN, but OpenWrt's ieee80211d is a
+	-- wifi-device option and hostapd's Country IE is a per-radio property
+	-- (it rides the radio's beacons, which every BSS on it shares), so the
+	-- per-BSS wire key has to collapse to one setting per radio.
+	--
+	-- The aggregate is "any WLAN on this radio asked for it", i.e. the most
+	-- PERMISSIVE reading, matching rates_by_radio below: the element is an
+	-- advertisement, not a restriction -- clients that ignore it are
+	-- unaffected -- so honouring the one WLAN that wants it costs the others
+	-- nothing, while the opposite fold would silently drop a setting the
+	-- controller was explicitly asked for. nil for a radio no WLAN mentions,
+	-- which leaves UCI alone.
+	local country_beacon_by_radio = {}
+	for _, vap in ipairs(vap_table) do
+		if vap.radio and vap.country_beacon ~= nil then
+			country_beacon_by_radio[vap.radio] =
+				country_beacon_by_radio[vap.radio] or vap.country_beacon
+		end
+	end
+
 	local rates_by_radio = {}
 	for _, vap in ipairs(vap_table) do
 		if vap.radio and vap.minrate_data then
@@ -1313,7 +1470,8 @@ function M.apply_config(resp, cfg, opts)
 			end
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
 				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled,
-				radio.country, radio.loadbalance_maxsta)
+				radio.country, radio.loadbalance_maxsta,
+				country_beacon_by_radio[radio.name])
 		end
 	end
 
@@ -1442,6 +1600,17 @@ function M.apply_config(resp, cfg, opts)
 			-- U-APSD. `uapsd` is hostapd.sh's option and, on 25.12, a schema
 			-- alias of uapsd_advertisement_enabled, so one name covers both.
 			if vap.uapsd ~= nil then extra.uapsd = vap.uapsd and "1" or "0" end
+			-- Opportunistic key caching (aaa.<n>.auth_cache). Sent only on a
+			-- WPA-Enterprise WLAN, so nil everywhere else and OpenWrt's own
+			-- default stands. ap.uc also writes disable_pmksa_caching from
+			-- the inverse, but only `okc` is in the 25.12 schema, so an
+			-- explicit 0 is the whole of "off" that is available.
+			if vap.okc ~= nil then extra.okc = vap.okc and "1" or "0" end
+			-- Forbid direct station-to-station links (aaa.<n>.tdls_prohibit).
+			-- On the wire for every WLAN, so this always writes.
+			if vap.tdls_prohibit ~= nil then
+				extra.tdls_prohibit = vap.tdls_prohibit and "1" or "0"
+			end
 			-- GTK rekey interval (s, 0 = off); hostapd's own default is 86400.
 			if vap.group_rekey then extra.wpa_group_rekey = vap.group_rekey end
 			-- SAE tuning, as the firmware writes it (6.8.2 ubntbox). Only on a WLAN
@@ -1846,7 +2015,7 @@ function M.apply_config(resp, cfg, opts)
 			end
 
 			local section = M.wlan_add(vap.radio, vap.ssid, vap.security,
-				vap.x_passphrase, extra, network, vap.wlanconf_id)
+				vap.x_passphrase, extra, network, vap.wlanconf_id, vap.pairwise)
 			if vap.ppsk and section then
 				M.ppsk_add(section, vap.ppsk, vlan_networks)
 			end

@@ -2276,6 +2276,40 @@ local function _wire_posint(v)
 	return n > 0 and tostring(n) or nil
 end
 
+-- aaa.<n>.wpa.1.pairwise: the WLAN's pairwise cipher, as the controller's own
+-- authoritative answer rather than openUF's derivation from the akm set.
+-- CONFIRMED live 2026-10-26 against 10.6.106 by diffing system_cfg across the
+-- wlanconf's `wpa_enc` field (REST-only; the 10.6 UI has no control): the
+-- generator maps the enum {auto, ccmp, gcmp, ccmp-256, gcmp-256} through
+-- com.ubnt.i.b.aL.kYktyHCkPVCBdJC, where `auto` becomes "CCMP" -- or
+-- "TKIP CCMP" on a WPA1 WLAN -- and every other value is the name upper-cased.
+-- Observed on the wire: CCMP (auto/ccmp), CCMP-256, GCMP. `gcmp-256` is
+-- refused by the controller's own validator and normalised back to auto, so it
+-- cannot arrive; it is mapped anyway because the enum carries it and a later
+-- build may let it through.
+--
+-- The return value is the cipher token for OpenWrt's `encryption` string
+-- (iface.uc's second `+` token), NOT a hostapd wpa_pairwise value.
+-- "CCMP" returns nil on purpose: it is what every WLAN openUF provisions gets
+-- by default (iface.uc's final `wpa_pairwise ??= 'CCMP'`), so carrying it
+-- would add a suffix that changes nothing and mask a genuine default.
+--
+-- "TKIP CCMP" is deliberately declined: it appears only on a WPA1-mode WLAN,
+-- openUF maps no controller security value to WPA1 at all, and TKIP is
+-- forbidden by both WPA2 and WPA3 certification. Anything else unrecognised is
+-- nil, which leaves the default in place rather than writing a cipher the
+-- driver may not have.
+local PAIRWISE_SUFFIX = {
+	["CCMP-256"] = "ccmp256",
+	["GCMP"]     = "gcmp",
+	["GCMP-256"] = "gcmp256",
+}
+
+local function _wire_pairwise(v)
+	if type(v) ~= "string" then return nil end
+	return PAIRWISE_SUFFIX[v:upper()]
+end
+
 -- aaa.<n>.sae.groups.<k>.group, in index order, as hostapd's space-separated
 -- sae_groups; nil unless sae.has_groups is on and every entry is a number.
 local function _wire_sae_groups(a)
@@ -3164,6 +3198,37 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- UniFi firmware runs `iwpriv <ath> rrm 0|1` with it
 				-- (firmware-confirmed for 4.0.15). nil when absent.
 				rrm                   = _wire_bool(a["11k.status"]),
+				-- aaa.<n>.auth_cache: opportunistic key caching / PMKSA
+				-- caching, from the wlanconf's `auth_cache` (REST-only, the
+				-- 10.6 UI has no control), DEFAULT ENABLED. CONFIRMED live
+				-- 2026-10-26 against 10.6.106 by diffing system_cfg across the
+				-- field. Emitted only in the generator's WPA branch that also
+				-- writes wpa.key.1.mgmt + wpa.psk (10.6 VAZShipWTNxlo), and
+				-- only ever observed on a WPA-Enterprise WLAN -- a WPA2-PSK
+				-- WLAN's aaa block carries no auth_cache at all, which is
+				-- consistent with OKC being an 802.1X notion. Maps onto
+				-- OpenWrt's `okc` wifi-iface option (schema-confirmed on
+				-- 25.12; ap.uc's own default is on for sae/owe and for FT).
+				-- nil when absent, so a PSK WLAN is left alone.
+				okc                   = _wire_bool(a.auth_cache),
+				-- aaa.<n>.tdls_prohibit: forbid direct station-to-station
+				-- (TDLS) links, from the wlanconf's `tdls_prohibit` (REST-only),
+				-- default disabled, on every aaa block. CONFIRMED live
+				-- 2026-10-26 the same way. Maps 1:1 onto OpenWrt's
+				-- `tdls_prohibit` wifi-iface option (schema-confirmed on 25.12).
+				tdls_prohibit         = _wire_bool(a.tdls_prohibit),
+				-- aaa.<n>.country_beacon: advertise the regulatory domain in
+				-- beacons (the 802.11d Country information element), from the
+				-- wlanconf's `country_beacon` (REST-only), default disabled,
+				-- on every aaa block. CONFIRMED live 2026-10-26 the same way.
+				-- OpenWrt's counterpart, `ieee80211d`, is a wifi-DEVICE
+				-- option, so apply_config has to collapse the per-BSS wire key
+				-- to one setting per radio -- see its aggregation.
+				country_beacon        = _wire_bool(a.country_beacon),
+				-- aaa.<n>.wpa.1.pairwise: the pairwise cipher the controller
+				-- actually chose -- see _wire_pairwise for the enum, what
+				-- reaches the wire and why CCMP comes back as nil.
+				pairwise              = _wire_pairwise(a["wpa.1.pairwise"]),
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
 				-- {key=, vid=} per private pre-shared key, in wire order;

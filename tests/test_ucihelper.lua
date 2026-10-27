@@ -225,6 +225,36 @@ Wiphy phy0
 		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
 ]]
 
+-- Real cipher-suite output from the same two boards, read over ucode's
+-- nl80211 binding on 2026-10-26 (`iw` 6.17 prints no Supported Ciphers block
+-- on 25.12, which is why the probe is a separate command at all). The
+-- selectors are IEEE 802.11 Table 12-4's 0x000FAC<n>.
+--
+-- The Archer C5 is the interesting one and is not what anyone would guess:
+-- its OLDER ath9k 2.4GHz radio (phy1) reports GCMP, GCMP-256 and CCMP-256,
+-- while its newer ath10k 5GHz radio (phy0) reports none of them. So a
+-- controller asking for GCMP has to be honoured on one band of this board and
+-- refused on the other -- refusing is what keeps hostapd from failing to start
+-- and taking the BSS off the air entirely.
+local ARCHER_C5_CIPHERS = "phy0 1027073 1027077 1027074 1027076 1027078 "
+	.. "1027085 1027083 1027084\n"
+	.. "phy1 1027073 1027077 1027074 1027076 1027082 1027080 1027081 "
+	.. "1027078 1027085 1027083 1027084\n"
+
+-- The AX3000T's mt76 phys report the full set on both bands.
+local AX3000T_CIPHERS = "phy0 1027076 1027080 1027081 1027082\n"
+	.. "phy1 1027076 1027080 1027081 1027082\n"
+
+-- Route each of phy_caps's two probes to its own fixture. Anything else (the
+-- ubus/ifname reads with_ucihelper stubs out) stays empty.
+local function phy_probe(iw_out, cipher_out)
+	return function(cmd)
+		if tostring(cmd):match("^iw phy") then return iw_out end
+		if tostring(cmd):match("^ucode ") then return cipher_out or "" end
+		return ""
+	end
+end
+
 -- The same board if its 2.4GHz driver COULD set the beacon frame rate, to pin
 -- the capability gate in both directions. Only that phy's extended-feature
 -- list differs -- BEACON_RATE_LEGACY is reported per phy, and the gate has to
@@ -3438,8 +3468,15 @@ return {
 			-- its TX Power slider, was then the wrong regdomain's.
 			local orig_popen, orig_time = ucihelper._popen, ucihelper._time
 			local reads, clock = 0, 1000
+			local function count_iw_read(cmd)
+				if tostring(cmd):match("^iw phy") then reads = reads + 1 end
+				return ""
+			end
 			ucihelper._time = function() return clock end
-			ucihelper._popen = function() reads = reads + 1; return "" end
+			-- Only the `iw phy` read is counted: phy_caps also runs the
+			-- nl80211 cipher probe, and this test is about the caching of
+			-- the capability read, not about how many commands it takes.
+			ucihelper._popen = count_iw_read
 			ucihelper._phy_caps_cache = nil
 			ucihelper._phy_caps_read_at = nil
 			ucihelper._phy_caps_unstable_until = nil
@@ -3453,10 +3490,16 @@ return {
 				local cursor = ucihelper._uci.cursor()
 				cursor:set("wireless", "radio0", "band", "5g")
 				ucihelper._time = function() return clock end
-				ucihelper._popen = function() reads = reads + 1; return "" end
+				-- Only the `iw phy` read is counted: phy_caps also runs the
+			-- nl80211 cipher probe, and this test is about the caching of
+			-- the capability read, not about how many commands it takes.
+			ucihelper._popen = count_iw_read
 				ucihelper.rf_config("radio0", nil, nil, nil, nil, nil, nil, nil, "PA")
 			end)
-			ucihelper._popen = function() reads = reads + 1; return "" end
+			-- Only the `iw phy` read is counted: phy_caps also runs the
+			-- nl80211 cipher probe, and this test is about the caching of
+			-- the capability read, not about how many commands it takes.
+			ucihelper._popen = count_iw_read
 
 			reads = 0
 			ucihelper.phy_caps()
@@ -3752,6 +3795,201 @@ return {
 			ucihelper._popen = function() return "" end
 			assert_eq(#ucihelper.ap_ifnames(), 0, "no ubus answer -> empty")
 			ucihelper._popen = orig
+		end
+	},
+	{
+		name = "ucihelper: two radios on one band expose only the ciphers BOTH can program",
+		fn = function()
+			with_ucihelper(function()
+				-- Rare, but real: a 2.4GHz-only phy beside a dual-band one.
+				-- A WLAN on that band can land on either radio, so the band's
+				-- cipher set has to be the intersection -- a union would hand
+				-- one radio a cipher it cannot program, and hostapd treats
+				-- that as fatal.
+				local two = ARCHER_C5_IW_PHY .. [[
+Wiphy phy2
+	Band 1:
+		Capabilities: 0x11ef
+			HT20/HT40
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+]]
+				ucihelper._popen = phy_probe(two, ARCHER_C5_CIPHERS
+					.. "phy2 1027076 1027082\n")
+				ucihelper._phy_caps_cache = nil
+				assert_true(ucihelper.cipher_ok("ng", "ccmp256"),
+					"both 2.4GHz phys report CCMP-256")
+				assert_false(ucihelper.cipher_ok("ng", "gcmp"),
+					"only one of them reports GCMP, so the band does not")
+
+				-- And a phy the probe said nothing about makes the band
+				-- unknown rather than empty: unknown never vetoes.
+				ucihelper._popen = phy_probe(two, ARCHER_C5_CIPHERS)
+				ucihelper._phy_caps_cache = nil
+				assert_true(ucihelper.cipher_ok("ng", "gcmp"),
+					"one unprobed phy on the band -> unknown, not a veto")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the controller's pairwise cipher is honoured only where the radio can program it",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = phy_probe(ARCHER_C5_IW_PHY, ARCHER_C5_CIPHERS)
+				ucihelper._phy_caps_cache = nil
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "5g")
+				cursor:set("wireless", "radio1", "band", "2g")
+				local warn = {}
+				local real = io.stderr
+				io.stderr = {write = function(_, s) warn[#warn + 1] = s end}
+				local ok, err = pcall(ucihelper.apply_config, {
+					radio_table = {},
+					vap_table = {
+						{ssid = "net", radio = "radio0", security = "wpa2",
+						 x_passphrase = "secret", pairwise = "gcmp"},
+						{ssid = "net", radio = "radio1", security = "wpa2",
+						 x_passphrase = "secret", pairwise = "gcmp"},
+					},
+				}, nil)
+				io.stderr = real
+				if not ok then error(err, 0) end
+				assert_eq(db.wireless.openuf_radio1_net.encryption, "psk2+gcmp",
+					"the ath9k 2.4GHz radio reports GCMP, so the suffix is written")
+				assert_eq(db.wireless.openuf_radio1_net.key, "secret",
+					"and the passphrase still reaches the suffixed section")
+				assert_eq(db.wireless.openuf_radio0_net.encryption, "psk2",
+					"the ath10k 5GHz radio does not, so the default stands")
+				assert_eq(db.wireless.openuf_radio0_net.key, "secret",
+					"the refused WLAN is still a working WPA2 WLAN")
+				assert_true(table.concat(warn):find("does not support it", 1, true) ~= nil,
+					"and the refusal is logged, not silent")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an unknown cipher probe never vetoes a pairwise cipher",
+		fn = function()
+			with_ucihelper(function(db)
+				-- No ucode, no nl80211 binding, unparseable output: openUF
+				-- must not refuse the controller's request because a probe
+				-- failed -- the same contract every other clamp here keeps.
+				ucihelper._popen = phy_probe(ARCHER_C5_IW_PHY, "")
+				ucihelper._phy_caps_cache = nil
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "5g")
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {{ssid = "net", radio = "radio0",
+						security = "wpa2", pairwise = "ccmp256"}},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_net.encryption, "psk2+ccmp256",
+					"unknown capabilities leave the controller's request alone")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a cipher suffix never lands on an EAP, OWE or 192-bit WLAN's base",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = phy_probe(AX3000T_IW_PHY, AX3000T_CIPHERS)
+				ucihelper._phy_caps_cache = nil
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "5g")
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						-- SECURITY_MAP already suffixes this one; a second
+						-- suffix after the first would be ignored outright.
+						{ssid = "eap", radio = "radio0",
+						 security = "wpa2-enterprise", pairwise = "gcmp",
+						 radius = {auth = {{ip = "192.0.2.10", port = 1812,
+							secret = "shh"}}}},
+						-- 192-bit pins GCMP-256 in the generator itself.
+						{ssid = "suiteb", radio = "radio0",
+						 security = "wpa3-enterprise-192", pairwise = "gcmp",
+						 radius = {auth = {{ip = "192.0.2.10", port = 1812,
+							secret = "shh"}}}},
+						{ssid = "open", radio = "radio0", security = "owe",
+						 pairwise = "gcmp"},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_eap.encryption, "wpa2+gcmp",
+					"the EAP base keeps its single, replaced cipher suffix")
+				assert_nil(db.wireless.openuf_radio0_eap.key,
+					"and an EAP BSS still carries no passphrase")
+				assert_eq(db.wireless.openuf_radio0_suiteb.encryption, "wpa3-192",
+					"192-bit is left exactly as the generator wants it")
+				assert_eq(db.wireless.openuf_radio0_open.encryption, "owe",
+					"OWE has no pairwise cipher to override")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes okc and tdls_prohibit per WLAN",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 okc = true, tdls_prohibit = true},
+						{ssid = "guest", radio = "radio0", security = "wpa2",
+						 okc = false, tdls_prohibit = false},
+						{ssid = "bare", radio = "radio0", security = "wpa2"},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.okc, "1", "auth_cache on")
+				assert_eq(db.wireless.openuf_radio0_corp.tdls_prohibit, "1", "TDLS forbidden")
+				assert_eq(db.wireless.openuf_radio0_guest.okc, "0",
+					"off is written explicitly, not left to OpenWrt's default")
+				assert_eq(db.wireless.openuf_radio0_guest.tdls_prohibit, "0", "TDLS allowed")
+				assert_nil(db.wireless.openuf_radio0_bare.okc,
+					"a WLAN the controller sent no auth_cache for is left alone")
+				assert_nil(db.wireless.openuf_radio0_bare.tdls_prohibit, "same for TDLS")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: country_beacon collapses per-WLAN to one ieee80211d per radio",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1", "radio2", "radio3"})
+				ucihelper.apply_config({
+					radio_table = {{name = "radio0"}, {name = "radio1"},
+						{name = "radio2"}, {name = "radio3"}},
+					vap_table = {
+						-- radio0: one WLAN wants the Country IE, one does not.
+						-- The permissive fold wins -- the element is an
+						-- advertisement, not a restriction.
+						{ssid = "a", radio = "radio0", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "b", radio = "radio0", security = "wpa2",
+						 country_beacon = true},
+						-- radio1 repeats radio0 in the opposite ORDER, which
+						-- is what distinguishes the permissive fold from a
+						-- plain last-one-wins assignment.
+						{ssid = "c", radio = "radio1", security = "wpa2",
+						 country_beacon = true},
+						{ssid = "c2", radio = "radio1", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "e", radio = "radio3", security = "wpa2",
+						 country_beacon = false},
+						-- radio2's WLAN carries the key not at all.
+						{ssid = "d", radio = "radio2", security = "wpa2"},
+					},
+				}, nil)
+				assert_eq(db.wireless.radio0.ieee80211d, "1",
+					"any WLAN on the radio asking for it is enough")
+				assert_eq(db.wireless.radio1.ieee80211d, "1",
+					"and the order the WLANs arrive in makes no difference")
+				assert_eq(db.wireless.radio3.ieee80211d, "0",
+					"nobody asked: written off, so the applied state is visible")
+				assert_nil(db.wireless.radio2.ieee80211d,
+					"a radio no WLAN carried the key for is left alone")
+			end)
 		end
 	},
 	{
