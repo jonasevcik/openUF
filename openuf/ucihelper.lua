@@ -613,8 +613,33 @@ function M.vap_vlan_ids(vap)
 	end
 	if vap.vlan_enabled then add(vap.vlan) end
 	for _, k in ipairs(vap.ppsk or {}) do add(k.vid) end
+	-- MAC-based VLANs: each overridden client needs its VLAN's L2 here too,
+	-- or hostapd refuses the station rather than falling back to the VAP's
+	-- own network (ieee802_11_set_radius_info -> hostapd_vlan_valid).
+	for _, e in ipairs(vap.mac_vlans or {}) do add(e.vid) end
 	table.sort(out)
 	return out
+end
+
+-- One wifi-vlan section for `vid` on the VAP in wifi-iface section `iface`,
+-- bound to UCI network `net`. Shared by the private-pre-shared-key and
+-- MAC-based-VLAN paths, which can both want the same VLAN on one VAP: the
+-- section name is derived from the VID alone, so the second writer reuses the
+-- first one's section instead of adding a duplicate vlan_file line.
+--
+-- ap.uc's iface_vlan() turns each one into a `<vid> <ifname>-<name>` line of
+-- hostapd's vlan_file and has netifd put that netdev in the named network's
+-- bridge.
+local function vlan_section(cursor, iface, vid, net)
+	local vs = iface .. "_vlan" .. vid
+	cursor:set("wireless", vs, "wifi-vlan")
+	cursor:set("wireless", vs, "iface", {iface})
+	-- The netdev is <vap ifname>-<name>: "phy0-ap0-20" stays
+	-- inside the 15-character limit, where "v20" might not.
+	cursor:set("wireless", vs, "name", tostring(vid))
+	cursor:set("wireless", vs, "vid", tostring(vid))
+	cursor:set("wireless", vs, "network", {net})
+	return vs
 end
 
 -- Private Pre-Shared Keys for the VAP in wifi-iface section `iface`.
@@ -643,14 +668,7 @@ function M.ppsk_add(iface, keys, networks)
 		else
 			-- Two keys on one VLAN share its section.
 			if k.vid then
-				local vs = iface .. "_vlan" .. k.vid
-				cursor:set("wireless", vs, "wifi-vlan")
-				cursor:set("wireless", vs, "iface", {iface})
-				-- The netdev is <vap ifname>-<name>: "phy0-ap0-20" stays
-				-- inside the 15-character limit, where "v20" might not.
-				cursor:set("wireless", vs, "name", tostring(k.vid))
-				cursor:set("wireless", vs, "vid", tostring(k.vid))
-				cursor:set("wireless", vs, "network", {net})
+				vlan_section(cursor, iface, k.vid, net)
 			end
 			local ss = iface .. "_psk" .. i
 			cursor:set("wireless", ss, "wifi-station")
@@ -661,6 +679,159 @@ function M.ppsk_add(iface, keys, networks)
 				cursor:set("wireless", ss, "vid", tostring(k.vid))
 			end
 		end
+	end
+	cursor:commit("wireless")
+end
+
+-- MAC-based VLANs ("Virtual Network Override"): put a named client on a named
+-- VLAN whatever SSID it joins. The controller sends one list per WLAN
+-- (aaa.<n>.accept_mac.*, see inform.lua's _wire_mac_vlans).
+--
+-- THE CONSUMER is hostapd's accept-MAC list, whose lines take an optional VLAN
+-- id after the address ("<mac> <vid>"). hostapd_check_acl() is consulted on
+-- every authentication BEFORE macaddr_acl is even looked at, and a match
+-- returns ACCEPT carrying that VLAN; a station that is NOT listed falls
+-- through to the macaddr_acl default. So an accept file on its own assigns
+-- VLANs without restricting access -- which is the whole feature. Read out of
+-- hostapd v2.12-devel (src/ap/ieee802_11_auth.c, hostapd/config_file.c), the
+-- build both APs run.
+--
+-- The VLAN must also be in hostapd's vlan_file or the station is REFUSED, not
+-- put on the VAP's own network ("Invalid VLAN %d received from RADIUS server",
+-- ieee802_11_set_radius_info -> hostapd_vlan_valid). Hence a wifi-vlan section
+-- per VLAN, exactly as the private-pre-shared-key path builds them.
+--
+-- THREE WAYS IN, because OpenWrt owns the same file for "MAC Address Filter":
+--  * No filter: openUF's own file via a raw accept_mac_file= line. ap.uc emits
+--    no macaddr_acl, and hostapd's default (0, accept-unless-denied) is what
+--    lets unlisted clients keep joining.
+--  * macfilter=allow: ap.uc writes accept_mac_file ITSELF from `maclist`, plus
+--    macaddr_acl=1. openUF hands its entries to the schema's `macfile` option,
+--    which ap.uc appends to that same file -- and drops those MACs from the
+--    maclist it writes, so each address appears exactly once (two lines for one
+--    station, one with a VLAN and one without, would leave hostapd's bsearch to
+--    pick either). An address NOT already allowed is skipped: adding it would
+--    silently widen the admin's whitelist.
+--  * macfilter=deny: the deny list is a separate file, but the accept list is
+--    checked first -- so a mapped MAC that is also denied would be let in.
+--    Those entries are dropped and the rest go in via the raw line.
+--
+-- REFUSED outright when the WLAN has RADIUS MAC authentication: there
+-- macaddr_acl=2 asks the RADIUS server about every client, and an accept-list
+-- entry returns ACCEPT before the question is asked. A VLAN override is not
+-- worth bypassing an access control.
+local MACVLAN_DIR = "/etc/openuf"
+
+-- Injectable for tests: write `contents` to `path`, true on success.
+M._write_file = function(path, contents)
+	local f = io.open(path, "w")
+	if not f then return false end
+	f:write(contents)
+	f:close()
+	return true
+end
+
+-- Injectable for tests: remove `path`, ignoring an absent file.
+M._remove_file = function(path) os.remove(path) end
+
+-- Where this VAP's accept file lives. Named after the wifi-iface section, which
+-- is derived from radio + SSID and so is stable across pushes.
+function M.mac_vlan_path(section)
+	return MACVLAN_DIR .. "/macvlan-" .. section
+end
+
+-- Decide what (if anything) this VAP's accept file will hold, before the
+-- wifi-iface section exists. Returns nil when there is nothing to write, or
+--   {path =, entries = {{mac=, vid=}, ...}, mode = "raw" | "macfile"}
+-- `maclist` is the MAC Address Filter list openUF is about to write, and is
+-- MUTATED in the macfilter=allow case (see above).
+function M.mac_vlan_plan(vap, networks, section, maclist)
+	local entries = vap.mac_vlans
+	if not entries or #entries == 0 then return nil end
+	local policy = vap.mac_filter_policy
+	if vap.mac_auth then
+		io.stderr:write(("ucihelper: %s: %d MAC-based VLAN entries ignored -- the "
+			.. "WLAN uses RADIUS MAC authentication, and an accept-list entry "
+			.. "would skip it\n"):format(tostring(vap.ssid), #entries))
+		return nil
+	end
+	-- M.DELETE when the WLAN has no MAC Address Filter, so not a list to read.
+	if type(maclist) ~= "table" then maclist = {} end
+	local filter = {}
+	for _, m in ipairs(maclist) do filter[tostring(m):lower()] = true end
+	local keep = {}
+	for _, e in ipairs(entries) do
+		local why
+		if not networks[e.vid] then
+			-- Same rule as a private pre-shared key with no network: better no
+			-- override than a client silently left on the VAP's own VLAN, which
+			-- is the segmentation the override exists to cross.
+			why = ("no network for VLAN %d"):format(e.vid)
+		elseif policy == "allow" and not filter[e.mac] then
+			why = "the MAC Address Filter does not allow it"
+		elseif policy == "deny" and filter[e.mac] then
+			why = "the MAC Address Filter denies it"
+		end
+		if why then
+			io.stderr:write(("ucihelper: %s: MAC-based VLAN for %s left out -- %s\n")
+				:format(tostring(vap.ssid), e.mac, why))
+		else
+			keep[#keep + 1] = e
+		end
+	end
+	if #keep == 0 then return nil end
+	-- The FILE IS WRITTEN HERE, before anything points hostapd at it. An
+	-- accept_mac_file= line naming a file that does not exist is not a degraded
+	-- feature: hostapd_config_read_maclist() returns -1 and hostapd refuses the
+	-- whole BSS, so the WLAN would vanish. On a write failure the plan is
+	-- abandoned instead, and the WLAN goes up without the overrides.
+	--
+	-- A LEADING newline, not a trailing one: ap.uc writes the maclist with
+	-- `join('\n', ...)` and no terminator, so in macfile mode openUF's first
+	-- byte lands on the end of the last allow-list address. That does NOT fail
+	-- -- which is why the newline matters. hwaddr_aton() reads exactly six
+	-- octets and ignores whatever follows (src/utils/common.c), so the joined
+	-- line is read as that LAST address, and the VLAN id is then taken from
+	-- after its first space -- the mapped client's. The allow-listed station
+	-- would silently get the override, and the intended one no entry at all.
+	-- Verified against hostapd v2.12-devel: the joined line draws no complaint.
+	-- Harmless in raw mode, where openUF owns the file outright.
+	local lines = {"", "# openUF: MAC-based VLANs. Rebuilt on every config push."}
+	for _, e in ipairs(keep) do lines[#lines + 1] = e.mac .. " " .. e.vid end
+	local path = M.mac_vlan_path(section)
+	if not M._write_file(path, table.concat(lines, "\n") .. "\n") then
+		io.stderr:write(("ucihelper: %s: cannot write %s -- MAC-based VLANs left "
+			.. "unapplied\n"):format(tostring(vap.ssid), path))
+		return nil
+	end
+	if policy == "allow" then
+		-- One line per address in the file ap.uc builds: ours carry the VLAN.
+		local mapped = {}
+		for _, e in ipairs(keep) do mapped[e.mac] = true end
+		local i = 1
+		while maclist[i] do
+			if mapped[tostring(maclist[i]):lower()] then
+				table.remove(maclist, i)
+			else
+				i = i + 1
+			end
+		end
+	end
+	return {
+		path    = path,
+		entries = keep,
+		mode    = (policy == "allow") and "macfile" or "raw",
+	}
+end
+
+-- One wifi-vlan section per VLAN the plan names. Called after wlan_add, like
+-- ppsk_add, since the sections hang off the VAP's.
+function M.mac_vlans_add(iface, plan, networks)
+	if not plan then return end
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	for _, e in ipairs(plan.entries) do
+		vlan_section(cursor, iface, e.vid, networks[e.vid])
 	end
 	cursor:commit("wireless")
 end
@@ -776,6 +947,49 @@ function M.derive_rates(floor_kbps, allow_cck, drop_below)
 	return rates
 end
 
+-- The UCI wifi-iface section name for one WLAN on one radio. Deterministic,
+-- and exposed so a caller that needs the name BEFORE the section exists (the
+-- MAC-based-VLAN accept file is named after it) derives the same one.
+--
+-- The name includes the radio, not just the SSID: broadcasting the
+-- same SSID on both radios simultaneously is the default, common case
+-- (the controller UI's "Radio Band: 2.4 GHz + 5 GHz" checkboxes) and
+-- produces one wlan_add() call per radio with an identical ssid. Keying
+-- purely by SSID collapsed both calls into the same UCI section, so the
+-- second call's "device" silently overwrote the first -- confirmed live
+-- against a real controller: only the last-processed radio's VAP
+-- survived. The radio is sanitized the same way the ssid is, though UCI
+-- radio names ("radio0"/"radio1") never need it.
+--
+-- The character class must NOT keep "-". A UCI section name may contain
+-- only [A-Za-z0-9_], and libuci enforces that in the most unhelpful way
+-- available: cursor:set() returns true, cursor:commit() returns true, and
+-- the section is silently discarded -- it never reaches /etc/config and
+-- never appears in `uci show`. So an SSID with a hyphen produced a
+-- wlan_add that reported success at every step and left no WLAN behind,
+-- with nothing in any log to say so. Confirmed live: creating
+-- "openuf-verify" in the controller pushed correctly, parsed correctly
+-- into vap_table, and simply never provisioned. Hyphens are common in
+-- SSIDs, so this was a wide hole.
+--
+-- Sanitizing is lossy, and that loss used to collapse WLANs: "Guest WiFi",
+-- "Guest-WiFi" and "Guest_WiFi" all became openuf_radio0_Guest_WiFi, so
+-- two of them on one radio shared a section and the second silently
+-- overwrote the first -- the same failure the per-radio keying above
+-- exists to prevent, one level down. When the name had to be ALTERED at
+-- all, a short hash of the original keeps them apart; a name that needed
+-- no alteration keeps the section name it has always had, so nothing
+-- already deployed is renamed. (apply_config wlan_clear()s every openuf_
+-- section before rebuilding them, so a name that does change leaves
+-- nothing stale behind either.)
+function M.vap_section_name(radio, ssid)
+	local safe_ssid = ssid:gsub("[^%w_]", "_")
+	if safe_ssid ~= ssid then
+		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
+	end
+	return OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_") .. "_" .. safe_ssid
+end
+
 -- Create a new wifi-iface section named openuf_<ssid> on the given radio.
 -- radio:    UCI radio name, e.g. "radio0" or "radio1"
 -- ssid:     SSID string
@@ -796,43 +1010,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 		pairwise)
 	local uci = get_uci()
 	local cursor = uci.cursor()
-	-- Section name includes the radio, not just the SSID: broadcasting the
-	-- same SSID on both radios simultaneously is the default, common case
-	-- (the controller UI's "Radio Band: 2.4 GHz + 5 GHz" checkboxes) and
-	-- produces one wlan_add() call per radio with an identical ssid. Keying
-	-- purely by SSID collapsed both calls into the same UCI section, so the
-	-- second call's "device" silently overwrote the first -- confirmed live
-	-- against a real controller: only the last-processed radio's VAP
-	-- survived. The radio is sanitized the same way the ssid is, though UCI
-	-- radio names ("radio0"/"radio1") never need it.
-	--
-	-- The character class must NOT keep "-". A UCI section name may contain
-	-- only [A-Za-z0-9_], and libuci enforces that in the most unhelpful way
-	-- available: cursor:set() returns true, cursor:commit() returns true, and
-	-- the section is silently discarded -- it never reaches /etc/config and
-	-- never appears in `uci show`. So an SSID with a hyphen produced a
-	-- wlan_add that reported success at every step and left no WLAN behind,
-	-- with nothing in any log to say so. Confirmed live: creating
-	-- "openuf-verify" in the controller pushed correctly, parsed correctly
-	-- into vap_table, and simply never provisioned. Hyphens are common in
-	-- SSIDs, so this was a wide hole.
-	--
-	-- Sanitizing is lossy, and that loss used to collapse WLANs: "Guest WiFi",
-	-- "Guest-WiFi" and "Guest_WiFi" all became openuf_radio0_Guest_WiFi, so
-	-- two of them on one radio shared a section and the second silently
-	-- overwrote the first -- the same failure the per-radio keying above
-	-- exists to prevent, one level down. When the name had to be ALTERED at
-	-- all, a short hash of the original keeps them apart; a name that needed
-	-- no alteration keeps the section name it has always had, so nothing
-	-- already deployed is renamed. (apply_config wlan_clear()s every openuf_
-	-- section before rebuilding them, so a name that does change leaves
-	-- nothing stale behind either.)
-	local safe_ssid = ssid:gsub("[^%w_]", "_")
-	if safe_ssid ~= ssid then
-		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
-	end
-	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_")
-		.. "_" .. safe_ssid
+	local section_name = M.vap_section_name(radio, ssid)
 	local enc = SECURITY_MAP[security] or "psk2"
 	-- The controller's own pairwise cipher (aaa.<n>.wpa.1.pairwise), as the
 	-- second `+` token of `encryption` -- which is where iface.uc reads a
@@ -2147,7 +2325,12 @@ function M.apply_config(resp, cfg, opts)
 			-- the two enum values and returns for anything else.
 			if vap.mac_filter_policy then
 				extra.macfilter = vap.mac_filter_policy
-				extra.maclist   = vap.mac_filter_list or {}
+				-- A COPY: the MAC-based-VLAN plan below takes addresses out of
+				-- the allow list it writes (they go in carrying a VLAN instead),
+				-- and the vap's own list is read again by get_vap_table.
+				local list = {}
+				for i, m in ipairs(vap.mac_filter_list or {}) do list[i] = m end
+				extra.maclist = list
 			else
 				extra.macfilter = M.DELETE
 				extra.maclist   = M.DELETE
@@ -2242,6 +2425,40 @@ function M.apply_config(resp, cfg, opts)
 				extra.dynamic_vlan = vap.radius.dynamic_vlan
 			end
 
+			-- MAC-based VLANs ("Virtual Network Override"). The plan writes the
+			-- accept file; see M.mac_vlan_plan for the three ways it reaches
+			-- hostapd and the cases it refuses.
+			local mac_vlan = M.mac_vlan_plan(vap, vlan_networks,
+				M.vap_section_name(vap.radio, vap.ssid), extra.maclist)
+			if mac_vlan then
+				if mac_vlan.mode == "macfile" then
+					extra.macfile = mac_vlan.path
+				else
+					add_bss_option(extra, "accept_mac_file=" .. mac_vlan.path)
+				end
+				-- The wifi-vlan sections below become hostapd's vlan_file either
+				-- way (ap.uc's iface_vlan writes it before any gate), but
+				-- vlan_no_bridge -- which keeps hostapd's hands off the bridge
+				-- netifd already built -- sits behind `vlan_possible &&
+				-- dynamic_vlan`. ap.uc sets vlan_possible itself for every
+				-- psk/sae/eap auth type, so dynamic_vlan=1 is enough there and
+				-- is also what the PPSK path has always written. On an OPEN or
+				-- OWE WLAN neither flag is ever set, so the option goes in raw:
+				-- without it hostapd creates its own brvlan<id> and moves the
+				-- VLAN netdev out of br-openuf<id>.
+				if not extra.dynamic_vlan then
+					if vap.security == "open" or vap.security == "owe" then
+						add_bss_option(extra, "vlan_no_bridge=1")
+					else
+						extra.dynamic_vlan = "1"
+					end
+				end
+			else
+				-- No overrides on this WLAN any more: take the client addresses
+				-- off the flash rather than leaving a list nothing reads.
+				M._remove_file(M.mac_vlan_path(M.vap_section_name(vap.radio, vap.ssid)))
+			end
+
 			-- conf.lua config.plugins: third-party edits to this VAP's
 			-- options, after everything built in (plugins.lua). Never
 			-- raises, and does nothing unless a plugin is listed.
@@ -2260,6 +2477,9 @@ function M.apply_config(resp, cfg, opts)
 				vap.x_passphrase, extra, network, vap.wlanconf_id, vap.pairwise)
 			if vap.ppsk and section then
 				M.ppsk_add(section, vap.ppsk, vlan_networks)
+			end
+			if mac_vlan and section then
+				M.mac_vlans_add(section, mac_vlan, vlan_networks)
 			end
 		end
 	end

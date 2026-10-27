@@ -531,6 +531,7 @@ Settings carried through from the controller:
 | Private Pre-Shared Keys | One `wifi-station` section per key (`openuf_<vap>_psk<k>`: `iface` = the VAP's section, `mac` = `00:00:00:00:00:00`, `key`, `vid` unless the key's network is VLAN 1) and one `wifi-vlan` per VLAN (`openuf_<vap>_vlan<vid>`: `name`/`vid` = the VLAN id, `network` = `openuf_vlan<vid>`), plus `dynamic_vlan=1` on the VAP, from `aaa.<n>.wpa.psk_file.<k>.psk`/`.vlanid`. OpenWrt turns them into hostapd's `wpa_psk_file` and `vlan_file`; the client's netdev is `<vap ifname>-<vid>`. The WLAN's own `wpa.psk` (a random passphrase the controller generates) stays the section's `key`. Needs a hostapd with VLAN support (the full `wpad-*` builds have it) and a `lan_cpueth` to build the VLANs on. `psk_radius=2` (keys from RADIUS only) skips the WLAN. The controller's `sae_psk` list (`sae.psk.<n>.psk/.mac/.vlan/.id`) feeds the same sections: with a `mac` the `wifi-station` carries that MAC instead of `00:00:00:00:00:00`; the `ff:ff:ff:ff:ff:ff` entry is the WLAN's own key and is skipped; a key also sent as `psk_file` is created once |
 | WPA-Enterprise (802.1X / RADIUS) | `encryption=wpa2+ccmp` / `wpa3` / `wpa3-mixed` / `wpa3-192`, chosen from the EAP AKM plus `wpa3.support`/`wpa3.transition`/`wpa3.enhanced_192` — the generator turns those into `auth_type` `eap`/`eap2`/`eap-eap2`/`eap192`. (`encryption=eap` looks right and is not: `auth_type` comes out `eap` but no `wpa` wildcard matches, so the BSS gets `wpa=0`.) Servers from `aaa.<n>.radius.auth.<k>.{ip,port,secret}` → `auth_server_addr` (list) / `auth_server_port` / `auth_server_shared_secret`, the `acct` twin → `acct_server_*`, `interim_update.{status,interval}` → `radius_acct_interim_interval`, `nas_identifier` → `nas_identifier`, `dynamic_vlan` → `dynamic_vlan`. No passphrase is ever written: the controller still sends a dummy `aaa.<n>.wpa.psk` on an EAP WLAN, and `wireless.<n>.security` reads `none` on the same push — neither is the discriminator. `ieee8021x`, `eapol_version` and the EAP key-mgmt list are the generator's own, so openUF writes none of them. `psk_radius=2` (PSK-from-RADIUS) is still skipped — that is a different feature |
 | RADIUS MAC authentication / Dynamic Authorization | `aaa.<n>.radius.macacl.status=enabled` → a raw `macaddr_acl=2` line, plus the same `radius.auth.<k>.*` servers as above — written as raw `auth_server_addr`/`auth_server_port`/`auth_server_shared_secret` lines on an open, PSK or SAE WLAN, where the generator never emits the UCI options. `aaa.<n>.radius.das.{client,secret}` → one `radius_das_client=<ip> <secret>`, `das.port` → `radius_das_port` (the controller uses 3800 + the WLAN index). Declined: `macacl.format`, `macacl.emptypassword` (UniFi hostapd patches, absent from OpenWrt's binary) and the whole `radius.dad.*` shape (it relays through the AP's own daemon from `127.0.0.1`). A WLAN that needs MAC authentication and cannot have it is skipped, not provisioned without it |
+| MAC-based VLANs ("Virtual Network Override") | `aaa.<n>.accept_mac.<k>.{mac,vlanid}` → one `<mac> <vlanid>` line of a hostapd **accept-MAC list**, plus a `wifi-vlan` section per VLAN (`openuf_<vap>_vlan<vid>`, shared with the private-pre-shared-key path) and `dynamic_vlan=1` on the VAP so OpenWrt emits `vlan_no_bridge`. The list file is openUF's own, `/etc/openuf/macvlan-<wifi-iface section>`, rebuilt on every push and removed when the WLAN has no overrides. How it reaches hostapd depends on the WLAN's MAC Address Filter: with **no filter** a raw `accept_mac_file=` line (no `macaddr_acl`, so hostapd's default still admits unlisted clients); with **`macfilter=allow`** the schema's `macfile` option, which OpenWrt appends to the accept file it writes itself — openUF then drops those addresses from `maclist` so each appears once, and skips any override the allow list does not already permit; with **`macfilter=deny`** the raw line again, minus any address on the deny list (the accept list is checked first and would otherwise let it in). `accept_mac.status` is **not** read: the controller emits it exactly when there is at least one entry, so the entries are the whole signal. Needs `fw_caps 0x80000000` (claimed) plus a site-wide quorum — see README — and a `lan_cpueth` to build the VLANs on |
 | Hotspot 2.0 / Passpoint | From the WLAN's embedded `hotspot2` object, pushed as `aaa.<n>.hs20.*`. Scalars become real wifi-iface options: `iw_enabled=1` (the generator's `iface_interworking()` gate, which emits `interworking=1`), `hs20=1`, `access_network_type`, `internet`/`asra`/`uesa` as 1/0, `venue_group`, `venue_type`, `disable_dgaf`, `hs20_deauth_req_timeout`, and `metrics.*` joined into one `hs20_wan_metrics` value (`<WAN info in hex>:<dl speed>:<ul speed>:<dl load>:<ul load>:<measurement>`). Every **cumulative** list is written as a raw `hostapd_bss_options` line instead: `ipaddr_type_availability`, `domain_name`, `venue_name=<lang>:<name>`, `venue_url=<i>:<url>`, `nai_realm=<encoding>,<realm>,<eap>[<id>:<val>]…`, `roaming_consortium=<oi>`, `anqp_3gpp_cell_net=<mcc>,<mnc>;…` (one line, semicolon-separated), `hs20_oper_friendly_name=<lang>:<text>`, `hs20_conn_capab=<proto>:<port>:<status>`. Needs `fw_caps` `0x800000` **and** `fw2_caps` `0x80000`; see the narrowings below |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
 | Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged. Both keys arrive `disabled` on a WPA3-only WLAN unless openUF advertises `radio_caps2` bit `0x2`, which it does wherever it advertises `0x1`. Key holders: `r0kh`/`r1kh` wildcard lists keyed with `aaa.<n>.iapp_key` (see below). Also `pmk_r1_push=1`, `reassociation_deadline=3000`, as UniFi firmware |
@@ -696,6 +697,62 @@ neither limited to a WPA-Enterprise WLAN.
   profile's `dynamic_vlan` is written only on an Enterprise WLAN. On any other,
   `2` (required) would make hostapd reject every client of a WLAN that worked a
   moment earlier, since openUF writes no VLAN map for RADIUS-assigned VLANs.
+  The plumbing itself exists (see MAC-based VLANs below, which builds the very
+  same `wifi-vlan` sections); what is missing is the list of VLANs, which a
+  RADIUS profile never enumerates.
+
+### MAC-based VLANs ("Virtual Network Override")
+
+A client given a **Virtual Network Override** (on the client's own page, not on
+a WLAN) belongs on that network's VLAN whatever SSID it joins. The controller
+groups every overridden client by its override network and sends the whole map
+to **every** WLAN, as `aaa.<n>.accept_mac.{status,<k>.{mac,vlanid}}`. The
+override network must be a *corporate* network — the controller refuses a
+VLAN-only one with `api.err.NetworkAssignedAsVlanOverrideIsNotCorporate`.
+
+- **Two gates, and the second is site-wide.** `fw_caps` `0x80000000` is the
+  device's own claim, made since 2026-10-27. Beside it the controller requires a
+  ubios gateway that claims the bit or is one of 23 listed models (a UCG Ultra,
+  model `UDRULT`, is both), **and** that no client-bearing AP or switch in the
+  site fails to claim it. One AP without the bit therefore switched the feature
+  off for every device in the site, which is where openUF stood before.
+- **hostapd's accept-MAC list is the consumer**, and its lines take an optional
+  VLAN id after the address. The list is consulted on every authentication
+  *before* `macaddr_acl` is looked at, and a match returns "accept" carrying
+  that VLAN, so a file of its own assigns VLANs without restricting access —
+  an unlisted client still joins as it always did.
+- **Each VLAN also needs a `wifi-vlan` section**, because hostapd refuses a
+  station whose VLAN is not in its `vlan_file` ("Invalid VLAN %d received from
+  RADIUS server" in `logread`, however little RADIUS is involved). openUF builds
+  them exactly as the private-pre-shared-key path does, into the same
+  `br-openuf<id>`, and one section serves both features when they name the same
+  VLAN. An override whose VLAN openUF cannot build — no `lan_cpueth` — is left
+  out and logged, never downgraded onto the SSID's own network.
+- **The MAC Address Filter owns the same file**, so the route depends on it. See
+  the UCI-mapping row above for the three cases. Two of them *narrow* the list:
+  an override the allow list does not permit is skipped, and one the deny list
+  names is skipped — the accept list is checked first and would otherwise let a
+  denied client in.
+- **Refused outright on a WLAN with RADIUS MAC authentication.** There
+  `macaddr_acl=2` asks the RADIUS server about every client, and an accept-list
+  entry returns "accept" before the question is asked. A VLAN override is not
+  worth bypassing an access control, so openUF logs the WLAN and the count and
+  writes nothing.
+- **Why the file is written before anything points at it.** An
+  `accept_mac_file=` naming a file hostapd cannot read is not a degraded
+  feature: `hostapd_config_read_maclist()` fails the whole BSS, and the WLAN
+  disappears. Same for a malformed line. So the file is written first and the
+  option is only emitted if that succeeded, and every address is validated at
+  the parser.
+
+⚠️ **What is and is not confirmed.** The wire was captured on a live controller
+and the whole path — accept file, `wifi-vlan` section, `accept_mac_file` and
+`vlan_no_bridge=1` in live hostapd, the VLAN netdev in `br-openuf<id>` — was
+verified on both an ath79 and a filogic board, teardown included. But the
+capture used a placeholder MAC belonging to no device, so **no real client has
+been moved to a VLAN by MAC**. Note also that the validation lab can never
+exercise this: its site has no gateway, so its controller refuses to emit the
+keys at all.
 
 **Hotspot 2.0 / Passpoint: what openUF claims, what it drops.** A Passpoint
 WLAN is a WPA-Enterprise WLAN with an ANQP/GAS profile on top, so everything in
@@ -1910,6 +1967,9 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Every client is rejected on a MAC-authenticated WLAN | The RADIUS server is being asked in a format it does not know. OpenWrt's hostapd always sends the MAC lower-case colon-separated as both User-Name and User-Password; the controller's `radius.macacl.format` (and `emptypassword`) only reach UniFi's own patched hostapd and are ignored here. Match the server's user list to `00:00:5e:00:53:01` (lower case, colon-separated), or set the profile's MAC format to colon-separated lower case |
 | CoA/Disconnect from the RADIUS server does nothing | Check `grep radius_das /var/run/hostapd-phy*.conf`: the line must read `radius_das_client=<server ip> <secret>` with a `radius_das_port`. If both are missing, the WLAN's profile has no accounting server or "RADIUS DAS" is off — the controller sends the keys only then. If the server sends from a different address than its accounting address, hostapd drops the request: the controller fills the DAS client from the **first accounting server**, and hostapd accepts only that one |
 | EAP clients authenticate but are then refused | The RADIUS profile has "RADIUS assigned VLAN: required" (`dynamic_vlan=2` in `hostapd-phy*.conf`) and the server returned a VLAN this AP has no network for — `cat /var/run/hostapd-<ifname>.vlan` lists the only ones it can honour. Set the mode to optional, or put the WLAN on a network that already carries those VLANs |
+| A client's Virtual Network Override does nothing | Every AP and switch in the site must claim `fw_caps 0x80000000`, beside a ubios gateway — one device without it disables the feature site-wide, so a non-openUF AP on an old firmware is enough. Check the controller's own view: `curl -sk -b … /api/s/default/stat/device` and test each `fw_caps` for the sign bit. If the gate passes, the keys arrive as `aaa.<n>.accept_mac.*`; `grep accept_mac` the `debug_dump_file` capture to see whether the controller sent them at all |
+| The override arrives but the client stays on the SSID's network | Read the accept list hostapd actually loaded: `cat /etc/openuf/macvlan-openuf_*` (openUF's own file) and `cat /var/run/hostapd-<ifname>.maclist` (the one OpenWrt writes when the WLAN also has a MAC Address Filter). An address openUF refused is logged with the reason — a VLAN it could not build (no `lan_cpueth`), an allow list that does not permit it, a deny list that names it, or RADIUS MAC authentication on the WLAN, which refuses the whole feature |
+| A WLAN with an override vanished from the air | `logread \| grep -i "maclist\|accept_mac"`. hostapd fails the whole BSS over an accept file it cannot read or a line it cannot parse, so this means the file went missing after it was written, or something else rewrote it. openUF writes the file before it emits the option and validates every address, so its own output cannot cause this |
 | A 5 GHz radio is on the wrong channel after a radar hit and stays there | `sed -n '/openuf-cron-begin/,/openuf-cron-end/p' /etc/crontabs/root` must carry `0 2 * * * /usr/bin/syswrapper.sh dfs-reset`; if it does not, the controller is not pushing the job — it only does so for a radio pinned to a DFS channel the site's country allows (`uci get wireless.<radio>.channel` must be a number, not `auto`). Run `/usr/bin/syswrapper.sh dfs-reset` to ask for it now; `logread \| grep dfs-reset` gives the reason it was left alone. The commonest one is the non-occupancy list: `iw phy phy<N> channels` shows the channel as `DFS state: unavailable` with the time left, and openUF waits for that rather than announce a switch the kernel will refuse |
 | Auto-channel still picks a DFS or blacklisted channel | Both keys only arrive for a radio whose channel is `auto`, and the blacklist half only then. `uci show wireless | grep -E "acs_exclude_dfs|chanlist"` shows what landed: the 5 GHz radio should carry `acs_exclude_dfs` matching Settings → Radios, and a radio on Auto in a site with a channel blacklist should carry a `chanlist` plus `openuf_chanlist=1`. Missing entirely: the controller is not sending them — `tools/heartbeat-probe.lua` must show `wifi_caps2` with bit `0x10` set (`0x2070` with roam reports on), and new wifi-device options need a **Force Provision**. Present in UCI but ACS ignores them: `grep -E "acs_exclude_dfs|chanlist" /var/run/hostapd-phy*.conf` — options reach hostapd only on a WiFi reload. `logread | grep -E "channel blacklist|auto-channel unrestricted"` names the three cases where openUF deliberately writes nothing (§ Auto-channel limits) |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |

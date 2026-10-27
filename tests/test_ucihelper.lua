@@ -4661,4 +4661,304 @@ Wiphy phy2
 			if not ok then error(err, 0) end
 		end
 	},
+	{
+		name = "ucihelper: MAC-based VLANs become an accept file, its VLAN sections and a raw accept_mac_file line",
+		fn = function()
+			local files, removed = {}, {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function(path) removed[path] = true end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123", mac_vlans = {
+								{mac = "00:00:5e:00:53:01", vid = 20},
+								{mac = "00:00:5e:00:53:02", vid = 30},
+								{mac = "00:00:5e:00:53:03", vid = 20},
+							}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_eq(table.concat(w[iface].hostapd_bss_options, ","),
+						"accept_mac_file=" .. path,
+						"hostapd is pointed at openUF's own file, not OpenWrt's maclist")
+					assert_nil(w[iface].macfile, "macfile is only for the allow-filter case")
+					assert_nil(w[iface].macaddr_acl,
+						"and nothing restricts access: unlisted clients still join")
+					assert_eq(w[iface].dynamic_vlan, "1",
+						"so ap.uc emits vlan_no_bridge and netifd keeps the bridge")
+					-- The LEADING blank line is load-bearing: without it the
+					-- allow-list case joins openUF's first line onto the last
+					-- address ap.uc wrote, and hostapd reads that silently as
+					-- the WRONG station. See mac_vlan_plan.
+					assert_eq(files[path],
+						"\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+						.. "\n00:00:5e:00:53:01 20\n00:00:5e:00:53:02 30"
+						.. "\n00:00:5e:00:53:03 20\n",
+						"<mac> <vid> per line, in the order the controller sent them")
+					assert_eq(w[iface .. "_vlan20"].network[1], "openuf_vlan20",
+						"VLAN 20 is in hostapd's vlan_file, or the station is refused")
+					assert_eq(w[iface .. "_vlan30"].network[1], "openuf_vlan30", "and 30")
+					local nvlan = 0
+					for _, sec in pairs(w) do
+						if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
+					end
+					assert_eq(nvlan, 2, "VLAN 20 once, though two clients use it")
+					assert_not_nil(db.network.openuf_vlan20, "VLAN 20 got its L2")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: with an allow filter the entries go in via macfile and leave the maclist",
+		fn = function()
+			local files = {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local vaps = {{ssid = "home", radio = "radio0", security = "wpa2",
+						x_passphrase = "basepass123",
+						mac_filter_policy = "allow",
+						mac_filter_list = {"00:00:5E:00:53:01", "00:00:5e:00:53:09"},
+						mac_vlans = {
+							{mac = "00:00:5e:00:53:01", vid = 20},
+							-- Not in the allow list: it could not join anyway,
+							-- and an accept entry would let it.
+							{mac = "00:00:5e:00:53:02", vid = 30},
+						}}}
+					ucihelper.apply_config({radio_table = {}, vap_table = vaps},
+						{net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_eq(w[iface].macfile, path,
+						"ap.uc appends it to the accept file it writes itself")
+					assert_nil(w[iface].hostapd_bss_options,
+						"no second accept_mac_file: one address, one line")
+					assert_eq(table.concat(w[iface].maclist, ","), "00:00:5e:00:53:09",
+						"the mapped address left the maclist, carrying its VLAN instead")
+					assert_eq(files[path],
+						"\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+						.. "\n00:00:5e:00:53:01 20\n",
+						"and only the allowed client is mapped")
+					assert_nil(w[iface .. "_vlan30"],
+						"the refused entry got no VLAN section either")
+					assert_eq(#vaps[1].mac_filter_list, 2,
+						"and the vap's own filter list was not emptied under it")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a denied MAC is never given a VLAN, since the accept list is checked first",
+		fn = function()
+			local files = {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123",
+							mac_filter_policy = "deny",
+							mac_filter_list = {"00:00:5e:00:53:02"},
+							mac_vlans = {
+								{mac = "00:00:5e:00:53:01", vid = 20},
+								{mac = "00:00:5e:00:53:02", vid = 30},
+							}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_eq(table.concat(w[iface].hostapd_bss_options, ","),
+						"accept_mac_file=" .. path, "the deny file is a different one")
+					assert_eq(table.concat(w[iface].maclist, ","), "00:00:5e:00:53:02",
+						"the deny list is untouched")
+					assert_eq(files[path],
+						"\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+						.. "\n00:00:5e:00:53:01 20\n",
+						"the denied client would have been let in by an accept entry")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: RADIUS MAC authentication refuses MAC-based VLANs outright",
+		fn = function()
+			local files, removed = {}, {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function(path) removed[path] = true end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123", mac_auth = true,
+							radius = {auth = {{ip = "192.0.2.10", port = "1812",
+								secret = "sec"}}, acct = {}},
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_nil(files[path], "no accept file is written")
+					assert_true(removed[path], "and a stale one is taken off the flash")
+					local raw = table.concat(w[iface].hostapd_bss_options, ",")
+					assert_true(raw:find("macaddr_acl=2", 1, true) ~= nil,
+						"the RADIUS ACL is in place")
+					assert_nil(raw:find("accept_mac_file", 1, true),
+						"and no accept entry, which would skip the lookup")
+					assert_nil(w[iface .. "_vlan20"], "and no VLAN section")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: an override whose VLAN has no network is left out, and the last one withdraws the file",
+		fn = function()
+			local files, removed = {}, {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function(path) removed[path] = true end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					-- No lan_cpueth, so openUF can build no VLAN at all. A client
+					-- left on the VAP's own network would be across the very
+					-- segmentation the override exists to cross.
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123",
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, nil)
+					local iface = "openuf_radio0_home"
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_nil(files[path], "nothing is written")
+					assert_true(removed[path], "the file goes")
+					assert_nil(db.wireless[iface].hostapd_bss_options,
+						"and hostapd is pointed at no file, which would sink the BSS")
+					assert_nil(db.wireless[iface].dynamic_vlan, "no VLAN options either")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: an open WLAN gets vlan_no_bridge raw, where ap.uc would never emit it",
+		fn = function()
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {
+							{ssid = "guest", radio = "radio0", security = "open",
+								mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}},
+							{ssid = "home", radio = "radio0", security = "wpa2",
+								x_passphrase = "basepass123",
+								mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}},
+						},
+					}, {net = {lan_cpueth = "eth1"}})
+					local g = db.wireless.openuf_radio0_guest
+					-- ap.uc sets vlan_possible only for psk/sae/eap, and
+					-- vlan_no_bridge sits behind it -- so without this line
+					-- hostapd bridges the VLAN netdev into its own brvlan20.
+					assert_true(table.concat(g.hostapd_bss_options, ","):find(
+						"vlan_no_bridge=1", 1, true) ~= nil,
+						"the open BSS says so itself")
+					assert_nil(g.dynamic_vlan, "and asks for no dynamic VLANs")
+					local h = db.wireless.openuf_radio0_home
+					assert_eq(h.dynamic_vlan, "1", "the WPA2 BSS lets ap.uc do it")
+					assert_nil(table.concat(h.hostapd_bss_options, ","):find(
+						"vlan_no_bridge", 1, true),
+						"and does not repeat the option")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a MAC-based VLAN and a private pre-shared key share one VLAN section",
+		fn = function()
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123",
+							ppsk = {{key = "keyvlan20a", vid = 20}},
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local w = db.wireless
+					local nvlan = 0
+					for _, sec in pairs(w) do
+						if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
+					end
+					assert_eq(nvlan, 1,
+						"one section, or vlan_file would carry VLAN 20 twice")
+					assert_eq(w.openuf_radio0_home_vlan20.network[1], "openuf_vlan20",
+						"and it still names the VLAN's network")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a failed accept-file write leaves the WLAN alone rather than sinking it",
+		fn = function()
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return false end
+			ucihelper._remove_file = function() end
+			local logged
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local buf = {}
+					local real = io.stderr
+					io.stderr = {write = function(_, t) buf[#buf + 1] = t end}
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0",
+							security = "wpa2", x_passphrase = "basepass123",
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					io.stderr = real
+					logged = table.concat(buf)
+					local w = db.wireless.openuf_radio0_home
+					assert_not_nil(w, "the WLAN is still provisioned")
+					-- accept_mac_file naming a file hostapd cannot read is not a
+					-- degraded feature: config_file.c fails the whole BSS.
+					assert_nil(w.hostapd_bss_options, "but hostapd is pointed nowhere")
+					assert_nil(db.wireless.openuf_radio0_home_vlan20, "and no VLAN section")
+					assert_contains(logged, "MAC-based VLANs left unapplied",
+						"and the reason is logged")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
 }

@@ -1643,6 +1643,93 @@ return {
 		end
 	},
 	{
+		name = "inform packet: MAC-based VLANs are read per client, with the status key ignored",
+		fn = function()
+			-- VERBATIM from the home controller (UniFi Network on a UCG Ultra),
+			-- 2026-10-27, with a Virtual Network Override set on a placeholder
+			-- client onto the IoT network (VLAN 10). The same map arrives on
+			-- EVERY WLAN -- the emitter takes the site's whole override list and
+			-- writes it per WLAN index, so three WLANs got three identical
+			-- blocks. (The validation lab cannot produce this: its site has no
+			-- gateway, so the controller's second gate refuses to emit the keys
+			-- at all. See PROTOCOL-VALIDATION.md.)
+			local sys_cfg = "aaa.1.ssid=Home LAN\naaa.1.devname=ath0\n"
+				.. "aaa.1.accept_mac.status=enabled\n"
+				.. "aaa.1.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.1.accept_mac.1.vlanid=10\n"
+				.. "aaa.1.wpa.psk=basepass123\n"
+				.. "aaa.2.ssid=Home IoT\naaa.2.devname=ath1\n"
+				.. "aaa.2.accept_mac.status=enabled\n"
+				.. "aaa.2.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.2.accept_mac.1.vlanid=10\n"
+				.. "aaa.2.wpa.psk=basepass123\n"
+				.. "wireless.1.ssid=Home LAN\nwireless.1.parent=radio0\n"
+				.. "wireless.2.ssid=Home IoT\nwireless.2.parent=radio1\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 2, "both WLANs are provisioned")
+			for i, v in ipairs(vap_table) do
+				assert_eq(#v.mac_vlans, 1, "WLAN " .. i .. " carries the override")
+				assert_eq(v.mac_vlans[1].mac, "00:00:5e:00:53:01", "the MAC")
+				assert_eq(v.mac_vlans[1].vid, 10, "and its VLAN, as a number")
+			end
+			assert_eq(logged, "", "nothing to complain about")
+			-- status is NOT the discriminator: the writer emits it from inside
+			-- the loop that writes the first entry, so it is present exactly when
+			-- entries are. The entries are the whole signal -- a block's presence
+			-- is this protocol's classic decoy.
+			local _, bare = inform._parse_wifi_system_cfg(
+				"aaa.1.ssid=home\naaa.1.accept_mac.status=enabled\n"
+				.. "wireless.1.ssid=home\nwireless.1.parent=radio0\n")
+			assert_nil(bare[1].mac_vlans, "status alone claims nothing")
+			-- A second entry, which the capture had no occasion to carry: the
+			-- controller's map is the site's, so a second overridden client adds
+			-- an index rather than a second block.
+			local _, two = inform._parse_wifi_system_cfg(
+				"aaa.1.ssid=home\naaa.1.accept_mac.status=enabled\n"
+				.. "aaa.1.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.1.accept_mac.1.vlanid=10\n"
+				.. "aaa.1.accept_mac.2.mac=00:00:5e:00:53:02\n"
+				.. "aaa.1.accept_mac.2.vlanid=30\n"
+				.. "wireless.1.ssid=home\nwireless.1.parent=radio0\n")
+			assert_eq(#two[1].mac_vlans, 2, "both clients")
+			assert_eq(two[1].mac_vlans[2].vid, 30, "each on its own VLAN")
+		end
+	},
+	{
+		name = "inform packet: a malformed or duplicated MAC-based VLAN entry is named and dropped",
+		fn = function()
+			-- Every entry is spliced into a hostapd accept-list line, where one
+			-- malformed line fails the whole FILE and takes the BSS with it.
+			local sys_cfg = "aaa.1.ssid=home\naaa.1.devname=ath0\n"
+				.. "aaa.1.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.1.accept_mac.1.vlanid=20\n"
+				.. "aaa.1.accept_mac.2.mac=not-a-mac\n"
+				.. "aaa.1.accept_mac.2.vlanid=30\n"
+				.. "aaa.1.accept_mac.3.mac=00:00:5e:00:53:03\n"
+				.. "aaa.1.accept_mac.3.vlanid=4095\n"
+				.. "aaa.1.accept_mac.4.mac=00:00:5E:00:53:01\n"
+				.. "aaa.1.accept_mac.4.vlanid=40\n"
+				.. "aaa.1.wpa.psk=basepass123\n"
+				.. "wireless.1.ssid=home\nwireless.1.parent=radio0\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			local v = vap_table[1]
+			assert_eq(#v.mac_vlans, 1, "only the sound entry survives")
+			assert_eq(v.mac_vlans[1].vid, 20, "the first one")
+			assert_contains(logged, "entry 2 -- not a MAC address", "entry 2 by number")
+			assert_contains(logged, "entry 3 -- VLAN id out of range", "4095 is not a VLAN")
+			assert_contains(logged, "entry 4 -- a duplicate of an earlier entry",
+				"two accept lines for one station would leave hostapd's bsearch to pick")
+		end
+	},
+	{
 		name = "inform packet: a WLAN needing MAC authentication is dropped, not left open",
 		fn = function()
 			-- MAC authentication is an access control, so it fails CLOSED: a WLAN

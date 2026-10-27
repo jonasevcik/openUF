@@ -198,8 +198,13 @@ local function build(opts)
 	}
 	for k, v in pairs(opts and opts.st or {}) do st[k] = v end
 	local json_str = inform.build_json(st, nil, ufhw)
-	return cjson.decode(json_str), st
+	return cjson.decode(json_str), st, json_str
 end
+
+-- fw_caps as openUF claims it: 0x80101110, which is this negative 32-bit
+-- integer. Written out rather than as a hex literal, because on Lua 5.1
+-- (the target) 0x80101110 is a positive double and would not compare.
+local MAC_VLAN_FW_CAPS = -2146430704
 
 -- A socket-shaped modelmap: one port_idx per physical switch socket, and no
 -- static uplink flag -- which socket the cable is in is detected from the
@@ -2237,7 +2242,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: fw_caps sets the switch, schedule and RADIUS-DAS bits (0x101110)",
+		name = "inform json: fw_caps sets the switch, schedule, RADIUS-DAS and MAC-based-VLAN bits (0x80101110)",
 		fn = function()
 			-- Confirmed via decompiled controller 10.4.57: Device.hasQCASwitch()
 			-- is hasFirmwareCapability(16) (gates the Ports view's projection
@@ -2252,9 +2257,16 @@ return {
 			-- the config writer tests inline (VAZShipWTNxlo:567) and which brings
 			-- aaa.<n>.radius.das.* to an accounting WLAN; hostapd is the CoA
 			-- listener it needs (radius_das_port/radius_das_client).
-			local d = build()
-			assert_eq(d.fw_caps, 0x101110,
-				"fw_caps bits 0x10 | 0x100 | 0x1000 | 0x100000 set")
+			local d, _, raw = build()
+			assert_eq(d.fw_caps, MAC_VLAN_FW_CAPS,
+				"fw_caps bits 0x10 | 0x100 | 0x1000 | 0x100000 | 0x80000000 set")
+			-- The SIGN is the point, and so is the absence of a fraction:
+			-- fw_caps is a Java int on the controller side, so 0x80101110 has
+			-- to go out as the negative it is, and as an integer literal.
+			-- No trailing comma in the needle: cjson emits object keys in hash
+			-- order, so fw_caps is sometimes the last one and followed by `}`.
+			assert_true(raw:find('"fw_caps":-2146430704', 1, true) ~= nil,
+				"and it is serialized as a negative integer, not 2148537104")
 			assert_eq(d.fw2_caps, 0,
 				"and no fw2_caps bit where Hotspot 2.0 is not supported")
 		end
@@ -2271,7 +2283,8 @@ return {
 			inform._sysinfo.hs20_supported = function() return true end
 			local ok, err = pcall(function()
 				local d = build()
-				assert_eq(d.fw_caps, 0x901110, "the Hotspot 2.0 bit joins fw_caps")
+				assert_eq(d.fw_caps, MAC_VLAN_FW_CAPS + 0x800000,
+					"the Hotspot 2.0 bit joins fw_caps")
 				assert_eq(d.fw2_caps, 0x80000, "and RadSec is claimed for the gate")
 			end)
 			inform._sysinfo.hs20_supported = orig
