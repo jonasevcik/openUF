@@ -106,6 +106,9 @@ if [ "$1" = "--verify" ]; then
 	cp -r tests "$BUILD/verify/tests"
 	# The installer tests source install.sh from the project root; ship-identical.
 	cp install.sh "$BUILD/verify/"
+	# tools/ is not shipped, but the suite dofile()s one of them
+	# (tools/cfg-coverage.lua), so the verify tree needs it present.
+	cp -r tools "$BUILD/verify/tools"
 	if ! ( cd "$BUILD/verify" && lua tests/run_tests.lua ); then
 		echo ""
 		echo "  FAIL tests do not pass against the stripped tree -- not packaging."
