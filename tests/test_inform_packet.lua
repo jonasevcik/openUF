@@ -6393,6 +6393,165 @@ return {
 		end
 	},
 	{
+		-- The monitors are what produce the radar event, so a DFS radio has to
+		-- keep them running on a site with neither 802.11k enrichment nor
+		-- connection tracking -- where _rrm_tick used to return early, stop
+		-- the collector and delete the event file.
+		name = "inform: a DFS radio keeps the control-socket monitors alive on its own",
+		fn = function()
+			local o_rrm, o_at, o_dfs = inform._rrmscan, inform._assoctrack, inform._dfs_radio
+			local o_next, o_time = inform._rrm_collector_next, inform._time
+			local calls
+			local stub = {
+				drain = function() return "" end,
+				collector_running = function() return false end,
+				collector_stop = function() calls[#calls + 1] = "collector_stop" end,
+				collector_ensure = function() calls[#calls + 1] = "collector_ensure" end,
+				monitors_ensure = function() calls[#calls + 1] = "monitors_ensure" end,
+				monitors_stop = function() calls[#calls + 1] = "monitors_stop" end,
+				parse_dfs = function() return {} end,
+			}
+			inform._rrmscan = stub
+			inform._assoctrack = nil	-- so _assoc_enabled is false
+			-- Restored through a pcall: this test replaces _assoctrack and the
+			-- collector clock, and a bare assert would leave both broken for
+			-- every test after it.
+			local function run(dfs, rrm_on)
+				calls = {}
+				inform._dfs_radio = dfs
+				inform._rrm_collector_next = 0
+				inform._time = function() return 1 end
+				inform._rrm_tick({config = {rrm_enrichment = rrm_on or nil}}, {})
+				return table.concat(calls, ",")
+			end
+			local ok, err = pcall(function()
+				assert_eq(run(true, false), "monitors_ensure",
+					"DFS only: the monitors run, the subscriber does not")
+				assert_eq(run(false, false), "",
+					"nothing wanted: the early branch, as before")
+				assert_eq(run(true, true), "collector_ensure,monitors_ensure",
+					"enrichment on: both")
+				assert_eq(run(false, true), "collector_ensure,monitors_ensure",
+					"enrichment alone still starts both")
+				-- A subscriber left over from a run with enrichment on is stopped.
+				stub.collector_running = function() return true end
+				assert_eq(run(true, false), "collector_stop,monitors_ensure",
+					"the stale subscriber goes before the monitors are restarted")
+			end)
+			inform._rrmscan, inform._assoctrack = o_rrm, o_at
+			inform._dfs_radio, inform._time = o_dfs, o_time
+			inform._rrm_collector_next = o_next
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- The contract is 10.6.106's own handler (com.ubnt.service.devmgr.e.c):
+		-- it needs BOTH "channel" and "freq" in the notif_payload and drops
+		-- the event with "Event without handler" if either is missing, reads
+		-- channel as a STRING and freq as an int, and then logs
+		-- "{ap} detected radar on channel {radar_channel} ({freq} MHz)".
+		-- 6.8.2's ubntbox sends the same three fields plus "vap".
+		name = "inform: a DFS radar detection goes out as EVT_AP_RadarDetected",
+		fn = function()
+			local o_post, o_build, o_ident = inform.http_post, inform.build_packet,
+				inform._notif_identity
+			local bodies = {}
+			inform.build_packet = function(json) return json end
+			inform.http_post = function(_, pkt) bodies[#bodies + 1] = cjson.decode(pkt); return "noop" end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20", model = "U6IW"}
+			inform._event_queue, inform._event_seen = {}, {}
+			local queued = inform._dfs_poll(
+				"1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500 ht_enabled=0 "
+				.. "chan_offset=0 chan_width=1 cf1=5530 cf2=0\n")
+			local sent = inform._send_events({adopted = true, inform_url = "http://x/inform"})
+			local q_after = #inform._event_queue
+			inform.http_post, inform.build_packet = o_post, o_build
+			inform._notif_identity = o_ident
+			inform._event_queue, inform._event_seen = {}, {}
+			assert_eq(queued, 1, "one detection queued")
+			assert_eq(sent, 1, "and sent")
+			assert_eq(q_after, 0, "queue drained")
+			local b = bodies[1]
+			assert_eq(b.inform_as_notif, true, "the notif envelope, as for a station notif")
+			assert_eq(b.notif_reason, "event", "notif_reason")
+			assert_eq(b.mac, "00:00:5e:00:53:20", "device identity")
+			local p = b.notif_payload
+			assert_eq(p.event_string, "EVT_AP_RadarDetected", "the event the controller dispatches on")
+			assert_eq(p.channel, "100", "channel as a string, which is how the handler reads it")
+			assert_eq(p.freq, 5500, "freq as a number")
+			assert_eq(p.vap, "phy1-ap0", "the BSS, as 6.8.2 sends it")
+			assert_eq(p.dedup_key, nil, "the dedup key is ours and never goes on the wire")
+		end
+	},
+	{
+		name = "inform: one radar hit on two BSSes is one event, and the queue is capped",
+		fn = function()
+			local o_time = inform._time
+			local now = 5000
+			inform._time = function() return now end
+			inform._event_queue, inform._event_seen = {}, {}
+			-- hostapd prints the detection on each BSS of the radio: same
+			-- channel, same second, two lines.
+			local two = "1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500\n"
+				.. "1299.01 phy1-ap1 DFS-RADAR-DETECTED freq=5500\n"
+			assert_eq(inform._dfs_poll(two), 1, "collapsed to one")
+			-- A different channel in the same second is a different radar.
+			assert_eq(inform._dfs_poll("1299.02 phy1-ap0 DFS-RADAR-DETECTED freq=5260\n"),
+				1, "another channel still reported")
+			-- Past the window the same channel is a new detection.
+			now = now + inform.EVENT_DEDUP_S + 1
+			assert_eq(inform._dfs_poll(two), 1, "a later hit on the same channel is new")
+			-- The cap is a queue cap, not a drop-everything: an unreachable
+			-- controller must not let /tmp grow an unbounded backlog.
+			inform._event_queue, inform._event_seen = {}, {}
+			for i = 1, inform.MAX_EVENTS + 4 do
+				inform.queue_event{event_string = "EVT_AP_RadarDetected", n = i}
+			end
+			assert_eq(#inform._event_queue, inform.MAX_EVENTS, "capped")
+			assert_eq(inform._event_queue[1].n, 1, "the oldest is kept")
+			-- An event with no event_string is not an event.
+			assert_eq(inform.queue_event{channel = "100"}, false, "no event_string")
+			assert_eq(inform.queue_event("EVT_AP_RadarDetected"), false, "not a table")
+			inform._time = o_time
+			inform._event_queue, inform._event_seen = {}, {}
+		end
+	},
+	{
+		-- Unlike the station notifs, a device event rides no capability: the
+		-- controller asked for nothing, and the AP is telling it something it
+		-- has no other way to learn. It does still need an adopted device
+		-- with an identity to file the event under.
+		name = "inform: device events need no notif-assoc-stat, but do need an adopted device",
+		fn = function()
+			local o_post, o_build, o_ident = inform.http_post, inform.build_packet,
+				inform._notif_identity
+			local posts = 0
+			inform.build_packet = function(json) return json end
+			inform.http_post = function() posts = posts + 1; return "noop" end
+			local ev = {event_string = "EVT_AP_RadarDetected", channel = "100", freq = 5500}
+			inform._notif_identity = nil
+			inform._event_queue = {ev}
+			assert_eq(inform._send_events({adopted = true, inform_url = "http://x/inform"}), 0,
+				"no identity yet: nothing sent")
+			inform._notif_identity = {mac = "00:00:5e:00:53:20"}
+			assert_eq(inform._send_events({adopted = false, inform_url = "http://x/inform"}), 0,
+				"not adopted: nothing sent")
+			assert_eq(#inform._event_queue, 1, "and the event is still queued")
+			assert_eq(inform._send_events({adopted = true, inform_url = "http://x/inform"}), 1,
+				"adopted, with an identity: sent, with no capability asked for")
+			-- A failed POST keeps it for the next heartbeat.
+			inform.http_post = function() return nil, "timeout" end
+			inform._event_queue = {ev}
+			assert_eq(inform._send_events({adopted = true, inform_url = "http://x/inform"}), 0,
+				"POST failed")
+			assert_eq(#inform._event_queue, 1, "kept")
+			inform.http_post, inform.build_packet = o_post, o_build
+			inform._notif_identity = o_ident
+			inform._event_queue, inform._event_seen = {}, {}
+			assert_eq(posts, 1, "exactly one POST reached the controller")
+		end
+	},
+	{
 		-- A roam report spoils with delay; a funnel event does not. Roams go
 		-- first, and a failed roam POST stops the funnel too (the controller
 		-- is not answering).

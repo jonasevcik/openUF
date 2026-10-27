@@ -1576,7 +1576,7 @@ cannot show, since it has no radios, no hostapd and no `uci`:
 | Read back | Archer C5 (ath79) | AX3000T (filogic/DSA) |
 |---|---|---|
 | `wireless.<vap>.tdls_prohibit` | `'0'` on all 3 WLANs | `'0'` on all 3 WLANs |
-| `wireless.radio{0,1}.ieee80211d` | `'0'` | `'0'` |
+| `wireless.radio{0,1}.ieee80211d` | `'0'` (**wrong — see below**) | `'0'` (**wrong**) |
 | `/var/run/hostapd-phy*.conf` | `tdls_prohibit=0` in every BSS block | same |
 | hostapd config errors in `logread` | 0 | 0 |
 
@@ -1588,6 +1588,50 @@ proven on hardware; and `hostapd-phy*.conf` carries `okc=1`/`okc=0` lines that o
 defaults. Neither AP runs a WPA-Enterprise WLAN, so the `auth_cache` → `okc` path stays
 lab-only. The push also carried `wpa.1.pairwise=CCMP`, and openUF correctly wrote no suffix:
 hostapd kept `wpa_pairwise=CCMP`.
+
+**`ieee80211d='0'` on a 5 GHz radio is a production outage. Corrected 2026-10-27.**
+About an hour after the provision above, an ordinary controller push rebuilt the wifi config
+on both APs and the 5 GHz radio did not come back on either board:
+
+```
+hostapd.add_iface failed for phy phy0 ifname=phy0-ap0      # Archer C5, ath10k, ch 36
+hostapd.add_iface failed for phy phy1 ifname=phy1-ap0      # AX3000T, mt76, ch 100
+```
+
+Feeding the device's own `/var/run/hostapd-phy0.conf` to a real hostapd (v2.12-devel, in
+`openwrt/rootfs:x86-64-25.12.0`) names the cause in one line:
+
+```
+Cannot enable IEEE 802.11h without IEEE 802.11d enabled
+1 errors found in configuration file
+```
+
+`hostapd.uc`'s `device_country_append()` emits `ieee80211h` for **every** radio with
+`hw_mode == 'a'` and a country (it is deleted only for `hw_mode != 'a'`, and the schema
+defaults it to `true`), while `ieee80211d` is emitted only when truthy. So `ieee80211d=0`
+plus 5 GHz is a config hostapd rejects outright — not a dropped option but a refused
+interface, with no SSID on the air and nothing in UCI to explain it.
+
+Three things worth carrying forward:
+
+- **The gate check has to include the consumer's cross-constraints, not just the option.**
+  The original reasoning checked that `ieee80211d` exists in the schema and that the
+  generator emits it — both true. hostapd's rule relating it to another option was the gap.
+- **The failure is delayed.** It appears at the next `wifi reload`, not at the push that
+  writes the option, so reading UCI and `hostapd-phy*.conf` straight after the provision —
+  which is exactly what the table above records — showed a clean, consistent, wrong state.
+  For anything that can keep an interface from starting, the check is `iw dev` showing an
+  SSID and a channel, not the config file.
+- **Unknown band counts as 5 GHz.** `band_for_device` falls back to `band_for_channel`,
+  which answers `"na"` when it cannot tell. That default is now load-bearing: guessing
+  "2.4 GHz" costs a radio.
+
+openUF now writes `ieee80211d='1'` on any 5 GHz radio regardless of `country_beacon`
+(repairing a radio an earlier version left at `0`), honours the controller's "off" on 2.4 GHz
+only, and logs `Country IE off is not applicable on 5 GHz` once. Verified on the AX3000T
+through a real force-provision: the warning fired, `wireless.radio1.ieee80211d='1'`,
+`hostapd-phy1.conf` carries `ieee80211d=1` beside `ieee80211h=1`, and `phy1-ap0` is back on
+**channel 100 at 80 MHz** — a DFS channel, which is precisely the case 802.11h exists for.
 
 **Three keys on this block are declines, each for a named reason** (10.6.106 generator
 `com.ubnt.service.config.VAZShipWTNxlo`, read 2026-10-26):
@@ -5020,6 +5064,116 @@ from `satisfaction.lua` and nothing else from this family. These are exactly the
 same one: **needs the controller side first** — whether 10.6.106 reads each key (jar string
 search) and whether OpenWrt has any source for it, since the firmware fills most of them from
 probes `mcad` runs against the client (ARP/DNS/ICMP) that openUF does not perform.
+
+#### Axis 3, settled 2026-10-27
+
+The controller side was read first, as the paragraph above said it had to be: every `.class`
+in 10.6.106's `internal-dependencies.jar` was extracted and searched for each key. Method,
+so it is repeatable: `unzip` the jar, `tr -c '[:print:]' '\n'` over every class, intersect the
+token set with the key names `libubnt.so.1.0.0` carries.
+
+**Nine of the eleven per-station keys appear nowhere in the controller.** `sta_ip_timeout`,
+`sta_arp_timeout`, `sta_dns_timeout`, `sta_dns_latency`, `sta_icmp_rtt`, `sta_disconnects`,
+`wifi_drops`, `tx_rate_avg` and `rx_rate_avg` have zero hits in the jar — so sending them
+would change nothing. Declined: **no consumer in 10.6.106**. (The same search explains a
+standing oddity: `wifi_retries` and `wifi_latency`, which openUF *does* send, are not in the
+jar either. They are satisfaction inputs the AP consumes itself, and the controller reads only
+the resulting score and the bar charts.)
+
+The two the controller does read are `rx_tcp_lat_avg` and `tx_tcp_lat_avg`, in
+`com.ubnt.service.e.a.a.e.rGUtaVWZlySeOK` — the `stat.vap` archiver, which takes them as
+`avgRxTcpRtt`/`avgTxTcpRtt` beside `client_signal_avg` and `num_sta_avg`. Declined:
+**no OpenWrt producer**. They are per-station TCP round-trip averages, which the firmware
+gets from mcad's own sampling of client traffic; openUF measures no TCP timing at all, and
+`satisfaction.score` accordingly passes a constant 100 for both the TCP-loss and TCP-latency
+terms. Implementing them means building a passive TCP RTT sampler first, which is its own
+piece of work and not a reporting gap.
+
+The same archiver class names the per-VAP sums the controller builds from the per-station
+keys, which is worth writing down because the names differ on the two sides:
+`sta_arp_timeout` → `sta_arp_failures`, `sta_dns_timeout` → `sta_dns_failures`,
+`sta_ip_timeout` → `sta_dhcp_failures` (DHCP, not IP), plus `sta_wpa_auth_failures`,
+`rx_tcp_stalls`/`tx_tcp_stalls`, `wifi_tx_latency_avg`, `sta_tx_rate`,
+`ratio_sta_high_ux_avg`/`ratio_sta_low_ux_avg`. The `*_failures` names are the controller's
+own; 6.8.2 never emits them, so a future attempt must send the per-station key, not the sum.
+
+**The win on this axis was not in the station table but in the events.** openUF sent no
+device event of any kind. 10.6.106 has handlers for eleven `EVT_AP_*` strings
+(`AcsTriggerComplete`, `AfcEvent`, `ChannelChanged`, `DetectRogueAP`, `Isolated`,
+`LocationEvent`, `PossibleInterference`, `QuickScanEvent`, `RadarDetected`,
+`RestartedUnknown`, `RestartProc`), and U7LR 6.8.2's whole rootfs contains exactly three:
+`EVT_AP_RadarDetected`, `EVT_AP_WirelessEvent` and `EVT_AP_Notification`, all in
+`sbin/ubntbox`. The intersection is one event — `EVT_AP_RadarDetected` — and it is
+implemented (see "DFS radar detection" below). The other eight controller-side strings are
+declined as **not device-sent**: the controller raises them itself from what it already has.
+`EVT_AP_WirelessEvent`/`EVT_AP_Notification` are declined the other way round: **no handler
+in 10.6.106**.
+
+Two further declines from the same sweep, both with the condition read out of the jar:
+
+- `commit_errors` — the device reporting a failed config apply, which would be a genuinely
+  useful thing for openUF to send. `com.ubnt.service.devmgr.l.AqxpICcpcuIxnda` reads it only
+  under `hyFnQ2.hasFeature(GATEWAY)`, and an AP identity never has that feature. Declined:
+  **gateway-only path**.
+- `ethernet_table` / `antenna_table` / `hw_caps` / `fw3_caps` / `sys_error_caps` — all absent
+  or zero in openUF's payload. `ethernet_table` is a controller-side setter
+  (`setEthernetTable`, consumed by "Trusted Port: resolveWiredMacs") that 6.8.2 never emits;
+  `hw_caps`'s bits are screen (1), LED colour (2), LCM (8), RPS (16), boot sound (32), smart
+  outlet (128), accelerometer (512), LED brightness (0x4000) and the compatible-PoE mask
+  (0x3800) — none of which an OpenWrt AP presenting as a U6-IW has. Declined: **nothing true
+  to claim**.
+
+#### DFS radar detection: `EVT_AP_RadarDetected`
+
+The wire contract, read from the handler rather than inferred —
+`com.ubnt.service.devmgr.e.c.Cuhf`, whose `kCNoUwYXLXMAUl(long, device, doc)` is:
+
+```java
+if (!doc.containsAllFields(new String[]{"channel", "freq"})) return false;
+String channel = doc.getString("channel");
+int freq = doc.getInt("freq");
+... alert(..., "ap", dev.getMAC(), "ap_name", dev.getName(),
+          "radar_channel", channel, "freq", freq)
+```
+
+So: the envelope is the ordinary notif inform (`inform_as_notif`, `notif_reason = "event"`),
+the payload needs `event_string`, `channel` **as a string** and `freq` **as a number**, and
+returning false lands in the dispatcher's `debug("Event without handler, payload: {}")`.
+`event_defs.json` carries the rest: subsystem `wlan`, `event_enabled: true`, message
+`"{ap} detected radar on channel {radar_channel} ({freq} MHz)"`, `is_negative: false`.
+6.8.2's own payload is the same three fields plus `vap`, from the string pool around
+`EVT_AP_RadarDetected` in `sbin/ubntbox`: `"DFS: Radar detected on channel %u (freq %u)"`,
+`event_string`, `mca-custom-alert`, `freq`, `vap`. openUF sends `vap` too.
+
+Device side: hostapd prints `DFS-RADAR-DETECTED freq=5500 ht_enabled=0 chan_offset=0
+chan_width=1 cf1=5530 cf2=0` on the BSS control socket. `freq` is where the radar was and
+`cf1` the BSS's centre frequency — on an 80 MHz channel they are different channels (5500 is
+100, 5530 is 106), so the channel is derived from `freq`. A line whose `freq` is unusable is
+dropped rather than reported with a guessed channel, since the handler needs both fields.
+
+**Lab, 10.6.106, 2026-10-27.** `debug.device=debug` in `system.properties` (restart required)
+puts the dispatcher's own decision in `server.log`, which makes this testable without a radio:
+
+| sent | `server.log` |
+|---|---|
+| `{event_string: EVT_AP_RadarDetected, channel: "100", freq: 5500, vap: "phy1-ap0"}` | `notif inform` … `Inform finished`, **no** "Event without handler" |
+| the same with `channel` removed | `Event without handler, payload: {"event_string":"EVT_AP_RadarDetected","freq":5500}` |
+| `{event_string: EVT_AP_NoSuchEventOpenUF, channel: "100", freq: 5500}` | `Event without handler, payload: {…}` |
+
+The two negative controls are what make the first row evidence: the dispatcher is reached, it
+logs its refusals at the level that was enabled, and it refused exactly the payloads it should.
+
+What the lab **cannot** show: the stored event. 10.6.106 keeps no documents in Mongo's
+`event` or `alarm` collections (both are empty even for adoption on a 10-day-old lab site),
+and `GET`/`POST /api/s/default/stat/event` is gone — 404 on this build. The jar carries
+`com/ubnt/dao/logs/`, `schema/initial/script/logs-schema.sql` and `sqlite-jdbc`, so events
+moved to a separate log store that this container does not provision. Handler acceptance is
+proven; the UI row is not.
+
+A notif inform with a *minimal* identity (mac/model/version only) is refused with HTTP 400.
+The one-shot controls above had to repeat what `build_json` puts in `_notif_identity` —
+serial, platform, hostname, ip, inform_url, cfgversion, required_version, state, uptime.
+Worth knowing before writing another notif test by hand.
 
 ### Axis 4 — commands: `syswrapper.sh`'s own answer list vs openUF's dispatcher
 

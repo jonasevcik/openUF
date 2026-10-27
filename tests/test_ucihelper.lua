@@ -3957,6 +3957,13 @@ Wiphy phy2
 		fn = function()
 			with_ucihelper(function(db)
 				seed_radios({"radio0", "radio1", "radio2", "radio3"})
+				-- Bands matter here: ieee80211d=0 is refused on 5 GHz (see the
+				-- 802.11h test below), so the radios that are meant to end up
+				-- at 0 have to be 2.4 GHz ones.
+				local c = ucihelper._uci.cursor()
+				for _, r in ipairs({"radio0", "radio1", "radio2", "radio3"}) do
+					c:set("wireless", r, "band", "2g")
+				end
 				ucihelper.apply_config({
 					radio_table = {{name = "radio0"}, {name = "radio1"},
 						{name = "radio2"}, {name = "radio3"}},
@@ -3989,6 +3996,58 @@ Wiphy phy2
 					"nobody asked: written off, so the applied state is visible")
 				assert_nil(db.wireless.radio2.ieee80211d,
 					"a radio no WLAN carried the key for is left alone")
+			end)
+		end
+	},
+	{
+		-- A production outage, both boards, 2026-10-27: hostapd refuses the
+		-- whole interface with "Cannot enable IEEE 802.11h without IEEE
+		-- 802.11d enabled", and hostapd.uc emits ieee80211h=1 for every
+		-- hw_mode 'a' radio with a country. The failure is
+		-- `hostapd.add_iface failed` -- the 5 GHz phy stays down -- and it
+		-- lands at the next `wifi reload`, not at the push that wrote the
+		-- option, which is why the provision looked clean.
+		name = "ucihelper: the Country IE is never turned off on a 5 GHz radio",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1", "radio2", "radio3", "radio4"})
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "radio0", "band", "5g")
+				c:set("wireless", "radio1", "band", "2g")
+				c:set("wireless", "radio2", "hwmode", "11a")
+				c:set("wireless", "radio3", "channel", "36")
+				-- radio4: no band, no hwmode, channel auto -- the band is not
+				-- knowable, so it must NOT be the one that takes a radio down.
+				c:set("wireless", "radio4", "channel", "auto")
+				-- An earlier openUF left this radio at the value that breaks
+				-- hostapd; the next push has to repair it, not leave it.
+				c:set("wireless", "radio0", "ieee80211d", "0")
+				ucihelper.apply_config({
+					radio_table = {{name = "radio0"}, {name = "radio1"},
+						{name = "radio2"}, {name = "radio3"}, {name = "radio4"}},
+					vap_table = {
+						{ssid = "a", radio = "radio0", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "b", radio = "radio1", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "c", radio = "radio2", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "d", radio = "radio3", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "e", radio = "radio4", security = "wpa2",
+						 country_beacon = false},
+					},
+				}, nil)
+				assert_eq(db.wireless.radio0.ieee80211d, "1",
+					"band=5g: the controller's 'off' cannot be honoured, and the"
+					.. " stale 0 is repaired")
+				assert_eq(db.wireless.radio1.ieee80211d, "0",
+					"band=2g: honoured, no 802.11h there")
+				assert_eq(db.wireless.radio2.ieee80211d, "1", "hwmode=11a")
+				assert_eq(db.wireless.radio3.ieee80211d, "1", "channel 36")
+				assert_eq(db.wireless.radio4.ieee80211d, "1",
+					"band unknown: treated as 5 GHz, because the cost of"
+					.. " guessing wrong is a radio with no SSID on the air")
 			end)
 		end
 	},

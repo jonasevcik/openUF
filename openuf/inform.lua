@@ -164,6 +164,10 @@ M._roam_fast         = false
 M._roam_keep         = false
 M._roam_st           = nil
 M._pre_blob          = nil
+-- Whether any radio was on a DFS channel on the last build_json, which is
+-- what decides the control-socket monitors are worth running even with
+-- 802.11k enrichment off: they are the only producer of the radar event.
+M._dfs_radio         = false
 
 -- Matches rrmscan.merge_into's own cutoff, which exists because the
 -- controller's rogue-AP ingestion silently drops any entry with age >= 30.
@@ -810,6 +814,25 @@ function M.build_json(st, cfg, ufhw)
 				break
 			end
 		end
+
+		-- Is any radio somewhere a radar hit can happen? Read off the
+		-- configured channel rather than the live one on purpose: "auto" has
+		-- no channel here and ACS can land on a DFS channel either way, so an
+		-- auto radio counts, and the monitors then run for a 2.4-only board
+		-- too. Cheap: they are one hostapd_cli per BSS, idle until an event.
+		local dfs_radio = false
+		for _, r in ipairs(radio_table) do
+			local ch = tostring(r.channel or "")
+			if ch == "" or ch == "auto" or ch == "0" then
+				-- r.radio is get_radio_table's band ("ng"/"na"); build_json
+				-- only re-derives `band` further down, after this point.
+				if r.radio ~= "ng" then dfs_radio = true end
+			elseif M._rrmscan and M._rrmscan.is_dfs_channel
+				and M._rrmscan.is_dfs_channel(ch) then
+				dfs_radio = true
+			end
+		end
+		M._dfs_radio = dfs_radio
 
 		-- Live per-radio channel utilization, parallel to radio_table (matches
 		-- real UniFi's split of static config vs. live stats). Also kept in
@@ -5636,7 +5659,13 @@ function M._rrm_tick(cfg, st)
 	M._roam_fast, M._roam_st = assoc_on and rrm.drain ~= nil, st
 	M._roam_keep = rrm_on and true or false
 	if not (assoc_on and rrm_on) then M._pre_blob = nil end
-	if not rrm_on and not assoc_on then
+	-- A radio that can see radar is a third consumer of the control-socket
+	-- monitors, alongside 802.11k enrichment and connection tracking. Without
+	-- it in this condition the whole path below is skipped -- and the branch
+	-- stops the collector and deletes the event file -- so on a site with
+	-- neither of the other two the radar event would never be sent.
+	local dfs_on = M._dfs_radio and true or false
+	if not rrm_on and not assoc_on and not dfs_on then
 		-- Enrichment is off, but a collector from an earlier run with it ON may
 		-- still be alive: it is a detached `ubus subscribe` child reparented to
 		-- init, so it outlives both the config change and the daemon. Nothing
@@ -5677,11 +5706,26 @@ function M._rrm_tick(cfg, st)
 			pcall(M._assoctrack.teardown)
 			M._assoc_installed = false
 		end
-		pcall(rrm.collector_ensure,
-			assoc_on and {on_auth = M._assoctrack.forget_shell("m"), fdb = true} or nil)
-		-- The control-socket monitors serve only the 802.11k enrichment:
-		-- connection tracking reads the ubus lines alone.
-		if rrm_on then
+		-- The `ubus subscribe` half serves enrichment and connection tracking
+		-- only: the radar event comes off the control socket, so a DFS-only
+		-- site pays for the monitors and not for the subscriber.
+		if rrm_on or assoc_on then
+			pcall(rrm.collector_ensure,
+				assoc_on and {on_auth = M._assoctrack.forget_shell("m"), fdb = true} or nil)
+		elseif rrm.collector_running then
+			-- DFS only: no subscriber is wanted, and one left over from a run
+			-- with enrichment on is a detached child that would append to the
+			-- event file forever. collector_stop also takes the monitors and
+			-- the file with it, so it runs before monitors_ensure below.
+			local ok_r, running = pcall(rrm.collector_running)
+			if ok_r and running then pcall(rrm.collector_stop) end
+		end
+		-- The control-socket monitors serve the 802.11k enrichment and the
+		-- DFS radar event: connection tracking reads the ubus lines alone.
+		-- M._dfs_radio is what build_json saw on the last cycle -- one cycle
+		-- stale, which costs nothing on a check that runs every
+		-- RRM_COLLECTOR_CHECK_INTERVAL.
+		if rrm_on or dfs_on then
 			if rrm.monitors_ensure then pcall(rrm.monitors_ensure) end
 		elseif rrm.monitors_stop then
 			pcall(rrm.monitors_stop)
@@ -5697,6 +5741,9 @@ function M._rrm_tick(cfg, st)
 		local ok_a, err_a = pcall(M._assoc_poll, blob)
 		if not ok_a then io.stderr:write("inform: assoctrack: " .. tostring(err_a) .. "\n") end
 	end
+	-- Before the rrm_on return: a radar hit is reported whether or not 802.11k
+	-- enrichment is on, and the monitors that produce it run on the DFS gate.
+	pcall(M._dfs_poll, blob)
 	if not rrm_on then return true end
 	-- Lines _idle drained since the last heartbeat were ingested there; the
 	-- beacon reports among them are still the harvest's.
@@ -6102,6 +6149,98 @@ local function post_notifs(st, batch, requeue)
 	return #batch, true
 end
 
+-- Device events, as opposed to the per-station notifs above: same envelope
+-- (notif_reason "event"), but the payload is an `event_string` the
+-- controller's own event registry dispatches on, and the device identity is
+-- all the rest it needs. The controller logs the event under its site and
+-- raises the matching alert.
+--
+-- Of the eleven EVT_AP_* strings 10.6.106 has a handler for, exactly one is
+-- sent by the AP: EVT_AP_RadarDetected. The other ten (ChannelChanged,
+-- DetectRogueAP, Isolated, PossibleInterference, AcsTriggerComplete,
+-- QuickScanEvent, LocationEvent, AfcEvent, RestartProc, RestartedUnknown)
+-- appear nowhere in U7LR 6.8.2's binaries: the controller raises them itself
+-- from what it already knows, so there is nothing for a device to send.
+-- Conversely EVT_AP_WirelessEvent and EVT_AP_Notification, which 6.8.2 does
+-- emit, have no handler in 10.6.106 at all.
+M.MAX_EVENTS = 16
+M._event_queue = {}
+
+-- Two BSSes on the same radio both see the same radar hit, and hostapd prints
+-- the event on each BSS's control socket -- so the same detection arrives
+-- once per BSS. Collapsed on (channel, second): the controller would
+-- otherwise log one alert per VAP for one radar.
+M.EVENT_DEDUP_S = 5
+M._event_seen = {}
+
+function M.queue_event(p)
+	if type(p) ~= "table" or not p.event_string then return false end
+	if p.dedup_key then
+		local now, key = M._time(), p.dedup_key
+		local last = M._event_seen[key]
+		if last and now - last < M.EVENT_DEDUP_S then return false end
+		M._event_seen[key] = now
+		for k, v in pairs(M._event_seen) do
+			if now - v > M.EVENT_DEDUP_S * 4 then M._event_seen[k] = nil end
+		end
+		p.dedup_key = nil
+	end
+	if #M._event_queue >= M.MAX_EVENTS then return false end
+	M._event_queue[#M._event_queue + 1] = p
+	return true
+end
+
+-- The radar detections in one drained collector blob, queued as the
+-- controller's own event. `vap` is the interface hostapd reported it on,
+-- which is what 6.8.2 sends beside channel and freq; the handler reads
+-- channel (as a string) and freq (as a number) and ignores the event if
+-- either is missing.
+function M._dfs_poll(blob)
+	local rrm = M._rrmscan
+	if not (rrm and rrm.parse_dfs) then return 0 end
+	local n = 0
+	for _, d in ipairs(rrm.parse_dfs(blob)) do
+		if M.queue_event{
+			event_string = "EVT_AP_RadarDetected",
+			channel      = tostring(d.channel),
+			freq         = d.freq,
+			vap          = d.ifname,
+			dedup_key    = "radar/" .. tostring(d.channel),
+		} then
+			n = n + 1
+			-- Worth a line of its own: a radar hit takes the radio off that
+			-- channel for 30 minutes, and this is the only record openUF
+			-- leaves of why.
+			io.stderr:write(string.format(
+				"inform: DFS radar detected on channel %d (%d MHz) on %s"
+				.. " -- reported to the controller\n",
+				d.channel, d.freq, tostring(d.ifname)))
+		end
+	end
+	return n
+end
+
+local function take_events(n)
+	local out = {}
+	for i = 1, math.min(n, #M._event_queue) do out[i] = M._event_queue[i] end
+	for _ = 1, #out do table.remove(M._event_queue, 1) end
+	return out
+end
+
+local function requeue_events(list)
+	for i = #list, 1, -1 do table.insert(M._event_queue, 1, list[i]) end
+end
+
+-- Device events ride no capability: unlike the station notifs they are not
+-- gated on notif-assoc-stat, since the controller asked for nothing and the
+-- event is the AP telling it something it has no other way to learn.
+function M._send_events(st)
+	if not (st and st.adopted) or not M._notif_identity then return 0 end
+	if #M._event_queue == 0 then return 0 end
+	local n = post_notifs(st, take_events(M.MAX_EVENTS), requeue_events)
+	return n
+end
+
 -- Roam reports first: they are the ones a delay spoils.
 function M._send_notifs(st)
 	local at = M._assoctrack
@@ -6132,6 +6271,9 @@ function M._roam_poll()
 	local evs = at.parse_events(blob)
 	at.ingest(evs)
 	at.roam_ingest(evs, M._vap_by_ifname)
+	-- This drain is the only one these lines get, so the radar events in it
+	-- are queued here too; they go out with the next heartbeat.
+	pcall(M._dfs_poll, blob)
 	-- Only the roam reports: the funnel's keep the heartbeat's cadence.
 	if #at._roam_queue > 0 and st and st.adopted and M._notif_identity then
 		post_notifs(st, at.take_roams(at.MAX_ROAMS), at.requeue_roams)
@@ -6229,6 +6371,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- heard from this AP, and a notif from a device it considers lost is
 	-- discarded anyway.
 	if M._assoc_enabled(st, cfg) then pcall(M._send_notifs, st) end
+	pcall(M._send_events, st)
 	-- The controller has now seen spectrum_scanning = true: sweep, and
 	-- inform again at once with the results and false.
 	if spectrum_due then

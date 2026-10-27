@@ -543,7 +543,7 @@ Settings carried through from the controller:
 | Group Rekey Interval | `wpa_group_rekey` (seconds, `0` = never). WPA WLANs only. Without it hostapd's default (86400) applies. A WLAN may store 0, which means no rotation |
 | Key caching (`auth_cache`, REST only, default **on**) | `okc` (`0`/`1`). Sent only on a WPA-Enterprise WLAN — a PSK WLAN's push carries no `auth_cache`, so nothing is written there and OpenWrt's own default applies (on for sae/owe and for FT). `disable_pmksa_caching` is not in the 25.12 schema, so an explicit `okc=0` is the whole of "off" that is available |
 | TDLS (`tdls_prohibit`, REST only) | `tdls_prohibit` (`0`/`1`), 1:1. On every WLAN's push, so this always writes |
-| Country IE / 802.11d (`country_beacon`, REST only) | per-**radio** `ieee80211d` (`0`/`1`). The wire key is per WLAN; `ieee80211d` is a wifi-device option, so openUF turns it on for a radio if **any** WLAN on that radio asks for it. A radio no WLAN carried the key for is left alone. It only reaches hostapd once a regulatory domain is set — the generator drops it otherwise, which is also what keeps hostapd from treating it as fatal |
+| Country IE / 802.11d (`country_beacon`, REST only) | per-**radio** `ieee80211d` (`0`/`1`). The wire key is per WLAN; `ieee80211d` is a wifi-device option, so openUF turns it on for a radio if **any** WLAN on that radio asks for it. A radio no WLAN carried the key for is left alone. It only reaches hostapd once a regulatory domain is set — the generator drops it otherwise, which is also what keeps hostapd from treating it as fatal. **On a 5 GHz radio the "off" setting is ignored and `ieee80211d=1` is written anyway**, because OpenWrt emits `ieee80211h=1` for every 5 GHz radio with a country and hostapd refuses the whole interface with *"Cannot enable IEEE 802.11h without IEEE 802.11d enabled"* — the symptom is `hostapd.add_iface failed` in `logread` and a radio with no SSID. openUF logs `Country IE off is not applicable on 5 GHz` once when it overrides. A radio whose band cannot be determined is treated as 5 GHz, for the same reason |
 | Pairwise cipher (`wpa.1.pairwise`, from wlanconf `wpa_enc`, REST only) | the second token of `encryption`: `psk2+gcmp`, `psk2+ccmp256`, `wpa2+gcmp`, … `CCMP` (the controller's `auto` and `ccmp`) writes no suffix, since it is the generator's own default. `gcmp-256` never arrives — the controller refuses the value. **Gated on the radio's cipher suites**, read over `ucode -l nl80211` (`iw` 6.17 prints none): a cipher the phy does not report keeps the default and logs `controller asked for pairwise cipher … -- keeping …`, because hostapd treats an unprogrammable cipher as fatal and the BSS would never come up. Where two radios serve one band the band's set is the intersection; an unknown probe never vetoes. OWE, and the 192-bit suite (which the generator pins to GCMP-256 itself), are left alone |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
@@ -1070,6 +1070,13 @@ drains and truncates on every inform:
   security and channel width come from. A monitor exits when its interface is torn down
   (`wifi down`/`up`, or a config push that rebuilds it), and openUF starts a new one within
   a minute. A `wifi reload` that changes nothing keeps them. Each uses about 0.9 MB.
+  The same hook also passes hostapd's `DFS-*` events, for the radar report below; it drops
+  everything else, so the spool stays beacon reports and DFS lines only.
+
+Because the monitors are the only source of the DFS radar event, they also run when a radio
+is on (or can land on) a DFS channel with `rrm_enrichment` off — see
+[DFS radar reporting](#16-dfs-radar-reporting). The `ubus subscribe` child is not started in
+that case: the radar event comes off the control socket.
 
 hostapd sends every report both ways, and the two copies can reach the spool on different
 informs. A bodiless copy never erases the SSID, security, width or channel the full one
@@ -1153,6 +1160,49 @@ The controller's `scan` command (REST `cmd/devmgr {"cmd":"scan","mac":…}`, opt
 runs `iw dev <if> scan ap-force` on the requested radio or band before the next inform.
 Each request is logged, e.g. `inform: scan_band: scanned 1 of 1 radio(s)`, and an iw
 refusal is logged as `iw refused to scan <if>`.
+
+### DFS radar reporting
+
+On a DFS channel (52–144) the radio must leave the channel for 30 minutes when it detects
+radar. hostapd does that by itself; what was missing is telling the controller, which
+otherwise logs nothing and the channel change looks unexplained.
+
+openUF reads `DFS-RADAR-DETECTED` off hostapd's control socket — the same
+`hostapd_cli -a /tmp/openuf-bresp.sh` monitors the 802.11k enrichment uses — and sends it
+as the AP's own event:
+
+```
+inform_as_notif = true, notif_reason = "event",
+notif_payload = {event_string = "EVT_AP_RadarDetected",
+                 channel = "100", freq = 5500, vap = "phy1-ap0"}
+```
+
+The controller logs *"&lt;AP&gt; detected radar on channel 100 (5500 MHz)"* under the wlan
+subsystem and raises the matching alert. `channel` is a **string** and `freq` a number,
+because that is how 10.6.106's handler reads them; with either missing the controller
+discards the event. The channel is derived from `freq`, which is where the radar was seen —
+not the BSS's centre frequency (`cf1`), which differs on a wide channel.
+
+Nothing to configure. There is no switch for it, and it does not need
+`capability=notif,notif-assoc-stat`: unlike the connection and roam reports, the controller
+asked for nothing. Because the monitors are the only producer, they are kept running
+whenever a radio is on a DFS channel or set to `auto` on 5 GHz, even with
+`rrm_enrichment = false` and `assoc_tracker = false`.
+
+What to expect in the log:
+
+```
+inform: DFS radar detected on channel 100 (5500 MHz) on phy1-ap0 -- reported to the controller
+```
+
+One detection is reported once even when the radio carries several BSSes (hostapd prints the
+event on each BSS's socket). At most 16 events are queued if the controller is unreachable;
+a failed POST keeps them for the next heartbeat.
+
+The other DFS events (`DFS-CAC-START`, `DFS-CAC-COMPLETED`, `DFS-NEW-CHANNEL`,
+`DFS-NOP-FINISHED`) reach the spool too, and are dropped: 10.6.106 has no handler for them.
+They are let through so that `grep DFS- /tmp/openuf-rrm.jsonl` after a hostapd start on a
+DFS channel shows the path works without waiting for real radar.
 
 ### WiFi Connectivity (connection stages)
 
@@ -1699,6 +1749,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Idle clients score low on WiFi Experience, and every client receives the same ~16 KB/s even when nothing is using it | usteerd's broadcast sync, copied to each client by Multicast Enhancement (§ usteer's AP-to-AP sync). Compare a client's `tx bytes` in `iw dev <ifname> station dump` over 30 s across clients. `nft list table bridge openuf_usteer` must show three drop rules while usteerd runs. On an older openUF, the traffic reaches every client |
 | A wired client behind the AP shows terabytes of usage in its 24 h / hourly / daily history, while its live totals look right | A controller collision, not an openUF counter. The controller writes a wired host that an AP reports in `port_table[].mac_table` into the per-client history with no byte counters. A UniFi gateway writes the same client with its own lifetime counter, so the controller adds that whole counter again on every AP inform. The history is wrong, the live totals and the port attribution are right. Expected: a real U6-IW goes through the same code. The only openUF-side fix would be to stop reporting wired hosts, so it is left as is (PROTOCOL-VALIDATION "A wired client's usage history grows") |
 | `logread` is mostly `BEACON-RESP-RX` hex lines | hostapd logging each 802.11k beacon report openUF asked a client for. Raise `rrm_request_interval` (3600 s by default; older `conf.lua` files set 600), or set `rrm_enrichment = false` |
+| A 5 GHz radio left its DFS channel and the controller logged nothing | The radar event comes off hostapd's control socket, so it needs a monitor attached: `pgrep -f '[h]ostapd_cli .*-a /tmp/openuf-bresp.sh'` must list one per BSS, and `hostapd-utils` must be installed. `grep DFS- /tmp/openuf-rrm.jsonl` right after a hostapd start on a DFS channel should show the CAC pair; if that is empty the monitors are not running. openUF logs `inform: DFS radar detected on channel …` for every event it reports |
 | A radio's Ch. Util reads 0 % | Usually true: it is the busy share of the operating channel since the previous inform (~10 s), rounded to whole percent like UniFi firmware, so a quiet 5 GHz cell at 0.4 % shows 0. Check with two `iw dev <ifname> survey dump` readings 10 s apart (`[in use]` entry: Δ`channel busy time` / Δ`channel active time`). Before 2026-10-13 openUF sent the average since the radio came up, which hid every spike |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |

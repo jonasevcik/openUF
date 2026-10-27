@@ -164,6 +164,63 @@ function M.freq_of_channel(ch)
 	return nil
 end
 
+-- The inverse, for hostapd's DFS events: they name a frequency and never a
+-- channel, while the controller's radar handler needs the channel.
+function M.channel_of_freq(freq)
+	freq = tonumber(freq)
+	if not freq then return nil end
+	if freq == 2484 then return 14 end
+	-- math.floor, not plain division: on Lua 5.3 and later `/` is float
+	-- division, so the channel would reach the wire as "100.0" -- a string
+	-- the controller's handler cannot match to a channel. The target is 5.1,
+	-- where the two agree, which is exactly how this would have shipped
+	-- unnoticed.
+	if freq >= 2412 and freq <= 2472 and (freq - 2407) % 5 == 0 then
+		return math.floor((freq - 2407) / 5)
+	end
+	if freq >= 5160 and freq <= 5885 and (freq - 5000) % 5 == 0 then
+		return math.floor((freq - 5000) / 5)
+	end
+	return nil
+end
+
+-- Channels that can carry a radar hit. Deliberately the whole 52-144 span
+-- rather than one regulatory domain's subset: this only gates whether the
+-- control-socket monitors are worth running, and a channel the domain forbids
+-- is never in use anyway.
+function M.is_dfs_channel(ch)
+	ch = tonumber(ch)
+	return (ch ~= nil) and ch >= 52 and ch <= 144
+end
+
+-- DFS radar detections among the drained collector lines. hostapd prints
+-- "DFS-RADAR-DETECTED freq=5500 ht_enabled=0 chan_offset=0 chan_width=1
+-- cf1=5500 cf2=0" on the BSS control socket; the hook prefixes the uptime and
+-- the interface, as it does for BEACON-RESP-RX.
+--
+-- freq is the one field that matters: it is the frequency the radar was seen
+-- on, which is not necessarily the BSS's own centre frequency (cf1) on a wide
+-- channel. A line without a usable freq is dropped rather than reported with a
+-- guessed channel -- the controller's handler needs both fields and ignores
+-- the event if either is missing.
+function M.parse_dfs(blob)
+	local out = {}
+	if type(blob) ~= "string" then return out end
+	for line in blob:gmatch("[^\n]+") do
+		local t, ifname = line:match("^(%d+%.?%d*)%s+(%S+)%s+DFS%-RADAR%-DETECTED")
+		if t then
+			local freq = tonumber(line:match("%sfreq=(%d+)"))
+			local ch = M.channel_of_freq(freq)
+			if ch then
+				out[#out + 1] = {
+					t = tonumber(t), ifname = ifname, freq = freq, channel = ch,
+				}
+			end
+		end
+	end
+	return out
+end
+
 -- Width from the operation elements, injected by inform.lua as
 -- sysinfo.channel_width so the scan cache and beacon reports decide it the
 -- same way. Unset (a test, or a load-order surprise), a report's width is
@@ -450,6 +507,15 @@ end
 -- script per event, which appends the beacon reports, uptime-stamped like the
 -- ubus lines, to the same EVENT_FILE, so a single drain() still reads both.
 -- hostapd_cli runs it as "<script> <ifname> <event words...>".
+--
+-- The hook also passes every DFS-* event, for parse_dfs below. Only
+-- DFS-RADAR-DETECTED is consumed; the rest (DFS-CAC-START, DFS-CAC-COMPLETED,
+-- DFS-NEW-CHANNEL, DFS-NOP-FINISHED) are drained and dropped. They are let
+-- through on purpose: a radar hit cannot be produced on demand, while a CAC
+-- pair arrives on every hostapd start on a DFS channel -- so they are the only
+-- way to show on real hardware that DFS events reach this file at all, which
+-- is the whole of what the radar path depends on. A handful of lines per
+-- hostapd restart is the cost.
 M.ACTION_SCRIPT   = "/tmp/openuf-bresp.sh"
 M.HOSTAPD_CTRL_DIR = "/var/run/hostapd"
 
@@ -457,7 +523,7 @@ function M.action_script()
 	return table.concat({
 		"#!/bin/sh",
 		"# openUF hostapd control-socket hook -- written by rrmscan.lua, do not edit.",
-		'[ "$2" = BEACON-RESP-RX ] || exit 0',
+		"case \"$2\" in BEACON-RESP-RX|DFS-*) ;; *) exit 0 ;; esac",
 		"read -r u _ < /proc/uptime",
 		"printf '%s %s\\n' \"$u\" \"$*\" >> " .. M.EVENT_FILE,
 	}, "\n") .. "\n"

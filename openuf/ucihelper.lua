@@ -1271,8 +1271,36 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	-- device_country_append() returns before emitting ieee80211d at all when
 	-- no radio declares a country (read from 25.12's live generator), so the
 	-- option cannot reach hostapd unaccompanied.
+	--
+	-- **Never 0 on a 5 GHz radio.** hostapd refuses the whole interface with
+	-- "Cannot enable IEEE 802.11h without IEEE 802.11d enabled", and
+	-- `ieee80211h` is exactly what hostapd.uc emits for every radio with
+	-- hw_mode 'a' and a country (it defaults to 1 in the schema, and is
+	-- deleted only for hw_mode != 'a'). The result is not a dropped option but
+	-- `hostapd.add_iface failed`: the 5 GHz phy stays down with no SSID on the
+	-- air and nothing in UCI to explain it. Seen in production on both boards
+	-- (ath79/ath10k and filogic/mt76) at the first `wifi reload` after this
+	-- option was first written -- not at the push that wrote it, which is why
+	-- reading UCI and hostapd.conf straight after the provision looked clean.
+	-- 802.11h carries DFS and TPC, so suppressing the country IE there is not
+	-- something to trade for it; the radio keeps 802.11d and the controller's
+	-- setting is honoured on 2.4 GHz only.
 	if country_beacon ~= nil then
-		cursor:set("wireless", radio, "ieee80211d", country_beacon and "1" or "0")
+		local five = band_for_device({
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel"),
+		}) == "na"
+		-- An explicit 1, not a delete: this also repairs a radio an earlier
+		-- openUF left at 0.
+		cursor:set("wireless", radio, "ieee80211d",
+			(country_beacon or five) and "1" or "0")
+		if five and not country_beacon and not M._warned_11d then
+			M._warned_11d = true
+			io.stderr:write("openuf: " .. tostring(radio) .. ": Country IE off is"
+				.. " not applicable on 5 GHz -- 802.11h (DFS) requires 802.11d,"
+				.. " and hostapd refuses the interface without it\n")
+		end
 	end
 	if rates then
 		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives
