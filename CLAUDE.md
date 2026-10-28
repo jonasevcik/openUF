@@ -18,8 +18,11 @@ instances (`announce`, `inform`) from `/opt/openuf/`.
   or by path as the modules do, never with a bare `require "util"`. Point a module's
   `M._read_file`-style seams at it rather than copying a helper.
 - `modelmap/` = board hardware profile, `ufmodel/` = presented UniFi identity
-- `PROTOCOL-VALIDATION.md` — the evidence log for every wire-format claim. Read the
-  relevant section before touching a protocol field; add to it when you establish one.
+- `docs/WIRE-REFERENCE.md` — the wire format itself: envelope, response `_type`s, every
+  `system_cfg` key, every outbound field. Read the relevant section before touching a
+  protocol field. `PROTOCOL-VALIDATION.md` — how those claims were established, the
+  environments, the findings that cost real debugging, the firmware sweep's verdicts, the
+  open questions and the dead ends. Add to whichever one fits when you establish something.
 
 ## Build & test
     eval $(luarocks path --local) && lua tests/run_tests.lua
@@ -70,6 +73,16 @@ Put every verification step into a tier and name the tier:
    and DSA can be settled here. See `CLAUDE.local.md` if present.
 
 ## Engineering rules learned the hard way
+- **Design a new feature for weak hardware as you write it**, not in a later audit pass.
+  Users run openUF on 9.6 MB-overlay ath79 boards. Hold new code against the ruleset
+  before calling it done: one lookup/walk pass per tick, derived facts computed once per
+  push, caches keyed on what can change them, an interval gate plus a cheap change
+  detector, sysfs over forks, one `nft -f` transaction per rebuild, shared helpers in
+  `util.lua` over copies, read-and-compare before a flash write, `table.concat` over `..`,
+  one line → one pattern, `find` over `gsub`. Never put a blocking `io.popen` on the
+  `handle_response` path without a guard and a `timeout`. State the measured cost in the
+  commit body. A week of features (2026-10-22..28) gave back part of the previous
+  fortnight's gains in nine places; each was cheap to avoid and expensive to find later.
 - **A command that ran isn't a command that succeeded.** Read state back with the
   tool's own `show`/`list` (`swconfig ... show`, `nft list`, `/var/run/hostapd-*.conf`),
   not the UCI you wrote.
@@ -111,4 +124,29 @@ Put every verification step into a tier and name the tier:
   and check the message too.
 - A feature or confidence change updates **README.md** (capability table, ✅ live-confirmed
   / ⚠️ unconfirmed + reason) **and USAGE.md** (config keys, deps, UCI mapping,
-  troubleshooting) in the same commit. Evidence goes in PROTOCOL-VALIDATION.md.
+  troubleshooting) in the same commit. Wire keys go in `docs/WIRE-REFERENCE.md`, evidence in
+  PROTOCOL-VALIDATION.md.
+
+## Write docs compact
+Apply these while writing the feature's docs, not in a later cleanup pass.
+- **One fact, one home.** README = does it work and what is the catch. USAGE = how to
+  configure it and what breaks. `docs/WIRE-REFERENCE.md` = the keys and fields.
+  `PROTOCOL-VALIDATION.md` = the evidence and the findings. Write a fact once and link to
+  it; a fact in two files goes stale in one of them.
+- **README cells are two sentences**: status mark, the gate or the reason for ⚠️, a link. A
+  cell that needs a third sentence is a USAGE section.
+- **Write the conclusion, not the investigation.** No "Axis N", no "Step N", no "Audit F11",
+  no retelling how a capture was taken. Record the method only when it is the only way to
+  re-verify the claim (`tools/fw-extract.sh`, the CFR recipe).
+- **One confirmation line per claim**: "live-confirmed on both APs 2026-10-27", plus the
+  single number that *is* the evidence — not the log excerpt and the narrative as well.
+- **Resolve in place; never strike through.** When an open question is answered, delete the
+  entry and correct the fact where it lives. No `~~…~~`, no "✅ Resolved" leftovers; git
+  history is the journal.
+- **Prefer a table row to a paragraph** for anything per-key or per-field, and don't restate
+  the table in prose beside it.
+- **Version only where it matters.** Name a controller or firmware build when the claim is
+  specific to it; otherwise state the fact plainly.
+- **Dead ends stay.** `## Dead ends — do not re-attempt` is never trimmed for length.
+- **A doc edit that only adds is suspect.** When a feature's docs land, check whether they
+  supersede text already there and delete that text in the same commit.

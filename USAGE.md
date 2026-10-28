@@ -55,7 +55,7 @@ back if the install still fails. Then `wpad` is restarted so hostapd re-executes
 > AES-128-GCM-encrypted inform; a device that can only do CBC stays stuck at
 > "Adopting" indefinitely. openUF's GCM support needs a `lua-openssl` build with
 > AEAD/GCM available — the `openssl-util` CLI fallback above is CBC-only and will
-> not get you adopted. See PROTOCOL-VALIDATION.md's "The GCM provisioning gate".
+> not get you adopted. See docs/WIRE-REFERENCE.md's "The GCM provisioning gate".
 
 There is no Lua zlib binding in the OpenWrt 25.12 feeds. openUF therefore sends
 inform payloads uncompressed and decompresses zlib-compressed controller
@@ -271,7 +271,7 @@ discovery requests the UniFi app, WiFiman's Discovery tab and the Device Discove
 Tool broadcast, so they list the AP with its model, name and firmware (one reply
 per asker and request type per half second). Requests sent to the discovery multicast
 group `233.89.188.1` are answered too; IPv6 (`ff02::1`) requests are not, because the
-listener is IPv4 only (see PROTOCOL-VALIDATION.md, "Discovery requests"). `false` turns the broadcast and the responder off together.
+listener is IPv4 only (see docs/WIRE-REFERENCE.md, "Discovery requests"). `false` turns the broadcast and the responder off together.
 Set it to `false` to be adopted over L3 only, and restart the service (the init script reads this
 and simply doesn't start the broadcaster). The reason to turn it off isn't
 noise: a controller that discovered a device via L2 adopts it *by SSHing in*,
@@ -304,7 +304,7 @@ inform: system_cfg: 12 dropped key(s): switch.port.<n>.name x5, switch.vlan.<n>.
 ```
 
 Most of what it lists is dropped deliberately (each case is explained in
-PROTOCOL-VALIDATION.md's `system_cfg` section) — its value is showing you when
+docs/WIRE-REFERENCE.md's `system_cfg` section) — its value is showing you when
 the controller starts sending something openUF has *never* seen, which is how
 two whole features sat unnoticed in every capture for months. Key names and
 counts only: these blobs carry passphrases and the adoption key, so no value is
@@ -318,7 +318,7 @@ inform: unhandled cmd 'clear-counters' (1 since start) -- ignored
 ```
 
 Some of these are expected, such as other device classes' commands. A name not listed in
-PROTOCOL-VALIDATION.md's cmd audit is a request openUF should probably answer, so please report it.
+docs/WIRE-REFERENCE.md's cmd list is a request openUF should probably answer, so please report it.
 
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
 hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
@@ -431,14 +431,12 @@ whether `--bootstrap-adopt` is passed to it.
 > controller explicitly logs `discovered via L3 inform, skip SSH adoption` and
 > never attempts SSH at all — unlike the L2 flow documented above. It delivers
 > the new `authkey` directly in the `mgmt_cfg` field of the `setparam` response
-> sent right after the Adopt click — confirmed against a real controller
-> (`linuxserver/unifi-network-application:10.4.57`), reproduced from a clean
-> environment. openUF's `inform.lua` accepts this only while unadopted, matching
-> `amd989/unifi-gateway`'s reference behavior. Adoption completes to
-> **Connected** — provided the device can encrypt with AES-GCM (see § 1). An
-> earlier version of this guide reported every newly-adopted device getting stuck
-> at "Adopting"; that was the missing GCM backend, not a controller-side issue,
-> and it is resolved — see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
+> sent right after the Adopt click — confirmed against a real controller and
+> reproduced from a clean environment. openUF's `inform.lua` accepts this only
+> while unadopted. Adoption completes to **Connected** — provided the device can
+> encrypt with AES-GCM (see § 1). **A device that stays at "Adopting" forever has
+> no working GCM backend**, which is the one failure that looks like a
+> controller-side problem and is not.
 
 ---
 
@@ -617,89 +615,56 @@ controller sends.
   address in `auth_server_addr`, so two servers that differ in either cannot be
   expressed. openUF takes the port and secret from the **first** server, puts
   every later server that agrees into the list, and drops the rest with a log
-  line naming the index (never the secret). Same for accounting. A RadSec/TLS
-  server is dropped too: the controller sends only the *filenames* of
-  certificates it transfers by another channel, so the server cannot be
-  completed, and treating it as plain RADIUS would put the shared secret on the
-  wire in the clear. There is no `radius.*.tls` key to key that on — the
-  controller never sends one; the presence of
-  `radius.<kind>.<k>.{ca_cert,client_cert,private_key}` is the whole
-  discriminator, and those filenames only arrive at all because openUF claims
-  `fw2_caps` `0x80000` for Hotspot 2.0 (see that row). A WLAN whose every auth server is dropped is
+  line naming the index (never the secret). Same for accounting. **A RadSec/TLS
+  server is dropped too**, with a log line: the controller sends only the
+  *filenames* of certificates it transfers by another channel, so the server
+  cannot be completed, and treating it as plain RADIUS would put the shared
+  secret on the wire in the clear. A WLAN whose every auth server is dropped is
   skipped loudly rather than brought up as a BSS nobody can join.
 - **A RADIUS-assigned VLAN only works for VLANs this AP already has.** openUF
   passes the profile's mode through as `dynamic_vlan` (1 optional / 2 required)
-  but writes no `wifi-vlan` section for it — the push enumerates no VLANs, so
-  there is nothing to build them from. hostapd's VLAN map therefore holds only
-  the VLANs the WLAN itself or a private pre-shared key brought. With
-  "RADIUS assigned VLAN: required" a station assigned anything else is refused.
-  That is deliberate: failing closed beats putting the client on the wrong
-  network, past the segmentation the setting exists for.
+  but writes no `wifi-vlan` section for it, because the push enumerates no
+  VLANs. hostapd's VLAN map therefore holds only the VLANs the WLAN itself or a
+  private pre-shared key brought, and with "RADIUS assigned VLAN: required" a
+  station assigned anything else is refused. That is deliberate: failing closed
+  beats putting the client on the wrong network, past the segmentation the
+  setting exists for.
 
-Not implemented, and silently ignored rather than half-applied: RadSec
-certificates. DAS/CoA and RADIUS MAC authentication were in this list until
-2026-10-27; they have their own section below.
+RadSec certificates themselves are not implemented, and are ignored rather than
+half-applied.
 
 ### RADIUS MAC authentication and Dynamic Authorization (CoA / Disconnect)
 
-Two settings of the same RADIUS profile, both implemented since 2026-10-27, and
-neither limited to a WPA-Enterprise WLAN.
+Two settings of the same RADIUS profile, and **neither is limited to a
+WPA-Enterprise WLAN** — the controller offers MAC Authentication on an open or
+WPA-PSK WLAN just as readily, with no capability gate.
 
 | Controller setting | Wire keys | UCI / hostapd |
 |---|---|---|
-| WLAN → Security → **MAC Authentication** | `aaa.<n>.radius.macacl.status` plus the full `aaa.<n>.radius.auth.<k>.*` block | `macaddr_acl=2`, and the auth servers (see below) |
-| RADIUS profile → **RADIUS DAS** (needs accounting on) | `aaa.<n>.radius.das.{status,port,client,secret}` | `radius_das_port`, `radius_das_client=<ip> <secret>` |
+| WLAN → Security → **MAC Authentication** | `aaa.<n>.radius.macacl.status` plus the full `aaa.<n>.radius.auth.<k>.*` block | `macaddr_acl=2`, and the auth servers as raw lines on a non-EAP WLAN |
+| RADIUS profile → **RADIUS DAS** (needs accounting on) | `aaa.<n>.radius.das.{status,port,client,secret}` | `radius_das_port`, `radius_das_client=<ip> <secret>`, one UDP port per WLAN (3800 + its index) |
 
-- **MAC authentication is not a security type.** The controller offers it on an
-  open or WPA-PSK WLAN just as readily as an Enterprise one, puts no capability
-  gate on it, and sends `radius.macacl.status` on **every** WLAN — the value is
-  the whole discriminator. With it on, the same RADIUS server block an
-  Enterprise WLAN gets arrives on that open WLAN, and hostapd's `macaddr_acl=2`
-  makes the AP ask the server whether a MAC may associate before it may.
-- **The servers go in as raw hostapd lines on a non-Enterprise WLAN.** OpenWrt's
-  generator calls `iface_authentication_server()` only from its EAP branch, so
-  on an open, PSK or SAE BSS the `auth_server_*` UCI options are stored and
-  never reach hostapd. openUF writes them through `hostapd_bss_options` there,
-  repeating the port and secret after each address exactly as the generator
-  does. Accounting is unaffected: `iface_accounting_server()` runs for every
-  auth type, so `acct_server_*` stays an ordinary option.
 - **It fails closed.** A WLAN that asks for MAC authentication and cannot have
   it is **not provisioned**: the log says `skipping WLAN "<ssid>" -- it requires
   RADIUS MAC authentication, and ...`, naming either the RADIUS problem or a
   `wpad` with no RADIUS client. An open WLAN brought up without its MAC ACL
   would admit everyone the setting exists to screen, so a missing WLAN an admin
   can see beats a silently open one.
-- **The MAC *formatting* keys are declined.** `radius.macacl.format` is a printf
-  format string (`%.2X-%.2X-%.2X-%.2X-%.2X-%.2X` for "hyphen upper") and
-  `radius.macacl.emptypassword` a flag; UAP firmware turns them into
-  `macaddr_format=` and `mac_acl_empty_passwd=`, options of UniFi's own patched
-  hostapd. Neither string exists in OpenWrt's hostapd binary on either AP, which
-  always sends the MAC lower-case colon-separated as both User-Name and
-  User-Password. **A RADIUS server configured for another format will reject the
-  client**: set the profile's MAC format to colon-separated lower case, or add
-  that form to the server's user list.
-- **Dynamic Authorization needs a capability claim, and hostapd is the
-  listener.** openUF claims `fw_caps` `0x100000`; the controller then adds the
-  `das.*` keys to every WLAN whose profile has accounting on and which has
-  "RADIUS DAS" or Hotspot 2.0 enabled, one UDP port per WLAN (3800 + its
-  index). hostapd's own `radius_das_client` holds the address **and** the shared
-  secret on one line, so openUF joins them; writing the schema's
-  `radius_das_secret` instead would be dropped on a non-EAP BSS (the generator
-  joins it only in its EAP branch) and hostapd then refuses the whole config
-  with `invalid DAS client` — the BSS would not come up at all.
-- **The `radius.dad.*` shape is declined.** The controller sends CoA twice over:
-  `dad.*` carries a per-client CIDR and expects the AP's own daemon to check it
-  and relay the request from `127.0.0.1` (which is literally what UAP firmware
-  writes as the DAS client). openUF has no such relay, so pointing hostapd at
-  localhost would make it answer nobody; only the `das.*` shape, which names the
-  client directly, is used.
+- **The MAC *formatting* keys are declined**, because OpenWrt's hostapd has no
+  option for them: it always sends the MAC lower-case colon-separated as both
+  User-Name and User-Password. **A RADIUS server configured for another format
+  will reject the client** — set the profile's MAC format to colon-separated
+  lower case, or add that form to the server's user list.
+- **Dynamic Authorization needs `fw_caps` `0x100000`**, which openUF claims, and
+  hostapd itself is the listener.
 - **A RADIUS-assigned VLAN is not honoured on a MAC-authenticated WLAN.** The
-  profile's `dynamic_vlan` is written only on an Enterprise WLAN. On any other,
+  profile's `dynamic_vlan` is written only on an Enterprise WLAN; on any other,
   `2` (required) would make hostapd reject every client of a WLAN that worked a
   moment earlier, since openUF writes no VLAN map for RADIUS-assigned VLANs.
-  The plumbing itself exists (see MAC-based VLANs below, which builds the very
-  same `wifi-vlan` sections); what is missing is the list of VLANs, which a
-  RADIUS profile never enumerates.
+
+Why the servers go in raw, why `das.*` is used and `dad.*` declined, and what
+the firmware does with each key: see
+[the wire reference](docs/WIRE-REFERENCE.md#radius-mac-authentication-and-dynamic-authorization).
 
 ### MAC-based VLANs ("Virtual Network Override")
 
@@ -711,71 +676,54 @@ override network must be a *corporate* network — the controller refuses a
 VLAN-only one with `api.err.NetworkAssignedAsVlanOverrideIsNotCorporate`.
 
 - **Two gates, and the second is site-wide.** `fw_caps` `0x80000000` is the
-  device's own claim, made since 2026-10-27. Beside it the controller requires a
-  ubios gateway that claims the bit or is one of 23 listed models (a UCG Ultra,
-  model `UDRULT`, is both), **and** that no client-bearing AP or switch in the
-  site fails to claim it. One AP without the bit therefore switched the feature
-  off for every device in the site, which is where openUF stood before.
-- **hostapd's accept-MAC list is the consumer**, and its lines take an optional
-  VLAN id after the address. The list is consulted on every authentication
-  *before* `macaddr_acl` is looked at, and a match returns "accept" carrying
-  that VLAN, so a file of its own assigns VLANs without restricting access —
-  an unlisted client still joins as it always did.
+  device's own claim. Beside it the controller requires a ubios gateway that
+  claims the bit or is one of 23 listed models (a UCG Ultra, model `UDRULT`, is
+  both), **and** that no client-bearing AP or switch in the site fails to claim
+  it. **One old AP therefore switches the feature off for every device in the
+  site.**
+- **An unlisted client is unaffected.** hostapd consults the accept-MAC list
+  before `macaddr_acl`, and a match returns "accept" carrying that VLAN, so a
+  file of its own assigns VLANs without restricting access.
 - **Each VLAN also needs a `wifi-vlan` section**, because hostapd refuses a
   station whose VLAN is not in its `vlan_file` ("Invalid VLAN %d received from
   RADIUS server" in `logread`, however little RADIUS is involved). openUF builds
-  them exactly as the private-pre-shared-key path does, into the same
-  `br-openuf<id>`, and one section serves both features when they name the same
-  VLAN. An override whose VLAN openUF cannot build — no `lan_cpueth` — is left
-  out and logged, never downgraded onto the SSID's own network.
-- **The MAC Address Filter owns the same file**, so the route depends on it. See
-  the UCI-mapping row above for the three cases. Two of them *narrow* the list:
-  an override the allow list does not permit is skipped, and one the deny list
-  names is skipped — the accept list is checked first and would otherwise let a
-  denied client in.
-- **Refused outright on a WLAN with RADIUS MAC authentication.** There
-  `macaddr_acl=2` asks the RADIUS server about every client, and an accept-list
-  entry returns "accept" before the question is asked. A VLAN override is not
-  worth bypassing an access control, so openUF logs the WLAN and the count and
-  writes nothing.
-- **Why the file is written before anything points at it.** An
-  `accept_mac_file=` naming a file hostapd cannot read is not a degraded
-  feature: `hostapd_config_read_maclist()` fails the whole BSS, and the WLAN
-  disappears. Same for a malformed line. So the file is written first and the
-  option is only emitted if that succeeded, and every address is validated at
-  the parser.
+  them as the private-pre-shared-key path does, into the same `br-openuf<id>`,
+  and one section serves both features when they name the same VLAN. An override
+  whose VLAN openUF cannot build — no `lan_cpueth` — is left out and logged,
+  never downgraded onto the SSID's own network.
+- **The MAC Address Filter owns the same file**, so the route depends on it (see
+  the UCI-mapping row above for the three cases). Two of them *narrow* the list:
+  an override the allow list does not permit is skipped, and so is one the deny
+  list names — the accept list is checked first and would otherwise let a denied
+  client in.
+- **Refused outright on a WLAN with RADIUS MAC authentication**, where an
+  accept-list entry would return "accept" before the server is asked. openUF
+  logs the WLAN and the count and writes nothing.
+- **The file is written before anything points at it**, and every address is
+  validated at the parser: an `accept_mac_file=` hostapd cannot read, or one
+  malformed line, fails the whole BSS and the WLAN disappears.
 
-⚠️ **What is and is not confirmed.** The wire was captured on a live controller
-and the whole path — accept file, `wifi-vlan` section, `accept_mac_file` and
-`vlan_no_bridge=1` in live hostapd, the VLAN netdev in `br-openuf<id>` — was
-verified on both an ath79 and a filogic board, teardown included. But the
-capture used a placeholder MAC belonging to no device, so **no real client has
-been moved to a VLAN by MAC**. Note also that the validation lab can never
-exercise this: its site has no gateway, so its controller refuses to emit the
-keys at all.
+⚠️ **Not confirmed:** the capture used a placeholder MAC belonging to no device,
+so **no real client has been moved to a VLAN by MAC**. The validation lab can
+never exercise this either — its site has no gateway, so its controller refuses
+to emit the keys at all.
 
 **Hotspot 2.0 / Passpoint: what openUF claims, what it drops.** A Passpoint
 WLAN is a WPA-Enterprise WLAN with an ANQP/GAS profile on top, so everything in
 the WPA-Enterprise section above applies first.
 
-- **Two capability bits, one of them for a feature openUF does not have.** The
-  controller's own validator computes "supports Passpoint" as "supports
-  Hotspot 2.0 **and** supports RadSec", so a Passpoint WLAN is refused with
-  `api.err.DevicePasspointNotSupported` unless openUF claims `fw_caps`
-  `0x800000` *and* `fw2_caps` `0x80000`. openUF claims both when the local
-  hostapd has the interworking options and `CONFIG_HS20`, although it
-  implements no RadSec. The trade is reported here rather than hidden: the one
-  thing the RadSec claim changes on the wire is that the controller starts
-  sending certificate *filenames* for a RadSec RADIUS server, which is the only
-  way openUF can tell such a server apart from a plaintext one — and it then
-  drops it instead of sending the shared secret in the clear. Without the
-  claim, that same server arrived indistinguishable from a plaintext one.
-- **Lists are raw hostapd lines, not UCI lists.** The OpenWrt generator joins a
-  list option's values with spaces into a single `name=a b c` line, which is
-  not what any of the cumulative interworking options means, and
-  `iface_interworking()` additionally overwrites `domain_name` with the joined
-  `anqp_3gpp_cell_net`. openUF therefore writes those through
-  `hostapd_bss_options`, which the generator appends verbatim and last.
+- **Two capability bits, one of them for a feature openUF does not have.** A
+  Passpoint WLAN is refused with `api.err.DevicePasspointNotSupported` unless
+  openUF claims `fw_caps` `0x800000` *and* `fw2_caps` `0x80000` (RadSec), which
+  it does when the local hostapd has the interworking options and `CONFIG_HS20`,
+  although it implements no RadSec. The trade, stated rather than hidden: the
+  claim makes a RadSec RADIUS server arrive with its certificate *filenames*,
+  which is the only way openUF can tell it from a plaintext one — and it then
+  drops that server with a log instead of sending the shared secret in the
+  clear. Without the claim it was indistinguishable.
+- **Lists are raw hostapd lines, not UCI lists**, because OpenWrt joins a list
+  option's values with spaces into one line, which is not what any cumulative
+  interworking option means.
 - **Dropped individually, never silently mangled.** Any value carrying a
   control character is dropped (it would end the hostapd config line and let
   the rest be read as further options), as is a language code longer than three
@@ -877,18 +825,16 @@ things on the AP, and openUF builds all three:
    before the bridge ever sees it. Steps 1 and 2 are the whole path there.
 
 > **Why not simply tag every socket.** openUF used to, and it broke every untagged
-> wired client behind an AP running a tagged SSID. On the `ar8216`/`ar8226`/`ar8229`/
-> `ar8236` driver family the tag flag is **not** per (port, VLAN): `ar8xxx_sw_set_ports()`
-> folds it into one global per-port bitmask (`priv->vlan_tagged`) from which
-> `__ar8216_setup_port()` picks add-tag vs strip-tag *for every VLAN at once*. Tagging a
-> socket into VLAN 10 therefore made it egress-tagged in VLAN 1 too, and the printer
-> plugged into it went deaf while still transmitting — UCI read `1 2 3 4 0t` while the
-> switch reported `0t 1t 2t 3t 4t`. The AR8327 has a real per-(port, VLAN) tag table and
-> showed none of it, which is how the bug survived. A consequence worth knowing on the
+> wired client behind an AP running a tagged SSID: on the `ar8216`/`ar8226`/`ar8229`/
+> `ar8236` driver family the tag flag is one **global per-port bitmask**, not a property
+> of (port, VLAN), so tagging a socket into VLAN 10 made it egress-tagged in VLAN 1 too
+> and the host plugged into it went deaf while still transmitting. The AR8327 has a real
+> per-(port, VLAN) table and showed none of it. A consequence worth knowing on the
 > global-bitmask chips: a port cannot be untagged in VLAN 1 *and* tagged in VLAN 10, so
 > running a tagged wireless VLAN necessarily leaves the **uplink** socket egress-tagged
 > for VLAN 1 as well. UniFi gateways accept that, and it is confined to the one port
-> facing the gateway.
+> facing the gateway. Details in
+> [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md#a-tagged-ssids-trunk-deafened-every-wired-client-on-the-ap).
 
 > **Keep VLAN ids below the switch's VLAN table size.** netifd has no `vid` option
 > (`strings /sbin/netifd` lists only `vlan` and `ports`), so a `switch_vlan` section's
@@ -929,15 +875,13 @@ network. `br-lan` keeps the uplink socket, the unassigned sockets and the AP's m
 address, untouched.
 
 The `bridge-vlan` + `vlan_filtering` route was rejected for two reasons, both worth knowing
-if you are tempted to add it:
-
-1. `br-lan` carries the AP's own management address. Turning `vlan_filtering` on there means
-   every VLAN — the management one included — must be declared exactly right, or the device
-   is stranded at the far end of a cable. Nothing openUF does should be able to do that.
-2. It would silently fight the tagged-SSID path. `wan.10` is an 8021q device on the `wan`
-   **bridge port**, and `vlan_do_receive()` runs ahead of the bridge's `rx_handler`, so
-   VLAN 10 frames are taken by `wan.10` before `br-lan` ever sees them. A `bridge-vlan`
-   declaring VLAN 10 on `br-lan` would receive nothing while looking perfectly correct.
+if you are tempted to add it: `br-lan` carries the AP's own management address, so turning
+`vlan_filtering` on there means every VLAN — the management one included — must be declared
+exactly right or the device is stranded at the far end of a cable; and it would silently
+fight the tagged-SSID path, since `wan.10` takes VLAN 10 frames before `br-lan` ever sees
+them, so a `bridge-vlan` declaring VLAN 10 would receive nothing while looking perfectly
+correct. The full reasoning, netifd bugs included, is in
+[PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md#why-learning-1-cannot-come-back).
 
 Scope on DSA: **Native VLAN only.** A bridge gives a port exactly one untagged home, which
 is what a Native VLAN is and what an AP's downstream socket needs. A port given nothing but
@@ -977,12 +921,11 @@ drops it rather than passing it to the CPU, where the software bridge would have
 it. It is the same one-FDB hazard as the tagged uplink's own `learning '0'`, reached from
 the other side.
 
-The failure is brutal to diagnose because **outbound is perfect throughout**. Captured on
-an AX3000T with an IKEA Trådfri hub on port 2, learning on: four DHCP DISCOVERs leave the
-socket, arrive on `wan.10`, leave the uplink correctly tagged — and nothing comes back, not
-even on the physical port, because a frame dropped in hardware never reaches the CPU to be
-captured. Every counter, every log line and the controller all say the port move worked.
-With learning off: DISCOVER → OFFER → REQUEST → ACK in 2 ms.
+The failure is brutal to diagnose because **outbound is perfect throughout**: with learning
+on, DHCP DISCOVERs leave the socket, arrive on the tagged uplink and go out correctly tagged
+— and nothing comes back, not even on the physical port, because a frame dropped in hardware
+never reaches the CPU to be captured, so every counter, every log line and the controller all
+say the port move worked. With learning off: DISCOVER → OFFER → REQUEST → ACK in 2 ms.
 
 Two consequences worth knowing:
 
@@ -1081,11 +1024,14 @@ membership in every other `switch_vlan` section, and an explicit *exclude* drops
 port's membership from that VLAN. Two safety refusals apply — an exclude that would leave
 the port untagged **nowhere** is ignored, and the management VLAN is never stripped of
 its last downstream port. openUF snapshots the original `ports` strings into `state.json`
-(`swvlan_backup`) before the first change, and `switchvlan.restore()` puts them back. Unticking the device-level **Port VLAN** box runs
-that restore automatically (the wire keeps the `switch.*` block with both gates at
-`disabled`, which openUF treats as the explicit off signal); a push that carries no
-`switch.*` block at all leaves the switch untouched. Inspect the result with
-`uci show network` and `swconfig dev switch0 show`.
+(`swvlan_backup`) before the first change, and `switchvlan.restore()` puts them back.
+Unticking the device-level **Port VLAN** box runs that restore automatically: both gates at
+`disabled` is the explicit off signal, and a push that carries no `switch.*` block at all
+also counts as off **while openUF holds a reversibility ledger** — a device that has had Port
+VLAN on and then has it unticked gets exactly that, a full `system_cfg` with the keys simply
+gone. With no ledger, nothing is torn down, so an older controller cannot trigger a teardown
+openUF never applied. Inspect the result with `uci show network` and
+`swconfig dev switch0 show`.
 
 > The generated UCI is unit-tested, but **openUF has no switch hardware to verify against** —
 > that these sections actually program the switch ASIC, and that
@@ -1191,7 +1137,7 @@ drains and truncates on every inform:
 
 Because the monitors are the only source of the DFS radar event, they also run when a radio
 is on (or can land on) a DFS channel with `rrm_enrichment` off — see
-[DFS radar reporting](#16-dfs-radar-reporting). The `ubus subscribe` child is not started in
+[DFS radar reporting](#dfs-radar-reporting). The `ubus subscribe` child is not started in
 that case: the radar event comes off the control socket.
 
 hostapd sends every report both ways, and the two copies can reach the spool on different
@@ -1597,10 +1543,9 @@ by which list it is in, and sends the two halves by different routes:
 
 Two traps worth knowing:
 
-- **An IP entry carries no port.** The portal's own accepts do (`8880`, `8843`, `8881`),
-  and until 2026-10-26 openUF knew only that shape — so an IP walled-garden entry, and
-  the egress rule that lets its replies back, were parsed as unknown and silently
-  unenforced. Both shapes are now applied.
+- **An IP entry carries no port**, unlike the portal's own accepts (`8880`, `8843`,
+  `8881`). A parser that requires one reads both the entry and the egress rule that lets
+  its replies back as unknown shapes and silently enforces neither.
 - **Re-resolution is on the controller's own cadence.** Along with the garden it pushes
   `*/10 * * * *  syswrapper.sh refresh-walled-garden 1`. openUF does that work in the
   inform loop (`GUEST_WG_INTERVAL`, 600 s) and on every config push, so `sysconf.lua`
@@ -1792,7 +1737,7 @@ refused.
 
 **Cron runs only commands openUF provides.** 10.6.106 can push exactly four, and this
 is the whole list (every `syswrapper.sh` string in the controller — see
-PROTOCOL-VALIDATION.md § *Axis 4*):
+PROTOCOL-VALIDATION.md § *Firmware as a source*):
 
 | Pushed command | Schedule | Pushed when | openUF |
 |---|---|---|---|

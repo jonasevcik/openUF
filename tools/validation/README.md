@@ -18,40 +18,32 @@ what each requires.
 The "AP" is Alpine with a **mocked UCI**, not OpenWrt. Two things to know before
 you trust a result here:
 
-- **UCI persists across process restarts** (since 2026-09-10). The mock writes
+- **UCI persists across process restarts.** The mock writes
   `/var/lib/openuf-uci-mock.json` on every `set`/`delete` and reloads it at
-  module load, the way a real `/etc/config/*` survives a reboot. That is what
-  makes "does this survive a restart?" answerable here at all — the startup
-  reapply of the Multicast/Broadcast Blocker and the WiFi Speed Limit rebuilds
-  both from `openuf_bcfilt`/`openuf_ratelimit_*` stamped on each managed
-  section, and that is now testable end to end. Before this the mock reseeded
-  on every process start, so the whole question was invisible.
-  Clear it with `docker compose down -v` (it lives in the container's writable
-  layer) or `lua -e 'require("uci")._reset()'` for a clean run without
-  recreating the container.
+  module load, the way a real `/etc/config/*` survives a reboot, which is what
+  makes "does this survive a restart?" answerable here at all. Clear it with
+  `docker compose down -v` (it lives in the container's writable layer) or
+  `lua -e 'require("uci")._reset()'` for a clean run without recreating the
+  container.
 - **`state.json` does survive**, since it is a real file in the container's
   writable layer. `docker restart openuf-validation-ap` therefore makes a
   faithful reboot test for anything driven from state.json — the static-IP
   reapply, blocked clients, the LED toggle. The network is reset by Docker on
   restart, exactly as a reboot resets it.
 
-The mock also gained a correct `cursor:delete(config, section, option)` on the
-same date. It had ignored the third argument and deleted the whole **section**
-either way — and the option form is not a rare path: `rf_config` deletes
-`txpower`/`basic_rate`/`supported_rates`/`legacy_rates` on essentially every
-radio push, and `wlan_add` deletes `macfilter`/`maclist` on every WLAN without a
-MAC filter. The lab was destroying its own `radio0`/`radio1` wifi-device sections
-and its freshly written wifi-iface sections on the ordinary push. The unit-test
-mock in `tests/test_ucihelper.lua` always had this right, which is why unit tests
-never showed it.
+**`grep -c "handle_response failed" /tmp/inform.log` must read 0 before you trust
+anything here.** A mock gap raises inside `_tick`'s pcall and surfaces as one
+stderr line, with everything after it — the bcfilter and shaper reconciles, the
+switchvlan pass, `handle_response`'s own final `state.save` — simply not run. Two
+such gaps have been fixed (a missing `cursor:get()`, and a
+`cursor:delete(config, section, option)` that ignored its third argument and
+destroyed the whole section); the unit-test mock in `tests/test_ucihelper.lua`
+had both right, which is why unit tests never showed them.
 
-The mock gained `cursor:get()` on 2026-09-10. It had never had one, and
-`usteer.set_enabled`'s no-op guard calls it on every WiFi setparam — so **every
-setparam in this environment died partway through**, inside `_tick`'s pcall,
-surfacing as a single stderr line. Everything after that call had therefore never
-run here: the bcfilter and shaper reconciles, the switchvlan pass, and
-`handle_response`'s own final `state.save`. If you see `handle_response failed`
-in the AP's log, stop and fix the cause before trusting anything downstream of it.
+**To test against an older controller**, pin the image with a one-line override
+file: `docker compose -f tools/validation/docker-compose.yml -f <override> up -d
+--build`, where the override sets `services.controller.image`. Reset the stack
+first (`down -v`) — the Mongo state is not cross-compatible.
 
 ## 1. Start the environment
 
