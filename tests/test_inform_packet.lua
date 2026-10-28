@@ -3245,6 +3245,88 @@ return {
 		end
 	},
 	{
+		name = "inform packet: the Hotspot 2.0 key table is indexed once, not once per collector",
+		fn = function()
+			-- _wire_hs20 has seven indexed collectors plus one per NAI realm,
+			-- and each used to re-walk the WLAN's whole key table. Counted
+			-- through string.match, since the hs20 patterns are the only ones
+			-- in the parser naming the block: one decomposition attempt per
+			-- hs20.* key, and nothing per collector.
+			local keys = {
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.access_network_type=2",
+				"aaa.1.hs20.internet=enabled",
+				"aaa.1.hs20.venue_group=2",
+				"aaa.1.hs20.venue_type=8",
+				"aaa.1.hs20.venue_name.1.lang=eng",
+				"aaa.1.hs20.venue_name.1.name=openUF Lab",
+				"aaa.1.hs20.venue_name.2.lang=fra",
+				"aaa.1.hs20.venue_name.2.name=Labo openUF",
+				"aaa.1.hs20.nai_realm.1.name=example.com",
+				"aaa.1.hs20.nai_realm.1.eap_method=13",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.id=5",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.val=6",
+				"aaa.1.hs20.nai_realm.2.name=example.net",
+				"aaa.1.hs20.nai_realm.2.eap_method=21",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.id=2",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.val=4",
+				"aaa.1.hs20.1.roaming_consortium=506f9a",
+				"aaa.1.hs20.2.roaming_consortium=001bc504bd",
+				"aaa.1.hs20.3gpp.1.mcc=230",
+				"aaa.1.hs20.3gpp.1.mnc=01",
+				"aaa.1.hs20.friendly_name.1.language=eng",
+				"aaa.1.hs20.friendly_name.1.text=openUF Operator",
+				"aaa.1.hs20.capab.1.protocol=6",
+				"aaa.1.hs20.capab.1.port=80",
+				"aaa.1.hs20.capab.1.status=open",
+			}
+			local lines = {
+				"aaa.1.ssid=openuf-eap", "aaa.1.status=enabled", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP", "aaa.1.wpa.1.pairwise=CCMP",
+				"aaa.1.id=2", "aaa.1.auth_cache=enabled",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.port=1812",
+				"aaa.1.radius.auth.1.secret=openufradius",
+			}
+			for _, l in ipairs(keys) do lines[#lines + 1] = l end
+			lines[#lines + 1] = "wireless.1.ssid=openuf-eap"
+			lines[#lines + 1] = "wireless.1.parent=radio0"
+			lines[#lines + 1] = "radio.1.phyname=radio0"
+			lines[#lines + 1] = "radio.1.devname=ath0"
+			local sys_cfg = table.concat(lines, "\n") .. "\n"
+
+			local real, calls = string.match, 0
+			string.match = function(s, p, ...)
+				if type(p) == "string" and p:find("hs20", 1, true) then
+					calls = calls + 1
+				end
+				return real(s, p, ...)
+			end
+			local ok, rt, vt = pcall(inform._parse_wifi_system_cfg, sys_cfg)
+			string.match = real
+			if not ok then error(rt, 0) end
+
+			local hs = vt[1].hs20
+			assert_true(hs ~= nil, "the hs20 block still parsed")
+			assert_eq(#hs.venue_name, 2, "both venue names")
+			assert_eq(#hs.nai_realm, 2, "both realms")
+			assert_eq(#hs.nai_realm[1].auth, 1, "the first realm's auth pair")
+			assert_eq(hs.nai_realm[2].auth[1].id, "2",
+				"and the second realm's own, not the first realm's")
+			assert_eq(table.concat(hs.roaming_consortium, " "),
+				"506f9a 001bc504bd", "both OIs, in index order")
+			assert_eq(#hs.cell_net, 1, "the 3GPP cell")
+			assert_eq(#hs.friendly_name, 1, "the operator name")
+			assert_eq(#hs.conn_capab, 1, "the connection capability")
+			-- Two attempts per key at the very most: the indexed shape, then
+			-- the roaming_consortium one. Ten scans of the table would be
+			-- #keys * 10 or more.
+			assert_true(calls <= 2 * #keys, string.format(
+				"one index pass, not one per collector (%d matches for %d "
+				.. "hs20 keys)", calls, #keys))
+		end
+	},
+	{
 		name = "inform packet: a WAN info octet above 9 is hex, not zero-padded decimal",
 		fn = function()
 			-- "At Capacity" (bit 3) plus "link up" (bits 0-1) is decimal 9 on

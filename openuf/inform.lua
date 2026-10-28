@@ -2637,15 +2637,45 @@ local function _wire_range(v, lo, hi)
 	return tostring(n)
 end
 
--- Collect aaa.<n>.hs20.<prefix>.<k>.* into an index-ordered array. The
--- tokenizer keeps the whole dotted tail as one flat key, so a sub-indexed
--- block is read by re-matching it (same shape as sae.groups / wpa.psk_file).
-local function _wire_indexed(a, pattern, build)
-	local idxs = {}
+-- One pass over the WLAN's key table for every indexed Hotspot 2.0 block.
+--
+-- The tokenizer keeps the whole dotted tail as one flat key, so a sub-indexed
+-- block has to be recovered by re-matching it (same shape as sae.groups /
+-- wpa.psk_file). _wire_indexed used to do that re-match itself, walking every
+-- key of `a` per call -- and _wire_hs20 calls it seven times plus once per NAI
+-- realm, so a Passpoint WLAN paid ~10 full scans of the same table per push.
+--
+-- Instead, index once. Every indexed hs20 key is `hs20.<prefix>.<i>.<leaf>`,
+-- or `hs20.<i>.<leaf>` for roaming_consortium, where <prefix> may itself carry
+-- an index (nai_realm.<i>.eap_method.auth). <leaf> is dotless and anchored, so
+-- <i> is always the key's LAST indexed level -- which is what puts each
+-- realm's auth parameters in a bucket of their own. Keys with no index
+-- (hs20.status, hs20.metrics.*) are read by name and so are skipped here.
+local function _wire_hs20_index(a)
+	local idx = {}
 	for k in pairs(a) do
-		local i = k:match(pattern)
-		if i then idxs[#idxs + 1] = tonumber(i) end
+		if k:sub(1, 5) == "hs20." then
+			local prefix, i, leaf = k:match("^hs20%.(.+)%.(%d+)%.([^.]+)$")
+			if not prefix then
+				i, leaf = k:match("^hs20%.(%d+)%.([^.]+)$")
+				prefix = i and ""
+			end
+			if prefix then
+				local bucket = prefix .. "/" .. leaf
+				local l = idx[bucket]
+				if l then l[#l + 1] = tonumber(i)
+				else idx[bucket] = {tonumber(i)} end
+			end
+		end
 	end
+	return idx
+end
+
+-- The indices filed under <prefix>/<leaf> by _wire_hs20_index, in index order,
+-- as whatever `build` makes of each. nil when none of them survives.
+local function _wire_indexed(idx, prefix, leaf, build)
+	local idxs = idx[prefix .. "/" .. leaf]
+	if not idxs then return nil end
 	table.sort(idxs)
 	local out = {}
 	for _, i in ipairs(idxs) do
@@ -2685,6 +2715,7 @@ local function _wire_hs20(a)
 	if not _wire_bool(a["hs20.status"]) then return nil end
 
 	local function k(suffix) return a["hs20." .. suffix] end
+	local idx = _wire_hs20_index(a)
 
 	local hs = {
 		-- Interworking element. access_network_type is the 4-bit ANQP field
@@ -2714,14 +2745,14 @@ local function _wire_hs20(a)
 	-- in UCI and silently discarded. Writing it would be a consumer keyed on a
 	-- producer that does not exist.
 
-	hs.venue_name = _wire_indexed(a, "^hs20%.venue_name%.(%d+)%.name$", function(i)
+	hs.venue_name = _wire_indexed(idx, "venue_name", "name", function(i)
 		local p = "hs20.venue_name." .. i .. "."
 		local lang, name = _wire_text(a[p .. "lang"], 3), _wire_text(a[p .. "name"])
 		if not (lang and name) then return nil end
 		return {lang = lang, name = name, url = _wire_text(a[p .. "url"], 1024)}
 	end)
 
-	hs.nai_realm = _wire_indexed(a, "^hs20%.nai_realm%.(%d+)%.name$", function(i)
+	hs.nai_realm = _wire_indexed(idx, "nai_realm", "name", function(i)
 		local p = "hs20.nai_realm." .. i .. "."
 		if a[p .. "status"] and not _wire_bool(a[p .. "status"]) then return nil end
 		local name = _wire_text(a[p .. "name"])
@@ -2729,8 +2760,8 @@ local function _wire_hs20(a)
 		if not (name and eap) then return nil end
 		-- The auth parameters are a THIRD level down, under
 		-- aaa.<n>.hs20.nai_realm.<i>.eap_method.auth.<j>.{id,val}.
-		local auth = _wire_indexed(a, "^hs20%.nai_realm%." .. i
-			.. "%.eap_method%.auth%.(%d+)%.id$", function(j)
+		local auth = _wire_indexed(idx, "nai_realm." .. i
+			.. ".eap_method.auth", "id", function(j)
 			local q = p .. "eap_method.auth." .. j .. "."
 			local id  = _wire_range(a[q .. "id"], 1, 255)
 			local val = _wire_range(a[q .. "val"], 0, 255)
@@ -2745,7 +2776,7 @@ local function _wire_hs20(a)
 
 	-- Note the index position: the key is hs20.<k>.roaming_consortium, not
 	-- hs20.roaming_consortium.<k>.
-	hs.roaming_consortium = _wire_indexed(a, "^hs20%.(%d+)%.roaming_consortium$",
+	hs.roaming_consortium = _wire_indexed(idx, "", "roaming_consortium",
 		function(i)
 			local oi = a["hs20." .. i .. ".roaming_consortium"]
 			-- An Organization Identifier is 3 to 15 octets of hex (hostapd
@@ -2757,7 +2788,7 @@ local function _wire_hs20(a)
 			return oi
 		end)
 
-	hs.cell_net = _wire_indexed(a, "^hs20%.3gpp%.(%d+)%.mcc$", function(i)
+	hs.cell_net = _wire_indexed(idx, "3gpp", "mcc", function(i)
 		local p = "hs20.3gpp." .. i .. "."
 		local mcc, mnc = a[p .. "mcc"], a[p .. "mnc"]
 		-- Kept as sent, not renormalised: a two-digit MNC is not a
@@ -2767,7 +2798,7 @@ local function _wire_hs20(a)
 		return {mcc = mcc, mnc = mnc}
 	end)
 
-	hs.friendly_name = _wire_indexed(a, "^hs20%.friendly_name%.(%d+)%.text$",
+	hs.friendly_name = _wire_indexed(idx, "friendly_name", "text",
 		function(i)
 			local p = "hs20.friendly_name." .. i .. "."
 			local lang = _wire_text(a[p .. "language"], 3)
@@ -2776,7 +2807,7 @@ local function _wire_hs20(a)
 			return {lang = lang, text = text}
 		end)
 
-	hs.conn_capab = _wire_indexed(a, "^hs20%.capab%.(%d+)%.protocol$", function(i)
+	hs.conn_capab = _wire_indexed(idx, "capab", "protocol", function(i)
 		local p = "hs20.capab." .. i .. "."
 		local proto = _wire_range(a[p .. "protocol"], 1, 255)
 		local port  = _wire_range(a[p .. "port"], 0, 65535)
