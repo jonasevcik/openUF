@@ -6753,6 +6753,180 @@ return {
 		end
 	},
 	{
+		-- A DFS-only site has no subscriber, so nothing ever writes the event
+		-- file: draining it every heartbeat was a read of the whole file plus
+		-- the truncating rewrite that follows, for nothing.
+		name = "inform: a quiet collector file is not drained",
+		fn = function()
+			local o_rrm, o_at, o_dfs = inform._rrmscan, inform._assoctrack, inform._dfs_radio
+			local o_next, o_time = inform._rrm_collector_next, inform._time
+			local file = os.tmpname()
+			os.remove(file)	-- the DFS-only case: no collector, no file at all
+			local drains = 0
+			inform._rrmscan = {
+				EVENT_FILE = file,
+				drain = function()
+					drains = drains + 1
+					local h = io.open(file, "r")
+					local b = h and h:read("*a") or ""
+					if h then h:close() end
+					local w = io.open(file, "w"); if w then w:close() end
+					return b
+				end,
+				collector_running = function() return false end,
+				collector_stop = function() end,
+				monitors_ensure = function() end,
+				parse_dfs = function(blob)
+					return blob:find("RADAR", 1, true)
+						and {{channel = 100, freq = 5500, ifname = "phy1-ap0"}} or {}
+				end,
+			}
+			inform._assoctrack = nil
+			inform._dfs_radio, inform._time = true, function() return 1 end
+			inform._event_queue, inform._event_seen = {}, {}
+			local o_stderr = io.stderr
+			io.stderr = {write = function() end}
+			local cfg = {config = {rrm_enrichment = false}}
+			local ok, err = pcall(function()
+				inform._rrm_collector_next = 0
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 0, "no file: nothing to drain")
+				local h = io.open(file, "w"); h:close()
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 0, "an empty file costs an open and a seek, not a drain")
+				h = io.open(file, "w")
+				h:write("1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500\n")
+				h:close()
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 1, "lines in it: drained")
+				assert_eq(#inform._event_queue, 1, "and the radar event is queued")
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 1, "the drain emptied it, so the next heartbeat is free again")
+			end)
+			io.stderr = o_stderr
+			os.remove(file)
+			inform._rrmscan, inform._assoctrack = o_rrm, o_at
+			inform._dfs_radio, inform._time = o_dfs, o_time
+			inform._rrm_collector_next = o_next
+			inform._event_queue, inform._event_seen = {}, {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- `elseif rrm.collector_running then` tested a FUNCTION value, so the
+		-- branch was always taken and the pgrep inside it ran every 60 s for
+		-- the lifetime of the daemon -- on every DFS-only site, to be told the
+		-- same thing every time.
+		name = "inform: the collector check stops once it reports there is none",
+		fn = function()
+			local o_rrm, o_at, o_dfs = inform._rrmscan, inform._assoctrack, inform._dfs_radio
+			local o_next, o_time, o_reaped =
+				inform._rrm_collector_next, inform._time, inform._collector_reaped
+			local checks, stops, alive = 0, 0, true
+			inform._rrmscan = {
+				drain = function() return "" end,
+				collector_running = function() checks = checks + 1; return alive end,
+				collector_stop = function() stops = stops + 1 end,
+				collector_ensure = function() end,
+				harvest = function() return {}, {} end,
+				hostapd_objects = function() return {} end,
+				monitors_ensure = function() end,
+				parse_dfs = function() return {} end,
+			}
+			inform._assoctrack = nil
+			inform._dfs_radio = true
+			local clock = 1000
+			inform._time = function() return clock end
+			local function minute()
+				clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+				inform._rrm_tick({config = {rrm_enrichment = false}}, {})
+			end
+			local ok, err = pcall(function()
+				inform._rrm_collector_next, inform._collector_reaped = 0, false
+				minute()
+				assert_eq(checks, 1, "the leftover subscriber is looked for")
+				assert_eq(stops, 1, "and killed")
+				-- A kill whose success is never read back: while it still
+				-- reports alive the question is asked again.
+				minute()
+				assert_eq(checks, 2, "a survivor is chased")
+				assert_eq(stops, 2, "and killed again")
+				alive = false
+				minute()
+				assert_eq(checks, 3, "one more check reports it gone")
+				assert_eq(stops, 2, "nothing left to kill")
+				minute(); minute(); minute()
+				assert_eq(checks, 3, "and that is the last pgrep this state costs")
+				-- Enrichment back on starts a collector, so the answer can
+				-- change again: the latch is cleared.
+				inform._rrm_collector_next = 0
+				inform._rrm_tick({config = {rrm_enrichment = true}}, {})
+				assert_eq(checks, 3, "nothing is pgrepped while one is wanted")
+				alive = true
+				minute()
+				assert_eq(checks, 4, "once it is unwanted again it is looked for afresh")
+			end)
+			inform._rrmscan, inform._assoctrack = o_rrm, o_at
+			inform._dfs_radio, inform._time = o_dfs, o_time
+			inform._rrm_collector_next, inform._collector_reaped = o_next, o_reaped
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- parse_dfs walked the whole blob a second time, right after
+		-- assoctrack.parse_events had walked it for the funnel -- the
+		-- one-pass rule the rest of the tick follows.
+		name = "inform: one walk of the collector blob finds the funnel's events and the radar",
+		fn = function()
+			local at = inform._assoctrack
+			local STA = "00:00:5e:00:53:01"
+			local blob = table.concat({
+				'100.10 { "assoc": {"address":"' .. STA .. '","ifname":"phy1-ap0","signal":-61} }',
+				'100.20 { "probe": {"address":"00:00:5e:00:53:09"} }',
+				'100.30 phy1-ap0 DFS-RADAR-DETECTED freq=5500 ht_enabled=0 cf1=5530',
+				'100.40 phy1-ap0 BEACON-RESP-RX 00:00:5e:00:53:01 1 0 0011',
+			}, "\n") .. "\n"
+			local evs = at.parse_events(blob)
+			local kinds = {}
+			for _, e in ipairs(evs) do kinds[e.ev] = (kinds[e.ev] or 0) + 1 end
+			assert_eq(kinds.assoc, 1, "the association is still parsed")
+			assert_eq(kinds.radar, 1, "and the radar line comes out of the same walk")
+			assert_eq(kinds.probe, nil, "probes are still ignored")
+			local radar
+			for _, e in ipairs(evs) do if e.ev == "radar" then radar = e end end
+			assert_eq(radar.ifname, "phy1-ap0", "the BSS hostapd reported it on")
+			assert_eq(radar.freq, 5500, "the frequency the radar was seen on")
+			assert_eq(radar.t, 100.30, "stamped with the collector's uptime")
+
+			-- Handed those records, _dfs_poll does not walk the blob again.
+			local o_rrm, o_time = inform._rrmscan, inform._time
+			local walks = 0
+			inform._rrmscan = setmetatable({
+				parse_dfs = function(b) walks = walks + 1; return o_rrm.parse_dfs(b) end,
+			}, {__index = o_rrm})
+			inform._time = function() return 7000 end
+			inform._event_queue, inform._event_seen = {}, {}
+			local o_stderr = io.stderr
+			io.stderr = {write = function() end}
+			local ok, err = pcall(function()
+				assert_eq(inform._dfs_poll(blob, evs), 1, "the detection is still reported")
+				assert_eq(walks, 0, "off the walk parse_events already did")
+				assert_eq(inform._event_queue[1].channel, "100",
+					"and radar_of resolved the channel the same way")
+				-- No event list (DFS only, nothing else reading the file):
+				-- parse_dfs does the walk itself, as before.
+				inform._event_queue, inform._event_seen = {}, {}
+				assert_eq(inform._dfs_poll(blob), 1, "the standalone path still works")
+				assert_eq(walks, 1, "by walking the blob")
+			end)
+			io.stderr = o_stderr
+			inform._rrmscan, inform._time = o_rrm, o_time
+			inform._event_queue, inform._event_seen = {}, {}
+			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		-- The contract is 10.6.106's own handler (com.ubnt.service.devmgr.e.c):
 		-- it needs BOTH "channel" and "freq" in the notif_payload and drops
 		-- the event with "Event without handler" if either is missing, reads

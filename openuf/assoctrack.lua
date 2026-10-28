@@ -201,6 +201,12 @@ end
 -- "<uptime> fdb <bridge monitor line>" lines come from the collector's fdb
 -- half (rrmscan.collector_script, opts.fdb) and become ev = "fdb" with the
 -- bridge port the address was learned on.
+--
+-- "<uptime> <ifname> DFS-RADAR-DETECTED ..." lines come off the control-socket
+-- monitor and belong to nothing here -- they become ev = "radar" and are the
+-- DFS consumer's (inform._dfs_poll, via rrmscan.radar_of). This walk is the
+-- only one the blob gets while connection tracking is on, and a second full
+-- gmatch pass over the same lines just to find them is the cost this avoids.
 local WANTED = {auth = true, assoc = true, ["sta-authorized"] = true, disassoc = true}
 
 function M.parse_events(blob)
@@ -218,16 +224,31 @@ function M.parse_events(blob)
 				and not rest:find("permanent", 1, true) then
 				out[#out + 1] = {t = tonumber(ft), ev = "fdb", mac = mac:lower(), port = port}
 			end
-		elseif t and WANTED[ev] then
-			local mac = body:match('"address":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
-			if mac then
+		elseif t then
+			if WANTED[ev] then
+				local mac = body:match('"address":"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)"')
+				if mac then
+					out[#out + 1] = {
+						t      = tonumber(t),
+						ev     = ev,
+						mac    = mac:lower(),
+						ifname = body:match('"ifname":"([^"]+)"'),
+						signal = tonumber(body:match('"signal":(%-?%d+)')),
+						alg    = body:match('"auth%-alg":"([^"]+)"'),
+					}
+				end
+			end
+		else
+			-- Only lines that are neither a ubus notification nor an fdb move
+			-- are tried against this: the probes that are the bulk of the file
+			-- matched above, so they pay no extra pattern.
+			local rt, rif = line:match("^(%d+%.?%d*)%s+(%S+)%s+DFS%-RADAR%-DETECTED")
+			if rt then
 				out[#out + 1] = {
-					t      = tonumber(t),
-					ev     = ev,
-					mac    = mac:lower(),
-					ifname = body:match('"ifname":"([^"]+)"'),
-					signal = tonumber(body:match('"signal":(%-?%d+)')),
-					alg    = body:match('"auth%-alg":"([^"]+)"'),
+					t      = tonumber(rt),
+					ev     = "radar",
+					ifname = rif,
+					freq   = tonumber(line:match("%sfreq=(%d+)")),
 				}
 			end
 		end

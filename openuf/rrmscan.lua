@@ -320,19 +320,26 @@ end
 -- channel. A line without a usable freq is dropped rather than reported with a
 -- guessed channel -- the controller's handler needs both fields and ignores
 -- the event if either is missing.
+-- One detection as the event queue wants it, or nil when the frequency is
+-- missing or unknown. The single place that decides a line is unusable: the
+-- collector blob is walked by assoctrack.parse_events when connection tracking
+-- is on (inform._dfs_poll then feeds its radar records through here) and by
+-- parse_dfs below when nothing else is reading the file.
+function M.radar_of(t, ifname, freq)
+	freq = tonumber(freq)
+	local ch = M.channel_of_freq(freq)
+	if not ch then return nil end
+	return {t = tonumber(t), ifname = ifname, freq = freq, channel = ch}
+end
+
 function M.parse_dfs(blob)
 	local out = {}
 	if type(blob) ~= "string" then return out end
 	for line in blob:gmatch("[^\n]+") do
 		local t, ifname = line:match("^(%d+%.?%d*)%s+(%S+)%s+DFS%-RADAR%-DETECTED")
 		if t then
-			local freq = tonumber(line:match("%sfreq=(%d+)"))
-			local ch = M.channel_of_freq(freq)
-			if ch then
-				out[#out + 1] = {
-					t = tonumber(t), ifname = ifname, freq = freq, channel = ch,
-				}
-			end
+			local d = M.radar_of(t, ifname, line:match("%sfreq=(%d+)"))
+			if d then out[#out + 1] = d end
 		end
 	end
 	return out

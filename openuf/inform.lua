@@ -137,6 +137,11 @@ M.RRM_REQUEST_INTERVAL = 3600
 -- exactly where it matters and the steady state costs nothing.
 M.RRM_COLLECTOR_CHECK_INTERVAL = 60
 M._rrm_collector_next = 0
+-- ... and once that check reports no collector, there is nothing left for it
+-- to find: only collector_ensure starts one, and it clears this. A site that
+-- wants no subscriber (DFS only, or nothing on at all) therefore pgreps once,
+-- not once a minute forever. _reap_collector owns both.
+M._collector_reaped = false
 
 -- Connection tracking for the controller's WiFi Connectivity view (see
 -- assoctrack.lua). _vap_by_ifname maps a hostapd BSS netdev to the vap_table
@@ -5970,18 +5975,58 @@ end
 -- Fold the drained collector lines into connection attempts and decide the
 -- ones that are complete. The nft listing is skipped while nobody is
 -- mid-connection, which is nearly every heartbeat.
+--
+-- Returns the parsed event list, which is the only walk of these lines: the
+-- radar records in it are _dfs_poll's.
 function M._assoc_poll(blob)
 	local at = M._assoctrack
 	local evs = at.parse_events(blob)
 	at.ingest(evs)
 	at.roam_ingest(evs, M._vap_by_ifname)
-	if next(at._stas) == nil then return end
+	if next(at._stas) == nil then return evs end
 	local up = tonumber(((M._read_file("/proc/uptime") or ""):match("^(%S+)")))
-	if not up then return end
+	if not up then return evs end
 	at.poll({
 		now = up, epoch = M._time(), sets = at.read_sets(up),
 		vap_by_ifname = M._vap_by_ifname,
 	})
+	return evs
+end
+
+-- Kill a collector nobody wants any more, and stop asking once it is gone.
+--
+-- The question costs a `pgrep` and the answer cannot change behind our back:
+-- nothing starts a collector except collector_ensure, which clears the latch.
+-- Without it a DFS-only site -- or one that never had enrichment on at all --
+-- pays that pgrep every RRM_COLLECTOR_CHECK_INTERVAL for as long as the daemon
+-- runs, to be told the same thing every time.
+function M._reap_collector(rrm)
+	if M._collector_reaped or not (rrm and rrm.collector_running) then return end
+	local ok, running = pcall(rrm.collector_running)
+	if not ok then return end
+	if running then
+		-- Not latched on a stop: collector_stop is a `kill` whose success is
+		-- not read back, and a child that survived it is exactly the unbounded
+		-- append this check exists to stop. The next interval asks again.
+		pcall(rrm.collector_stop)
+		return
+	end
+	M._collector_reaped = true
+end
+
+-- Is there anything in the collector's event file? An open and a seek, against
+-- drain()'s read of the whole file plus the truncating rewrite that follows it
+-- -- and on a site where the collector is not running (DFS only) the file does
+-- not exist at all, so the answer is one failed open per heartbeat.
+function M._events_pending(rrm)
+	-- No file to look at (a test's stub, a future collector that keeps its
+	-- lines elsewhere): drain and let it answer, as before.
+	if not rrm.EVENT_FILE then return true end
+	local f = io.open(rrm.EVENT_FILE, "r")
+	if not f then return false end
+	local size = f:seek("end")
+	f:close()
+	return (tonumber(size) or 0) > 0
 end
 
 -- The hostapd event collector serves two consumers: 802.11k enrichment
@@ -6013,12 +6058,14 @@ function M._rrm_tick(cfg, st)
 		--
 		-- Rate-limited on the collector's own liveness clock rather than run
 		-- every tick: this is a pgrep, and there is nothing to catch between
-		-- checks once the child is gone.
+		-- checks once the child is gone. Latched on top of that (see
+		-- M._collector_reaped): a site that never had enrichment on, or had it
+		-- on and has since been cleaned up, would otherwise pgrep every 60 s
+		-- for the lifetime of the daemon to learn the same thing every time.
 		local now = M._time()
 		if now >= M._rrm_collector_next then
 			M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
-			local ok_r, running = pcall(rrm.collector_running)
-			if ok_r and running then pcall(rrm.collector_stop) end
+			M._reap_collector(rrm)
 			if M._assoc_installed then
 				pcall(M._assoctrack.teardown)
 				M._assoc_installed = false
@@ -6048,13 +6095,15 @@ function M._rrm_tick(cfg, st)
 		if rrm_on or assoc_on then
 			pcall(rrm.collector_ensure,
 				assoc_on and {on_auth = M._assoctrack.forget_shell("m"), fdb = true} or nil)
-		elseif rrm.collector_running then
+			-- A collector is wanted again, so whatever the latch below learned
+			-- about there not being one no longer holds.
+			M._collector_reaped = false
+		else
 			-- DFS only: no subscriber is wanted, and one left over from a run
 			-- with enrichment on is a detached child that would append to the
 			-- event file forever. collector_stop also takes the monitors and
 			-- the file with it, so it runs before monitors_ensure below.
-			local ok_r, running = pcall(rrm.collector_running)
-			if ok_r and running then pcall(rrm.collector_stop) end
+			M._reap_collector(rrm)
 		end
 		-- The control-socket monitors serve the 802.11k enrichment and the
 		-- DFS radar event: connection tracking reads the ubus lines alone.
@@ -6068,18 +6117,26 @@ function M._rrm_tick(cfg, st)
 		end
 	end
 
+	-- A quiet event file is the common case -- on a DFS-only site it is every
+	-- heartbeat, since nothing is subscribing -- so the size is checked before
+	-- draining, the way _roam_poll already does between heartbeats.
 	local blob
-	if rrm.drain then
+	if rrm.drain and M._events_pending(rrm) then
 		local ok_d, b = pcall(rrm.drain)
 		if ok_d then blob = b end
 	end
+	local evs
 	if assoc_on then
-		local ok_a, err_a = pcall(M._assoc_poll, blob)
-		if not ok_a then io.stderr:write("inform: assoctrack: " .. tostring(err_a) .. "\n") end
+		local ok_a, res = pcall(M._assoc_poll, blob)
+		if ok_a then evs = res
+		else io.stderr:write("inform: assoctrack: " .. tostring(res) .. "\n") end
 	end
 	-- Before the rrm_on return: a radar hit is reported whether or not 802.11k
 	-- enrichment is on, and the monitors that produce it run on the DFS gate.
-	pcall(M._dfs_poll, blob)
+	-- `evs` is the walk _assoc_poll already did over these same lines: with
+	-- connection tracking on, the radar records come out of it instead of a
+	-- second gmatch pass over the blob. Nothing drained, nothing to look at.
+	if blob and blob ~= "" then pcall(M._dfs_poll, blob, evs) end
 	if not rrm_on then return true end
 	-- Lines _idle drained since the last heartbeat were ingested there; the
 	-- beacon reports among them are still the harvest's.
@@ -6089,7 +6146,10 @@ function M._rrm_tick(cfg, st)
 		blob, M._pre_blob = table.concat(chunks), nil
 	end
 
-	local ok, fresh, reporters = pcall(rrm.harvest, blob)
+	-- `blob or ""`, never a bare nil: harvest drains the file itself when it is
+	-- handed nothing, which would undo the size gate above (and re-read a file
+	-- a failed drain has already emptied).
+	local ok, fresh, reporters = pcall(rrm.harvest, blob or "")
 	if ok then
 		-- A station that answered is off the bench, whatever it reported.
 		for mac in pairs(reporters or {}) do M._rrm_asked[mac] = nil end
@@ -6643,11 +6703,29 @@ end
 -- which is what 6.8.2 sends beside channel and freq; the handler reads
 -- channel (as a string) and freq (as a number) and ignores the event if
 -- either is missing.
-function M._dfs_poll(blob)
+--
+-- `evs` is assoctrack.parse_events' output over the same blob, when connection
+-- tracking has already walked it: its radar records are turned into the same
+-- {t, ifname, freq, channel} rows by rrmscan.radar_of, so the blob is walked
+-- once per drain rather than once per consumer. Without it (DFS only, nothing
+-- else reading the file) parse_dfs does the walk itself.
+function M._dfs_poll(blob, evs)
 	local rrm = M._rrmscan
 	if not (rrm and rrm.parse_dfs) then return 0 end
+	local hits
+	if evs then
+		hits = {}
+		for _, e in ipairs(evs) do
+			if e.ev == "radar" then
+				local d = rrm.radar_of(e.t, e.ifname, e.freq)
+				if d then hits[#hits + 1] = d end
+			end
+		end
+	else
+		hits = rrm.parse_dfs(blob)
+	end
 	local n = 0
-	for _, d in ipairs(rrm.parse_dfs(blob)) do
+	for _, d in ipairs(hits) do
 		if M.queue_event{
 			event_string = "EVT_AP_RadarDetected",
 			channel      = tostring(d.channel),
@@ -6704,11 +6782,7 @@ end
 function M._roam_poll()
 	local rrm, at, st = M._rrmscan, M._assoctrack, M._roam_st
 	if not (rrm and at and rrm.drain) then return end
-	local f = io.open(rrm.EVENT_FILE, "r")
-	if not f then return end
-	local size = f:seek("end")
-	f:close()
-	if not size or size == 0 then return end
+	if not M._events_pending(rrm) then return end
 	local blob = rrm.drain()
 	if not blob or blob == "" then return end
 	if M._roam_keep then
@@ -6720,8 +6794,9 @@ function M._roam_poll()
 	at.ingest(evs)
 	at.roam_ingest(evs, M._vap_by_ifname)
 	-- This drain is the only one these lines get, so the radar events in it
-	-- are queued here too; they go out with the next heartbeat.
-	pcall(M._dfs_poll, blob)
+	-- are queued here too; they go out with the next heartbeat. Off the walk
+	-- parse_events just did, not a second one over the same blob.
+	pcall(M._dfs_poll, blob, evs)
 	-- Only the roam reports: the funnel's keep the heartbeat's cadence.
 	if #at._roam_queue > 0 and st and st.adopted and M._notif_identity then
 		post_notifs(st, at.take_roams(at.MAX_ROAMS), at.requeue_roams)
