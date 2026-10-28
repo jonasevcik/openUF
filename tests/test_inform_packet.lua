@@ -7617,7 +7617,88 @@ return {
 			real._resolve = orig_resolve
 			inform._ucihelper = nil
 			inform._guest_server, inform._guest_built, inform._guest_ctx = nil, nil, nil
-			inform._guest_wg_next = 0
+			inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a push does not re-ask DNS for a garden whose names did not move",
+		fn = function()
+			local real, rt, save = inform._guestportal, inform._time, inform._state.save
+			local orig_resolve = real._resolve
+			local asked = 0
+			real._resolve = function() asked = asked + 1; return {"198.51.100.20"} end
+			inform._guestportal = {
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+			}
+			inform._state.save = function() end
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local spec = {enabled = true, url = "http://192.0.2.2/",
+					wg_allowed = {"a.example"}, wg_restricted = {}}
+				local st = sample_state({guest_token = "00", guest_portal = spec})
+				inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 2, "the first push resolves: one name, asked twice")
+				-- The controller repeats the whole garden on every push, and
+				-- each name costs two blocking nslookups.
+				inform._guest_wg_resolve(st)
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 2, "two more pushes with the same names ask nothing")
+				spec.wg_allowed = {"a.example", "b.example"}
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 6, "a changed name list resolves both names")
+				spec.wg_allowed = {"b.example", "a.example"}
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 10, "so does a reordering: that is the order they are asked in")
+				now = now + inform.GUEST_WG_INTERVAL
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 14, "and the ten-minute window reopens it")
+			end)
+			inform._guestportal, inform._time, inform._state.save = real, rt, save
+			real._resolve = orig_resolve
+			inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a garden pass that runs out of time is retried in two minutes",
+		fn = function()
+			local real, rt, save = inform._guestportal, inform._time, inform._state.save
+			local orig_resolve, orig_now = real._resolve, real._now
+			local clock, asked = 0, 0
+			real._now = function() return clock end
+			real._resolve = function()
+				asked = asked + 1
+				clock = clock + 5
+				return {"198.51.100.20"}
+			end
+			inform._guestportal = {
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+			}
+			inform._state.save = function() end
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_token = "00", guest_portal = {enabled = true,
+					url = "http://192.0.2.2/", wg_allowed = {"a.example", "b.example"},
+					wg_restricted = {}}})
+				inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+				with_stderr(function() inform._guest_wg_resolve(st) end)
+				assert_eq(asked, 1, "the budget is spent inside the first name")
+				assert_eq(inform._guest_wg_next, now + inform.GUEST_WG_RETRY,
+					"so the heartbeat comes back in two minutes, not ten")
+				asked, clock = 0, 0
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 0, "a push inside the retry window asks nothing")
+				now = now + inform.GUEST_WG_RETRY
+				with_stderr(function() inform._guest_wg_resolve(st) end)
+				assert_true(asked > 0, "the retry window reopens it")
+			end)
+			inform._guestportal, inform._time, inform._state.save = real, rt, save
+			real._resolve, real._now = orig_resolve, orig_now
+			inform._guest_wg_next, inform._guest_wg_sig = 0, nil
 			if not ok then error(err, 0) end
 		end
 	},

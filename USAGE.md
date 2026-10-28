@@ -1608,6 +1608,20 @@ Two traps worth knowing:
   schedule-action` gets. Each name is asked twice per round, as the firmware's
   `walled_action.sh` does, so a round-robin record does not shrink the set.
 
+`nslookup` **blocks**, and the inform loop is single-threaded, so the garden is bounded
+on three sides — a dead resolver must not cost the AP its heartbeat:
+
+| Bound | Value | What it does |
+|---|---|---|
+| `guestportal.WG_MAX_SITES` | 32 per list | names past it are dropped with a log line naming the first one |
+| `inform.GUEST_WG_BUDGET` | 5 s per pass | past it no further name is asked; the rest keep their last answer, exactly as a name that failed to resolve does. One name can overrun by a single lookup |
+| the name list's signature | — | a push repeats the whole garden whether or not it changed, and a Force Provision loop repeats it every few seconds. An unchanged list inside the refresh window is not re-asked at all |
+
+A pass that ran out of time opens a two-minute window (`GUEST_WG_RETRY`) instead of the
+usual ten, so the names it never reached are picked up soon — without letting the pushes
+in between re-ask. On the Archer C5 a blackholed lookup takes 5 s (musl's resolver cap),
+so the worst a push can cost is about 10 s.
+
 The answers live in `state.json` as `guest_wg_ips` (`{allowed = {name = {ip, …}},
 restricted = …}`), which makes two things true: a reboot rebuilds the rules from the last
 good answers instead of waiting on DNS, and a name that *stops* resolving keeps the
@@ -1712,6 +1726,12 @@ redirect. firewall4 already pulls in `kmod-nft-nat`.
 - `guestportal: ignoring malformed walled-garden site`: the name did not pass openUF's
   check (spaces, an IPv4 literal, a label over 63 characters). It never reaches a
   command line.
+- `guestportal: walled garden: out of time at <name> -- the names from here on keep
+  their last answer until the next refresh`: the pass spent its `GUEST_WG_BUDGET`. The
+  usual cause is a resolver that is not answering; check `nslookup <name>` on the
+  device. The remaining names are retried two minutes later.
+- `guestportal: walled garden: more than 32 allowed sites pushed`: the list is longer
+  than `WG_MAX_SITES`. Express the tail as subnets instead.
 - `guestportal: walled-garden addresses changed -- rebuilding`: the ten-minute refresh
   found a different address set and rebuilt the chains.
 

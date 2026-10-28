@@ -92,6 +92,13 @@ M.MARK_HTTP    = "0x40000000"
 -- Where the NAT-redirected HTTP is answered. Not 80: uhttpd/LuCI may hold it.
 M.PORT         = 8820
 
+-- Names per list the garden will resolve. Each one costs two blocking
+-- nslookups, and a blackholed resolver takes 5 s per lookup (musl's res_msend
+-- cap, measured on the Archer C5), so an unbounded list is a stall measured in
+-- minutes on a daemon whose heartbeat is 10 s. The controller's own UI offers
+-- no such list length; anything past this is dropped with a line in the log.
+M.WG_MAX_SITES = 32
+
 -- ─── Parsing ─────────────────────────────────────────────────────────────────
 
 local function is_ipv4(s)
@@ -303,6 +310,12 @@ function M.parse(sys_raw)
 						.. ("%q"):format(tostring(r.name)) .. "\n")
 				elseif not seen[r.name] then
 					seen[r.name] = true
+					if #out >= M.WG_MAX_SITES then
+						io.stderr:write(("guestportal: walled garden: more than %d %s "
+							.. "sites pushed -- %q and any after it are not enforced\n")
+							:format(M.WG_MAX_SITES, which, r.name))
+						break
+					end
 					out[#out + 1] = r.name
 				end
 			end
@@ -353,33 +366,67 @@ end
 -- allowed site) or close it (a restricted one). Names no longer pushed are
 -- dropped. Like walled_action.sh, each name is asked twice and the answers
 -- merged, so a round-robin record does not shrink the set on alternate runs.
+--
+-- `budget` is how many seconds of wall clock the whole pass may spend asking:
+-- M._resolve blocks, and the daemon that calls this has a heartbeat to keep.
+-- Past it no further name is asked; the names already done are kept, the rest
+-- fall back on prev exactly as a name that failed to resolve does, and the
+-- fourth return value says the pass was cut short so the caller can come back
+-- sooner. A budget, not a deadline, so the clock is only ever M._now() --
+-- inform.lua's own M._time is a different, test-stubbed one.
+--
 -- Returns the new {name = {ip, ...}} map, how many names could not be
--- resolved, and whether the flattened address set changed.
-function M.resolve_garden(names, prev)
+-- resolved, whether the flattened address set changed, and whether the pass
+-- ran out of time.
+M._now = os.time
+function M.resolve_garden(names, prev, budget)
 	prev = type(prev) == "table" and prev or {}
-	local map, failed = {}, 0
+	local map, failed, partial, said = {}, 0, false, false
+	local deadline = tonumber(budget) and (M._now() + budget) or nil
 	for _, name in ipairs(names or {}) do
+		local out_of_time = deadline and M._now() >= deadline
 		local ips, seen = {}, {}
-		for _ = 1, 2 do
-			for _, ip in ipairs(M._resolve(name) or {}) do
-				if not seen[ip] then
-					seen[ip] = true
-					ips[#ips + 1] = ip
+		if not out_of_time then
+			for n = 1, 2 do
+				-- Also between the two asks, so one name can overrun the
+				-- deadline by at most a single lookup.
+				if n == 2 and deadline and M._now() >= deadline then
+					partial = true
+					break
+				end
+				for _, ip in ipairs(M._resolve(name) or {}) do
+					if not seen[ip] then
+						seen[ip] = true
+						ips[#ips + 1] = ip
+					end
 				end
 			end
 		end
-		if #ips == 0 then
-			failed = failed + 1
-			if prev[name] then
+		if #ips > 0 then
+			map[name] = ips
+		else
+			-- One line for the whole cut-off, not one per name left: the names
+			-- after the deadline were never asked, so "did not resolve" would
+			-- be wrong about every one of them.
+			if out_of_time then
+				if not said then
+					said = true
+					io.stderr:write("guestportal: walled garden: out of time at "
+						.. name .. " -- the names from here on keep their last "
+						.. "answer until the next refresh\n")
+				end
+				partial = true
+				map[name] = prev[name]
+			elseif prev[name] then
+				failed = failed + 1
 				io.stderr:write("guestportal: walled garden: " .. name
 					.. " did not resolve -- keeping the last " .. #prev[name] .. " address(es)\n")
 				map[name] = prev[name]
 			else
+				failed = failed + 1
 				io.stderr:write("guestportal: walled garden: " .. name
 					.. " did not resolve and has no earlier answer -- not enforced\n")
 			end
-		else
-			map[name] = ips
 		end
 	end
 	local function flat(m)
@@ -388,7 +435,7 @@ function M.resolve_garden(names, prev)
 		table.sort(l)
 		return table.concat(l, " ")
 	end
-	return map, failed, flat(map) ~= flat(prev)
+	return map, failed, flat(map) ~= flat(prev), partial
 end
 
 -- A {name = {ip, ...}} map as one sorted, deduplicated address list, which is

@@ -5107,29 +5107,76 @@ end
 -- to run (`*/10 * * * *  syswrapper.sh refresh-walled-garden 1`, which
 -- sysconf.lua therefore installs no crontab line for). Returns true when the
 -- address set changed, i.e. when the chains have to be rebuilt.
+--
+-- Each name costs two blocking nslookups and a blackholed resolver takes 5 s
+-- per lookup, so this is the one path on which the controller can stall the
+-- daemon: it runs inline in handle_response, and three missed informs is what
+-- puts a genuine AP into selfrun. Two bounds, since neither is enough alone:
+--
+--  * the NAME LIST's signature, against the refresh window the last pass
+--    opened. A push repeats the whole garden whether or not it changed (a
+--    Force Provision loop repeats it every few seconds), and re-asking DNS
+--    for an unchanged list inside that window buys nothing: the ten-minute
+--    refresh is what catches an address that moved. The signature is held in
+--    memory, not state.json, because the window is: a restart re-resolves
+--    once, which is also when the chains are rebuilt from scratch anyway.
+--  * a wall-clock budget per pass. Past it no further name is asked and the
+--    rest keep their last answer, which is what a name that stops resolving
+--    already does. One name can overrun by a single lookup, so the worst case
+--    is BUDGET + 5 s.
 M.GUEST_WG_INTERVAL = 600
+-- After a pass that ran out of time, rather than ten minutes.
+M.GUEST_WG_RETRY = 120
+M.GUEST_WG_BUDGET = 5
 M._guest_wg_next = 0
+M._guest_wg_sig = nil
+
+-- The signature of one push's garden names: the two lists in push order, which
+-- is the order they are resolved in, so a reordering is a different list.
+local function guest_wg_sig(names)
+	local parts = {}
+	for _, which in ipairs({"allowed", "restricted"}) do
+		parts[#parts + 1] = which .. "=" .. table.concat(names[which], ",")
+	end
+	return table.concat(parts, " ")
+end
+
 function M._guest_wg_resolve(st)
 	local gp, spec = M._guestportal, st.guest_portal
 	local names = {
 		allowed    = (type(spec) == "table" and spec.wg_allowed) or {},
 		restricted = (type(spec) == "table" and spec.wg_restricted) or {},
 	}
-	M._guest_wg_next = M._time() + M.GUEST_WG_INTERVAL
+	local now = M._time()
 	if #names.allowed == 0 and #names.restricted == 0 then
+		M._guest_wg_next = now + M.GUEST_WG_INTERVAL
+		M._guest_wg_sig = guest_wg_sig(names)
 		if st.guest_wg_ips == nil then return false end
 		st.guest_wg_ips = nil
 		M._state.save(st)
 		return true
 	end
+	local sig = guest_wg_sig(names)
+	if sig == M._guest_wg_sig and now < M._guest_wg_next then return false end
 	local store = type(st.guest_wg_ips) == "table" and st.guest_wg_ips or {}
-	local changed = false
+	local changed, partial = false, false
 	local out = {}
 	for _, which in ipairs({"allowed", "restricted"}) do
-		local map, _, diff = gp.resolve_garden(names[which], store[which])
+		-- One budget for the pass, not one per list: what is left of it after
+		-- the allowed names is what the restricted ones get.
+		local left = M.GUEST_WG_BUDGET - (M._time() - now)
+		local map, _, diff, cut = gp.resolve_garden(names[which], store[which],
+			left > 0 and left or 0)
 		out[which] = map
 		changed = changed or diff
+		partial = partial or cut
 	end
+	M._guest_wg_sig = sig
+	-- A pass that ran out of time opens a shorter window, so the names it
+	-- never asked are picked up by the heartbeat in two minutes rather than
+	-- ten -- without letting every push in between re-ask.
+	M._guest_wg_next = M._time()
+		+ (partial and M.GUEST_WG_RETRY or M.GUEST_WG_INTERVAL)
 	if changed then
 		st.guest_wg_ips = out
 		M._state.save(st)

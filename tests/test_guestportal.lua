@@ -336,6 +336,67 @@ return {
 		end
 	},
 	{
+		name = "guestportal: resolve_garden stops asking when the budget runs out",
+		fn = function()
+			local orig_r, orig_n = gp._resolve, gp._now
+			-- Every lookup costs five seconds, as a blackholed resolver does
+			-- (musl's res_msend cap, measured on the Archer C5).
+			local clock, asked = 0, {}
+			gp._now = function() return clock end
+			gp._resolve = function(n)
+				asked[#asked + 1] = n
+				clock = clock + 5
+				return {"198.51.100.20"}
+			end
+			local prev = {["c.example"] = {"198.51.100.33"}, ["d.example"] = {"198.51.100.34"}}
+			local map, failed, changed, partial
+			local err = with_stderr(function()
+				map, failed, changed, partial = gp.resolve_garden(
+					{"a.example", "b.example", "c.example", "d.example"}, prev, 5)
+			end)
+			assert_true(partial, "the pass says it ran out of time")
+			assert_eq(#asked, 1, "one lookup, not eight: the budget is spent inside the first name")
+			assert_eq(failed, 0, "a name never asked did not fail to resolve")
+			assert_eq(table.concat(map["a.example"], ","), "198.51.100.20", "the one name asked is kept")
+			assert_eq(table.concat(map["c.example"], ","), "198.51.100.33",
+				"the names never asked keep their last answer")
+			assert_nil(map["b.example"], "one with no earlier answer is simply absent")
+			assert_true(changed, "a.example appeared, so the chains are rebuilt")
+			local lines = 0
+			for _ in err:gmatch("out of time") do lines = lines + 1 end
+			assert_eq(lines, 1, "one line for the whole cut-off, not one per name left")
+			assert_true(err:find("b.example", 1, true) ~= nil, "naming where it stopped")
+			-- No budget at all is the old, unbounded behaviour.
+			clock, asked = 0, {}
+			local _, _, _, whole = gp.resolve_garden({"a.example", "b.example"}, nil)
+			assert_false(whole, "no budget: the whole list is asked")
+			assert_eq(#asked, 4, "each name twice")
+			gp._resolve, gp._now = orig_r, orig_n
+		end
+	},
+	{
+		name = "guestportal: the walled garden takes at most WG_MAX_SITES names per list",
+		fn = function()
+			local lines = {"dnsmasq.walled_garden.1.status=enabled"}
+			for i = 1, gp.WG_MAX_SITES + 3 do
+				lines[#lines + 1] = ("dnsmasq.walled_garden.1.site.%d.allowed=h%d.example"):format(i, i)
+				lines[#lines + 1] = ("dnsmasq.walled_garden.1.site.%d.restricted=r%d.example"):format(i, i)
+			end
+			local s
+			local err = with_stderr(function()
+				s = gp.parse(CAPTURE .. table.concat(lines, "\n") .. "\n")
+			end)
+			assert_eq(#s.wg_allowed, gp.WG_MAX_SITES, "the allowed list is capped")
+			assert_eq(#s.wg_restricted, gp.WG_MAX_SITES, "and the restricted one independently")
+			assert_eq(s.wg_allowed[gp.WG_MAX_SITES], ("h%d.example"):format(gp.WG_MAX_SITES),
+				"kept in push order up to the cap")
+			assert_true(err:find(("h%d.example"):format(gp.WG_MAX_SITES + 1), 1, true) ~= nil,
+				"the first name dropped is named")
+			assert_true(err:find("allowed", 1, true) ~= nil and err:find("restricted", 1, true) ~= nil,
+				"both lists report their own cut")
+		end
+	},
+	{
 		name = "guestportal: reconcile enforces the garden, allowed above every drop",
 		fn = function()
 			local spec = gp.parse(CAPTURE .. GARDEN)
