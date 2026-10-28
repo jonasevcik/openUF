@@ -33,6 +33,14 @@ instances (`announce`, `inform`) from `/opt/openuf/`.
   0 and 1 are truthy, so normalise before branching.
 - Syntax-check on 5.1: `docker cp openuf/<m>.lua openuf-validation-ap:/tmp/c.lua &&
   docker exec openuf-validation-ap luac -p /tmp/c.lua`
+- **`lua tests/run_tests.lua` from the project root is not the only way the suite runs.**
+  `tools/dist.sh --verify` re-runs it in a scratch tree holding only `openuf/` (stripped),
+  `tests/`, `tools/` and `install.sh`, and the Release workflow builds with `--verify`, so a
+  test that reads any other path passes locally and fails only on the tag. A test that
+  `dofile()`s or opens something outside those four needs that path copied into the verify
+  tree in the same commit. Run `sh tools/dist.sh --verify` whenever a test gains a new
+  file dependency (it caught this twice: README.md at v0.10.0, `tools/cfg-coverage.lua` at
+  v0.13.0 — a whole test FILE errored out, so the total dropped by one file, not one test).
 - CI failure: `gh run list` + `gh run view <id> --log-failed`. Don't guess.
 - Run modules from the project root with `OPENUF_TEST_MODE = true` set; loading
   `inform.lua` without it starts a real inform loop.
