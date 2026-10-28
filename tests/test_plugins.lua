@@ -317,6 +317,57 @@ return {
 		end
 	},
 	{
+		name = "plugins: the enabled list is read once per push, not once per VAP",
+		fn = function()
+			local orig = plugins._read_file
+			local ok, err = pcall(function()
+				local reads, listing = 0, ""
+				plugins._read_file = function(path)
+					if path == plugins.LIST then
+						reads = reads + 1
+						return listing
+					end
+					return nil
+				end
+				plugins._reset()
+				plugins.end_pass()
+
+				-- The zero-plugin install, which is every install until
+				-- someone drops a file in: eight WLANs on a push.
+				local cfg = {config = {}}
+				for _ = 1, 8 do plugins.vap_options({}, VAP, cfg, ENV) end
+				assert_eq(reads, 8, "outside a pass every call re-reads the list")
+
+				reads = 0
+				plugins.begin_pass()
+				for _ = 1, 8 do plugins.vap_options({}, VAP, cfg, ENV) end
+				assert_eq(reads, 1, "inside one, eight VAPs cost one file open")
+
+				-- The pass is dropped on entry, not only on exit: a push that
+				-- raised inside the VAP loop left the pass open, and the next
+				-- one must not be served that stale list. Same cfg table, so
+				-- only the re-open can explain the re-read. (No end_pass()
+				-- before it on purpose -- that is the leaked-pass case.)
+				reads, listing = 0, "\n# nothing enabled\n"
+				plugins.begin_pass()
+				plugins.vap_options({}, VAP, cfg, ENV)
+				assert_eq(reads, 1, "a re-opened pass re-reads")
+
+				-- A different config inside the same pass is a different
+				-- question, so it is not served the first answer.
+				reads = 0
+				plugins.vap_options({}, VAP, {config = {}}, ENV)
+				assert_eq(reads, 1, "another cfg table is re-read")
+				plugins.end_pass()
+				assert_eq(plugins._pass_list, nil, "and end_pass drops the answer")
+			end)
+			plugins._read_file = orig
+			plugins.end_pass()
+			plugins._reset()
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "plugins: fingerprint moves with the list and with a plugin's source",
 		fn = function()
 			with_plugins({a = plugin_src("extra.a = '1'")}, function()

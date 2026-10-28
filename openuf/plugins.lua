@@ -132,8 +132,33 @@ local function names_of(cfg)
 	return all
 end
 
+-- The answer to M.enabled, cached for the length of one config push.
+--
+-- vap_options is called once per VAP, and every call walked names_of again --
+-- which opens /etc/openuf/plugins.enabled -- BEFORE the `#list == 0` early
+-- return, so an install with no plugins at all (every install, until someone
+-- drops a file in) paid one file open per WLAN per push for a list that is
+-- always empty. The list cannot change mid-push: conf.lua is read at startup
+-- and _reconcile_plugins has already fingerprinted the files.
+--
+-- Deliberately NOT nest-safe the way ucihelper.begin_pass is: there is one
+-- caller (apply_config's VAP loop) and begin_pass drops the cache on entry, so
+-- a pass left open by a raise inside the loop cannot serve a stale list to the
+-- next push. Outside a pass every call re-reads, which keeps the test suite's
+-- per-test _read_file stubs independent of one another.
+M._pass = false
+M._pass_list = nil
+function M.begin_pass() M._pass, M._pass_list = true, nil end
+function M.end_pass()   M._pass, M._pass_list = false, nil end
+
 -- The enabled plugins, in order. A name listed twice runs once.
 function M.enabled(cfg)
+	-- Keyed on the cfg table itself, not just on the pass: a caller that
+	-- opened a pass and then asked about a different config gets a real
+	-- answer rather than the first one.
+	if M._pass and M._pass_list and M._pass_list.cfg == cfg then
+		return M._pass_list.list
+	end
 	local out, seen = {}, {}
 	for _, name in ipairs(names_of(cfg)) do
 		if not seen[name] then
@@ -142,6 +167,7 @@ function M.enabled(cfg)
 			if mod then out[#out + 1] = {name = name, mod = mod} end
 		end
 	end
+	if M._pass then M._pass_list = {cfg = cfg, list = out} end
 	return out
 end
 

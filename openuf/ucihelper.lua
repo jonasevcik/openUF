@@ -1881,6 +1881,12 @@ function M.apply_config(resp, cfg, opts)
 	-- times. Nothing between here and the commit reads the wireless config
 	-- through a second cursor, so there is no half-written state to observe.
 	local wcursor = get_uci().cursor()
+	-- One read of the plugin list for the whole loop instead of one per VAP
+	-- (plugins.lua's begin_pass note). Closed after the commit below.
+	do
+		local plugins = get_plugins()
+		if plugins and plugins.begin_pass then plugins.begin_pass() end
+	end
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			local extra = {}
@@ -2541,6 +2547,10 @@ function M.apply_config(resp, cfg, opts)
 	end
 	-- Everything the loop staged, in one rewrite of /etc/config/wireless.
 	wcursor:commit("wireless")
+	do
+		local plugins = get_plugins()
+		if plugins and plugins.end_pass then plugins.end_pass() end
+	end
 
 	-- A VLAN no WLAN uses may still be wanted by a wired port assigned to it
 	-- (DSA per-port VLAN puts the socket in this same bridge -- see

@@ -4785,6 +4785,42 @@ Wiphy phy2
 		end
 	},
 	{
+		name = "ucihelper: the plugin list is read once for the VAP loop, not once per WLAN",
+		fn = function()
+			-- plugins.vap_options walks the enabled list before its
+			-- "#list == 0" early return, and that walk opens
+			-- /etc/openuf/plugins.enabled -- so an install with no plugins at
+			-- all used to pay one file open per WLAN per push. apply_config
+			-- opens a plugin pass around the loop; this counts the opens.
+			local plugins = dofile("openuf/plugins.lua")
+			local reads = 0
+			plugins._read_file = function(path)
+				if path == plugins.LIST then reads = reads + 1 end
+				return nil
+			end
+			local op = ucihelper._plugins
+			ucihelper._plugins = plugins
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local vaps = {}
+					for i = 1, 8 do
+						vaps[i] = {ssid = "wlan" .. i, radio = "radio0",
+							security = "wpa2", x_passphrase = "basepass123"}
+					end
+					ucihelper.apply_config({radio_table = {}, vap_table = vaps},
+						{config = {}})
+					assert_eq(reads, 1, "one list read for eight WLANs")
+					assert_not_nil(db.wireless.openuf_radio0_wlan8,
+						"and every WLAN was still provisioned")
+				end)
+				-- The pass does not outlive the push.
+				assert_eq(plugins._pass, false, "apply_config closed the pass")
+			end)
+			ucihelper._plugins = op
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "ucihelper: one VLAN section per VLAN, not per overridden client",
 		fn = function()
 			-- vlan_section derives the section name from the VID alone, so the
