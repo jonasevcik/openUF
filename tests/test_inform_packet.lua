@@ -7786,6 +7786,16 @@ return {
 				assert_nil(st.guest_wg_ips, "and state no longer carries addresses")
 				assert_false(inform._guest_wg_resync(st), "nothing to refresh")
 				assert_false(inform._guest_wg_resync(sample_state()), "portal off: nothing to do")
+				-- A portal with no garden at all: the fields are absent, not
+				-- empty, which is the case the guard is measured in (it used
+				-- to allocate an empty table per field per heartbeat to take
+				-- a length of). Still nothing resolved and nothing rebuilt.
+				built = 0
+				inform._guest_wg_next = 0
+				assert_false(inform._guest_wg_resync(sample_state({guest_token = "00",
+					guest_portal = {enabled = true, url = "http://192.0.2.2/"}})),
+					"no garden: no refresh")
+				assert_eq(built, 0, "and no rebuild")
 			end)
 			inform._guestportal, inform._time, inform._state.save = real, rt, save
 			real._resolve = orig_resolve

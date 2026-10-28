@@ -1735,6 +1735,105 @@ return {
 		end
 	},
 	{
+		name = "inform json: one walk of radio_table settles both the country and the DFS flag",
+		fn = function()
+			-- The two per-device facts derived from radio_table (country_code
+			-- and M._dfs_radio) used to be two separate ipairs passes over
+			-- the same table. One pass now, stopping as soon as both are
+			-- settled -- counted through is_dfs_channel, the only fork-free
+			-- seam the loop calls per radio.
+			local real_is_dfs = inform._rrmscan.is_dfs_channel
+			local calls = 0
+			inform._rrmscan.is_dfs_channel = function(ch)
+				calls = calls + 1
+				return real_is_dfs(ch)
+			end
+			local o_dfs = inform._dfs_radio
+			local radios
+			inject_sysinfo(false)
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				local out = {}
+				for i, r in ipairs(radios) do
+					out[i] = {name = "radio" .. (i - 1), radio = r.radio,
+						channel = r.channel, country = r.country, ht = "HT20",
+						tx_power = "20", disabled = false, max_txpower = 20}
+				end
+				return out
+			end
+			local function run()
+				calls = 0
+				local st = {
+					authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+					inform_url = "http://10.0.0.1:8080/inform",
+					mac = "00:00:5e:00:53:01", ip = "192.0.2.3",
+					hostname = "testap",
+				}
+				return cjson.decode(inform.build_json(st, nil, ufhw))
+			end
+			local ok, err = pcall(function()
+				-- The first radio answers both questions, so the second is
+				-- never looked at: one is_dfs_channel call, not two.
+				radios = {
+					{radio = "na", channel = 100, country = "CZ"},
+					{radio = "ng", channel = 6},
+				}
+				local d = run()
+				assert_eq(d.country_code, 203, "CZ off the first radio")
+				assert_true(inform._dfs_radio, "channel 100 is DFS")
+				assert_eq(calls, 1, "the walk stopped at the radio that settled both")
+
+				-- Neither fact is settled by the 2.4 radio's channel, so the
+				-- walk goes on and finds the DFS one behind it.
+				radios = {
+					{radio = "ng", channel = 6, country = "CZ"},
+					{radio = "na", channel = 100},
+				}
+				d = run()
+				assert_eq(d.country_code, 203, "still CZ")
+				assert_true(inform._dfs_radio, "the second radio is the DFS one")
+				assert_eq(calls, 2, "both channels tested")
+
+				-- A country option that is not in the ISO table still settles
+				-- the question on the radio that carries it, exactly as the
+				-- old loop's unconditional `break` did -- the fallback wins
+				-- and the second radio's CZ is not consulted.
+				radios = {
+					{radio = "na", channel = 36, country = "ZZ"},
+					{radio = "ng", channel = 6, country = "CZ"},
+				}
+				d = run()
+				assert_eq(d.country_code, 840, "unknown regdomain -> the 840 fallback")
+				assert_false(inform._dfs_radio, "36 and 6 are not DFS")
+				assert_eq(calls, 2, "and both radios were walked, since DFS never settled")
+			end)
+			inform._rrmscan.is_dfs_channel = real_is_dfs
+			inform._dfs_radio = o_dfs
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: the Hotspot 2.0 probe is read once per payload",
+		fn = function()
+			-- fw_caps 0x800000 and fw2_caps 0x80000 are the same probe; it is
+			-- cached in sysinfo, so this is about not asking twice per build.
+			local orig = inform._sysinfo.hs20_supported
+			local asked = 0
+			inform._sysinfo.hs20_supported = function()
+				asked = asked + 1
+				return true
+			end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_eq(asked, 1, "one read for both masks")
+				assert_eq(d.fw_caps, MAC_VLAN_FW_CAPS + 0x800000, "the bit is still set")
+				assert_eq(d.fw2_caps, 0x80000, "and so is RadSec's")
+			end)
+			inform._sysinfo.hs20_supported = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: ACS radio's band is re-derived from the live channel (real ucihelper)",
 		fn = function()
 			-- The inject_ucihelper mock hardcodes radio="ng" and so bypasses
