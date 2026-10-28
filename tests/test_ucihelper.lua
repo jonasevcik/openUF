@@ -3216,6 +3216,31 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: use_only_unifi_wlan commits nothing once the SSIDs are already off",
+		fn = function()
+			-- Every push calls this, and after the first one each branch is a
+			-- no-op -- but it used to commit regardless, so the steady state
+			-- rewrote /etc/config/wireless on the overlay for no change at all.
+			with_ucihelper(function(db, cmds, commits)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "theirs", "wifi-iface")
+
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(db.wireless.theirs.disabled, "1", "disabled on the first pass")
+				assert_eq(commits.wireless, 1, "which is a change, so it commits")
+
+				ucihelper.set_wlan_exclusive(true)
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(commits.wireless, 1, "and then nothing more to write")
+
+				-- A real change still reaches the flash.
+				ucihelper.set_wlan_exclusive(false)
+				assert_eq(db.wireless.theirs.disabled, "0", "re-enabled")
+				assert_eq(commits.wireless, 2, "and committed")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: use_only_unifi_wlan never switches off a mesh or station link",
 		fn = function()
 			-- The option is about SSIDs COMPETING with the controller's on the
@@ -4708,6 +4733,141 @@ Wiphy phy2
 					end
 					assert_eq(nvlan, 2, "VLAN 20 once, though two clients use it")
 					assert_not_nil(db.network.openuf_vlan20, "VLAN 20 got its L2")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a push rewrites the wireless config once, whatever the WLAN count",
+		fn = function()
+			-- /etc/config/wireless lives on the overlay, and the boards openUF
+			-- targets have around 5 MB of it free. wlan_add, ppsk_add and
+			-- mac_vlans_add each used to open their own cursor and commit it, so
+			-- this push (three WLANs, one with private pre-shared keys, one with
+			-- MAC-based VLANs) rewrote the file five times for one set of final
+			-- contents. The commit counter is the only way to see it.
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db, cmds, commits)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {
+							{ssid = "home", radio = "radio0", security = "wpa2",
+							 x_passphrase = "basepass123"},
+							{ssid = "keys", radio = "radio0", security = "wpa2",
+							 x_passphrase = "basepass123",
+							 ppsk = {{key = "clientpass1", vid = 20},
+							         {key = "clientpass2", vid = 30}}},
+							{ssid = "mapped", radio = "radio0", security = "wpa2",
+							 x_passphrase = "basepass123",
+							 mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 40}}},
+						},
+					}, {net = {lan_cpueth = "eth1"}})
+					-- One for wlan_clear's teardown, one for everything the VAP
+					-- loop staged. Not one per WLAN, and not three for the WLAN
+					-- that carries keys and overrides.
+					assert_eq(commits.wireless, 2,
+						"wlan_clear, then the whole VAP loop in a single commit")
+					-- And the config itself is unchanged by the deferral.
+					assert_not_nil(db.wireless.openuf_radio0_home, "the plain WLAN")
+					assert_eq(db.wireless.openuf_radio0_keys_psk1.key, "clientpass1",
+						"the private pre-shared keys still landed")
+					assert_not_nil(db.wireless.openuf_radio0_mapped_vlan40,
+						"and the MAC-based VLAN's section")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: one VLAN section per VLAN, not per overridden client",
+		fn = function()
+			-- vlan_section derives the section name from the VID alone, so the
+			-- written config was always right -- but the loop ran it once per
+			-- ENTRY, and the controller's list is per client. 30 clients on 3
+			-- VLANs issued 150 cursor:set calls for 15 options' worth of config.
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local cursor = ucihelper._uci.cursor()
+					local real_set, sets = cursor.set, 0
+					cursor.set = function(self, config, section, ...)
+						if config == "wireless"
+								and tostring(section):find("_vlan", 1, true) then
+							sets = sets + 1
+						end
+						return real_set(self, config, section, ...)
+					end
+					local entries = {}
+					for i = 1, 30 do
+						entries[i] = {mac = ("00:00:5e:00:53:%02x"):format(i),
+							vid = 20 + (i % 3) * 10}
+					end
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0",
+							security = "wpa2", x_passphrase = "basepass123",
+							mac_vlans = entries}},
+					}, {net = {lan_cpueth = "eth1"}})
+					cursor.set = real_set
+					-- The type plus iface/name/vid/network, per distinct VLAN.
+					assert_eq(sets, 15, "five sets per distinct VLAN, not per client")
+					local nvlan = 0
+					for _, sec in pairs(db.wireless) do
+						if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
+					end
+					assert_eq(nvlan, 3, "and still a section for each of the three")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: the accept file is not rewritten when its bytes are already there",
+		fn = function()
+			-- Another flash write on every push for a list that changes only when
+			-- the admin edits it.
+			local body = "\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+				.. "\n00:00:5e:00:53:01 20\n"
+			local writes = 0
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() writes = writes + 1; return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local orig_read = ucihelper._read_file
+					ucihelper._read_file = function(path)
+						if path == "/etc/openuf/macvlan-openuf_radio0_home" then
+							return body
+						end
+						return orig_read(path)
+					end
+					local vaps = {{ssid = "home", radio = "radio0", security = "wpa2",
+						x_passphrase = "basepass123",
+						mac_filter_policy = "allow",
+						mac_filter_list = {"00:00:5e:00:53:01", "00:00:5e:00:53:09"},
+						mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}}
+					ucihelper.apply_config({radio_table = {}, vap_table = vaps},
+						{net = {lan_cpueth = "eth1"}})
+					ucihelper._read_file = orig_read
+					local w = db.wireless
+					local iface = "openuf_radio0_home"
+					assert_eq(writes, 0, "identical bytes: no write")
+					-- Only the write is skipped. Everything the push hands ap.uc
+					-- still has to happen, or the mapped station gets two lines.
+					assert_eq(w[iface].macfile, "/etc/openuf/macvlan-" .. iface,
+						"hostapd is still pointed at the file")
+					assert_eq(table.concat(w[iface].maclist, ","), "00:00:5e:00:53:09",
+						"and the mapped address still left the maclist")
+					assert_not_nil(w[iface .. "_vlan20"], "its VLAN section too")
 				end)
 			end)
 			ucihelper._write_file, ucihelper._remove_file = ow, orm

@@ -43,6 +43,27 @@ local function get_uci()
 	return require("uci")
 end
 
+-- One cursor for a whole config push, instead of one per VAP.
+--
+-- Every writer below used to open its own cursor and commit it, so a push
+-- rewrote /etc/config/wireless once per WLAN -- three times over for a WLAN
+-- carrying private pre-shared keys and MAC-based VLANs. That is a flash write
+-- each time on boards with ~5 MB of free overlay, for a file whose final
+-- contents are the same either way. `apply_config` now opens one cursor, hands
+-- it to each writer, and commits once when the VAP loop is done.
+--
+-- Called with a cursor, borrow it and leave the committing to its owner;
+-- called with nil, open one and commit it, which is what every other caller
+-- (and every direct caller in the tests) still relies on.
+local function borrow_cursor(cursor)
+	if cursor then return cursor, false end
+	return get_uci().cursor(), true
+end
+
+local function release_cursor(cursor, owned, config)
+	if owned then cursor:commit(config) end
+end
+
 -- General memo for the lookup pass M.begin_pass/end_pass open (see the
 -- wireless_status cache further down, which was the first thing to need one).
 -- Anything in here answers the SAME question for the length of one inform
@@ -657,9 +678,11 @@ end
 -- A key whose VLAN has no network is left out rather than provisioned
 -- without one: that client would land on the VAP's own network, past the
 -- segmentation the key exists for.
-function M.ppsk_add(iface, keys, networks)
-	local uci = get_uci()
-	local cursor = uci.cursor()
+-- cursor:   optional caller's cursor to write into (see borrow_cursor); the
+--           caller then commits. Without one this opens and commits its own.
+function M.ppsk_add(iface, keys, networks, cursor)
+	local owned
+	cursor, owned = borrow_cursor(cursor)
 	for i, k in ipairs(keys or {}) do
 		local net = k.vid and networks[k.vid]
 		if k.vid and not net then
@@ -680,7 +703,7 @@ function M.ppsk_add(iface, keys, networks)
 			end
 		end
 	end
-	cursor:commit("wireless")
+	release_cursor(cursor, owned, "wireless")
 end
 
 -- MAC-based VLANs ("Virtual Network Override"): put a named client on a named
@@ -799,7 +822,12 @@ function M.mac_vlan_plan(vap, networks, section, maclist)
 	local lines = {"", "# openUF: MAC-based VLANs. Rebuilt on every config push."}
 	for _, e in ipairs(keep) do lines[#lines + 1] = e.mac .. " " .. e.vid end
 	local path = M.mac_vlan_path(section)
-	if not M._write_file(path, table.concat(lines, "\n") .. "\n") then
+	local body = table.concat(lines, "\n") .. "\n"
+	-- The entries change only when the admin edits the client list, while this
+	-- runs on every push. Read the file back first and skip a write whose bytes
+	-- are already on the flash. Only the WRITE is skipped: the maclist edit
+	-- below is part of what this push hands ap.uc, not part of the file.
+	if M._read_file(path) ~= body and not M._write_file(path, body) then
 		io.stderr:write(("ucihelper: %s: cannot write %s -- MAC-based VLANs left "
 			.. "unapplied\n"):format(tostring(vap.ssid), path))
 		return nil
@@ -826,14 +854,25 @@ end
 
 -- One wifi-vlan section per VLAN the plan names. Called after wlan_add, like
 -- ppsk_add, since the sections hang off the VAP's.
-function M.mac_vlans_add(iface, plan, networks)
+-- One section per DISTINCT VLAN, not per entry: vlan_section derives the
+-- section name from the VID alone, so N clients on one VLAN wrote the same five
+-- options N times over. The controller's lists are per client, and a site that
+-- overrides 50 of them across 3 VLANs did 250 cursor:set calls for 15 options'
+-- worth of config.
+--
+-- cursor: optional caller's cursor (see borrow_cursor).
+function M.mac_vlans_add(iface, plan, networks, cursor)
 	if not plan then return end
-	local uci = get_uci()
-	local cursor = uci.cursor()
+	local owned
+	cursor, owned = borrow_cursor(cursor)
+	local done = {}
 	for _, e in ipairs(plan.entries) do
-		vlan_section(cursor, iface, e.vid, networks[e.vid])
+		if not done[e.vid] then
+			done[e.vid] = true
+			vlan_section(cursor, iface, e.vid, networks[e.vid])
+		end
 	end
-	cursor:commit("wireless")
+	release_cursor(cursor, owned, "wireless")
 end
 
 -- UCI option marking a wifi-iface that openUF disabled on the user's behalf,
@@ -878,21 +917,28 @@ function M.set_wlan_exclusive(enabled)
 			end
 		end
 	end)
+	local changed = false
 	for _, t in ipairs(targets) do
 		if t.release then
 			cursor:set("wireless", t.name, "disabled", "0")
 			cursor:set("wireless", t.name, AUTODISABLED, "0")
+			changed = true
 		elseif enabled then
 			if t.disabled ~= "1" then
 				cursor:set("wireless", t.name, "disabled", "1")
 				cursor:set("wireless", t.name, AUTODISABLED, "1")
+				changed = true
 			end
 		elseif t.stamped then
 			cursor:set("wireless", t.name, "disabled", "0")
 			cursor:set("wireless", t.name, AUTODISABLED, "0")
+			changed = true
 		end
 	end
-	cursor:commit("wireless")
+	-- Each branch above is already a no-op once it has run, so in the steady
+	-- state -- which is every push after the first -- there is nothing to
+	-- commit, and committing anyway rewrote /etc/config/wireless for it.
+	if changed then cursor:commit("wireless") end
 end
 
 -- ─── Minimum Data Rate ───────────────────────────────────────────────────────
@@ -1006,10 +1052,13 @@ end
 -- pairwise: optional pairwise-cipher token ("gcmp", "ccmp256", ...) from
 --           inform.lua's _wire_pairwise, appended to the encryption string
 --           when this radio's hardware can program it. nil keeps the default.
+-- cursor:   optional caller's cursor to write into (see borrow_cursor), so a
+--           push with several WLANs rewrites /etc/config/wireless once rather
+--           than once per WLAN. The caller commits.
 function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id,
-		pairwise)
-	local uci = get_uci()
-	local cursor = uci.cursor()
+		pairwise, cursor)
+	local owned
+	cursor, owned = borrow_cursor(cursor)
 	local section_name = M.vap_section_name(radio, ssid)
 	local enc = SECURITY_MAP[security] or "psk2"
 	-- The controller's own pairwise cipher (aaa.<n>.wpa.1.pairwise), as the
@@ -1077,7 +1126,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 			end
 		end
 	end
-	cursor:commit("wireless")
+	release_cursor(cursor, owned, "wireless")
 	return section_name
 end
 
@@ -1826,6 +1875,12 @@ function M.apply_config(resp, cfg, opts)
 	-- Every VLAN this push still wants an L2 for; anything else gets pruned
 	-- after the loop.
 	local wanted_vlans = {}
+	-- ONE cursor for the whole loop, committed once below: the three writers
+	-- (wlan_add, ppsk_add, mac_vlans_add) each used to open and commit their
+	-- own, so a four-WLAN push rewrote /etc/config/wireless four to twelve
+	-- times. Nothing between here and the commit reads the wireless config
+	-- through a second cursor, so there is no half-written state to observe.
+	local wcursor = get_uci().cursor()
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			local extra = {}
@@ -2474,15 +2529,18 @@ function M.apply_config(resp, cfg, opts)
 			end
 
 			local section = M.wlan_add(vap.radio, vap.ssid, vap.security,
-				vap.x_passphrase, extra, network, vap.wlanconf_id, vap.pairwise)
+				vap.x_passphrase, extra, network, vap.wlanconf_id, vap.pairwise,
+				wcursor)
 			if vap.ppsk and section then
-				M.ppsk_add(section, vap.ppsk, vlan_networks)
+				M.ppsk_add(section, vap.ppsk, vlan_networks, wcursor)
 			end
 			if mac_vlan and section then
-				M.mac_vlans_add(section, mac_vlan, vlan_networks)
+				M.mac_vlans_add(section, mac_vlan, vlan_networks, wcursor)
 			end
 		end
 	end
+	-- Everything the loop staged, in one rewrite of /etc/config/wireless.
+	wcursor:commit("wireless")
 
 	-- A VLAN no WLAN uses may still be wanted by a wired port assigned to it
 	-- (DSA per-port VLAN puts the socket in this same bridge -- see
