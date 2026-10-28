@@ -1339,6 +1339,8 @@ the station leaves or 30 s have passed since it was authorized:
 - Associated but never authorized (a wrong passphrase looks like this): a WPA failure.
 - A fast (802.11r) roam with no DNS: "soft failure, roam". The controller counts that as
   a successful connection.
+- Each decided attempt is logged as `openuf: assoctrack: <mac> <ifname> vap=<vap> -> <verdict>`
+  (`logread | grep assoctrack`; `no event` is the rule below).
 - **No DHCP and no DNS at all: nothing is sent.** The controller's Success rule needs DNS
   answers, so a sensor that never resolves a name can't pass, and openUF won't invent a
   pass or a failure for it.

@@ -410,6 +410,16 @@ function M.poll(ctx)
 		end
 		if done then
 			M._stas[mac] = nil
+			-- One line per decided attempt: the only record of what the
+			-- funnel was fed and why (or why nothing was). Attempts are rare.
+			io.stderr:write(string.format(
+				"openuf: assoctrack: %s %s vap=%s -> %s (assoc %dms, authz %s, gone=%s)\n",
+				mac, tostring(s.ifname), tostring(vap),
+				f and (f.event_type .. (f.wpa_auth_failures == 1 and " wpa" or f.ip_failures == 1 and " dhcp"
+					or f.dns_timeouts == 1 and " dns" or "")) or "no event",
+				ms(s.t_assoc, s.t_auth),
+				s.t_authz and (ms(s.t_authz, s.t_auth) .. "ms") or "never",
+				tostring(s.t_gone ~= nil)))
 			-- No vap_table entry for this BSS means no band and no WLAN to
 			-- attribute it to; the controller would file it under 2.4 GHz.
 			if f and vap then
