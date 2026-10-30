@@ -5,7 +5,7 @@
 	or reconfigure the device.
 
 	Usage (via syswrapper.sh):
-	  syswrapper.sh set-adopt  <inform_url> <authkey_hex32>
+	  syswrapper.sh set-adopt  <inform_url> <authkey_hex32> [<mac>]
 	  syswrapper.sh set-inform <inform_url>
 	  syswrapper.sh reset-inform
 	  syswrapper.sh 11k-scan          -- the controller's nightly cron job
@@ -59,7 +59,7 @@ end
 
 local function usage()
 	io.stderr:write(
-		"Usage: syswrapper.sh set-adopt <url> <key32hex>\n" ..
+		"Usage: syswrapper.sh set-adopt <url> <key32hex> [<mac>]\n" ..
 		"       syswrapper.sh set-inform <url>\n" ..
 		"       syswrapper.sh reset-inform\n" ..
 		"       syswrapper.sh 11k-scan\n" ..
@@ -77,12 +77,18 @@ local function is_url(s)
 	return type(s) == "string" and (s:match("^https?://") ~= nil)
 end
 
+local function is_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+
 -- ─── Commands ────────────────────────────────────────────────────────────────
 
--- set-adopt <url> <key>
+-- set-adopt <url> <key> [<mac>]
 -- Called by the controller after clicking Adopt.  Stores the new authkey
 -- and marks the device as adopted.
-local function cmd_set_adopt(url, key)
+-- A MAC that differs from the one this device informs with is refused: the
+-- controller is adopting another device at this address.
+local function cmd_set_adopt(url, key, mac)
 	if not is_url(url) then
 		io.stderr:write("syswrapper: invalid URL: " .. tostring(url) .. "\n")
 		return false
@@ -92,8 +98,17 @@ local function cmd_set_adopt(url, key)
 			.. tostring(key) .. "\n")
 		return false
 	end
+	if mac ~= nil and not is_mac(mac) then
+		io.stderr:write("syswrapper: invalid MAC: " .. tostring(mac) .. "\n")
+		return false
+	end
 	local st = load_state()
 	local s  = st.load()
+	if mac and type(s.mac) == "string" and s.mac:lower() ~= mac:lower() then
+		io.stderr:write("syswrapper: set-adopt names " .. mac .. ", this device is "
+			.. s.mac .. "\n")
+		return false
+	end
 	s.inform_url = url
 	s.authkey    = key:lower()
 	s.adopted    = true
@@ -224,7 +239,7 @@ end
 local function main(args)
 	local cmd = args[1]
 	if cmd == "set-adopt" then
-		if not cmd_set_adopt(args[2], args[3]) then
+		if not cmd_set_adopt(args[2], args[3], args[4]) then
 			usage(); os.exit(1)
 		end
 	elseif cmd == "set-inform" then

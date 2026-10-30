@@ -5,7 +5,10 @@
 # install.sh). Permits exactly one command shape and nothing else, whether
 # invoked interactively or non-interactively over SSH:
 #
-#   syswrapper.sh set-adopt <url> <key32hex>
+#   [/usr/bin/]syswrapper.sh set-adopt <url> <key32hex> [<mac>]
+#
+# UniFi Network 10.6 sends the absolute path, and some builds append the
+# device's MAC. syswrapper.lua refuses a MAC that is not this AP's.
 #
 # Any other input -- including a plain interactive login attempt -- is
 # refused. This is the actual security boundary for the bootstrap account:
@@ -24,10 +27,12 @@ deny() {
 # refused outright -- this account never gets an interactive prompt.
 [ "$1" = "-c" ] || deny "interactive login not permitted"
 
+SYSWRAPPER=/usr/bin/syswrapper.sh
+
 cmd=$2
 
 case "$cmd" in
-	"syswrapper.sh set-adopt "*) ;;
+	"syswrapper.sh set-adopt "*|"$SYSWRAPPER set-adopt "*) ;;
 	*) deny "command not permitted" ;;
 esac
 
@@ -37,10 +42,10 @@ esac
 # against files in the current directory.
 set -f
 set -- $cmd
-[ "$#" -eq 4 ] || deny "malformed command"
+[ "$#" -eq 4 ] || [ "$#" -eq 5 ] || deny "malformed command"
 
-bin=$1; sub=$2; url=$3; key=$4
-[ "$bin" = "syswrapper.sh" ] || deny "malformed command"
+bin=$1; sub=$2; url=$3; key=$4; mac=${5:-}
+[ "$bin" = "syswrapper.sh" ] || [ "$bin" = "$SYSWRAPPER" ] || deny "malformed command"
 [ "$sub" = "set-adopt" ]     || deny "malformed command"
 
 case "$url" in
@@ -53,4 +58,11 @@ case "$key" in
 esac
 [ "${#key}" -eq 32 ] || deny "invalid key length"
 
-exec /usr/bin/syswrapper.sh set-adopt "$url" "$key"
+if [ -z "$mac" ]; then
+	exec "$SYSWRAPPER" set-adopt "$url" "$key"
+fi
+case "$mac" in
+	*[!0-9a-fA-F:]*) deny "invalid mac" ;;
+esac
+[ "${#mac}" -eq 17 ] || deny "invalid mac"
+exec "$SYSWRAPPER" set-adopt "$url" "$key" "$mac"

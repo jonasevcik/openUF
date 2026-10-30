@@ -377,8 +377,8 @@ sh install.sh install --bootstrap-adopt
   write access to `/etc/openuf` only — no other privilege, ever, even
   transiently.
 - Its login shell (`openuf/hook/adopt-shell.sh`) is a forced-command wrapper
-  that permits exactly one thing: running `syswrapper.sh set-adopt <url>
-  <key>`. Any other command, or a plain interactive login attempt, is refused
+  that permits exactly one thing: running `[/usr/bin/]syswrapper.sh set-adopt
+  <url> <key> [<mac>]`. Any other command, or a plain interactive login attempt, is refused
   outright — the account can never be used as a general-purpose shell.
 - Once the device is adopted, `inform.lua` locks the account (`passwd -l`) —
   it detects this within one poll interval (~10s) of the SSH-driven

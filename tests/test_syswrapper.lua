@@ -99,6 +99,74 @@ return {
 			assert_false(sw.cmd_set_adopt("10.0.0.1:8080/inform", key), "no scheme rejected")
 		end
 	},
+	{
+		name = "syswrapper: set-adopt takes this device's MAC in any case and refuses another",
+		fn = function()
+			reset_state()
+			local s = state.load()
+			s.mac = "00:00:5e:00:53:01"
+			state.save(s)
+			local key = "deadbeefdeadbeefdeadbeefdeadbeef"
+			local url = "http://192.0.2.1:8080/inform"
+			local real = io.stderr
+			io.stderr = {write = function() end}
+			local other = sw.cmd_set_adopt(url, key, "00:00:5e:00:53:02")
+			local bad = sw.cmd_set_adopt(url, key, "not-a-mac")
+			io.stderr = real
+			assert_false(other, "another device's MAC is refused")
+			assert_false(bad, "a malformed MAC is refused")
+			assert_false(state.load().adopted, "neither adopted the device")
+			assert_true(sw.cmd_set_adopt(url, key, "00:00:5E:00:53:01"), "own MAC, upper case")
+			assert_true(state.load().adopted, "adopted")
+		end
+	},
+	{
+		name = "adopt-shell: accepts the 10.6 form with the absolute path and an optional MAC",
+		fn = function()
+			-- A copy of the shell that execs a stub instead of /usr/bin/syswrapper.sh.
+			local dir = "/tmp/openuf_test_adoptshell_" .. tostring(os.time())
+			os.execute("mkdir -p '" .. dir .. "'")
+			local f = io.open("openuf/hook/adopt-shell.sh", "r")
+			local src = f:read("*a")
+			f:close()
+			local n
+			src, n = src:gsub("\nSYSWRAPPER=/usr/bin/syswrapper.sh\n",
+				"\nSYSWRAPPER=" .. dir .. "/sw\n")
+			assert_eq(n, 1, "the shell names its syswrapper in one assignment")
+			f = io.open(dir .. "/adopt-shell.sh", "w")
+			f:write(src)
+			f:close()
+			f = io.open(dir .. "/sw", "w")
+			f:write('#!/bin/sh\necho "RAN $*"\n')
+			f:close()
+			os.execute("chmod +x '" .. dir .. "/sw'")
+			local function run(cmd)
+				local h = io.popen("sh '" .. dir .. "/adopt-shell.sh' -c '" .. cmd .. "' 2>&1")
+				local out = h:read("*a")
+				h:close()
+				return out
+			end
+			local url = "http://192.0.2.1:8080/inform"
+			local key = string.rep("ab", 16)
+			local mac = "00:00:5e:00:53:01"
+			local sw_path = dir .. "/sw"
+
+			assert_contains(run("syswrapper.sh set-adopt " .. url .. " " .. key),
+				"RAN set-adopt " .. url .. " " .. key, "the bare form")
+			assert_contains(run(sw_path .. " set-adopt " .. url .. " " .. key),
+				"RAN set-adopt " .. url .. " " .. key, "the absolute path 10.6 sends")
+			assert_contains(run(sw_path .. " set-adopt " .. url .. " " .. key .. " " .. mac),
+				"RAN set-adopt " .. url .. " " .. key .. " " .. mac, "the MAC is passed on")
+			assert_contains(run(sw_path .. " set-adopt " .. url .. " " .. key .. " 00:00:5e:00:53"),
+				"invalid mac", "a short MAC is refused")
+			assert_contains(run(sw_path .. " set-adopt " .. url .. " " .. key .. " " .. mac .. " x"),
+				"malformed command", "a sixth word is refused")
+			assert_contains(run("/bin/sh -c id"), "not permitted", "other commands are refused")
+			assert_true(run(sw_path .. " set-adopt " .. url .. " " .. key .. "; id")
+				:find("RAN", 1, true) == nil, "no command chaining")
+			os.execute("rm -rf '" .. dir .. "'")
+		end
+	},
 	-- ── set-inform ────────────────────────────────────────────────────────
 	{
 		name = "syswrapper: set-inform updates inform_url without touching authkey",

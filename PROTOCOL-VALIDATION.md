@@ -1095,6 +1095,10 @@ list comes from the `fw-update.ui.com` firmware API.
   an Inform Host Override) does not reproduce it: a host name the controller cannot resolve
   adopts with and without the field, and the controller records its own address as the
   device's `inform_ip`. Only the UCG can settle it.
+- **Which `set-adopt` form a controller sends.** The bootstrap shell accepts the bare or
+  absolute command path and an optional trailing MAC, which the BZ2 4.3.28 firmware ignores
+  (`syswrapper.sh` reads `$1 $2`). No controller build has been captured sending the MAC form
+  here; the lab and both APs adopt over L3.
 - **`bootrom_version`** has no counterpart in the device schema. The firmware sends it (the
   U-Boot version), so keeping it is right; whether the controller reads it is unknown.
 - **What the plaintext firmware cannot settle.** UAP BZ2 4.0.15 predates OWE, PPSK, WPA3 and FT
