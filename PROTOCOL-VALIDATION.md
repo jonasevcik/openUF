@@ -1085,6 +1085,9 @@ list comes from the `fw-update.ui.com` firmware API.
   Every nft expression is accepted by a real nft and the ruleset loads on both boards, but
   frame-level selection is unproven: the validation container cannot create network namespaces,
   and the alternative is enabling the control on a live WLAN.
+- **Whether the controller escapes a `=` in a passphrase or SSID.** The parser keeps it (unit
+  test, no capture): a WLAN whose passphrase contains `=` has not been pushed from a real
+  controller yet.
 - **`bootrom_version`** has no counterpart in the device schema. The firmware sends it (the
   U-Boot version), so keeping it is right; whether the controller reads it is unknown.
 - **What the plaintext firmware cannot settle.** UAP BZ2 4.0.15 predates OWE, PPSK, WPA3 and FT

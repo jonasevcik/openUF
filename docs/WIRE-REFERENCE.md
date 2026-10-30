@@ -677,6 +677,9 @@ shape `ucihelper.apply_config()` expects.
 Conventions throughout: booleans are `"enabled"`/`"disabled"` (sometimes `"true"`/`"1"`), and
 an **absent block means disabled** — there is generally no explicit `status=false`.
 
+A line splits at its **first** `=`: keys never contain one, values may (a passphrase
+`pass=word`, an SSID `a=b`).
+
 **Provisioning is not driven by `cfgversion` alone.** A device reporting a stale or bogus
 version sometimes gets an immediate full push and sometimes only `noop`s, indefinitely, even
 across restarts and fresh random values; an empty string is ignored outright. The reliable

@@ -817,6 +817,22 @@ return {
 		end
 	},
 	{
+		name = "inform packet: a '=' in a passphrase or SSID stays in the value",
+		fn = function()
+			-- A line splits at its FIRST '='. A greedy key pattern split at
+			-- the last one: the passphrase lost its head (key "wpa.psk=pass"),
+			-- and an SSID with '=' left wireless.<n>.ssid unset so no WLAN
+			-- was built at all.
+			local cfg = "aaa.1.ssid=a=b\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.1.wpa.psk=pass=word==\n"
+				.. "wireless.1.ssid=a=b\nwireless.1.parent=radio0\n"
+			local _, vt = inform._parse_wifi_system_cfg(cfg)
+			assert_not_nil(vt[1], "the WLAN with '=' in its SSID is built")
+			assert_eq(vt[1].ssid, "a=b", "SSID keeps its '='")
+			assert_eq(vt[1].x_passphrase, "pass=word==", "passphrase keeps every '='")
+		end
+	},
+	{
 		name = "inform packet: auth_cache rides the WPA-Enterprise branch and becomes okc",
 		fn = function()
 			-- The one WLAN kind the controller sends auth_cache on, captured

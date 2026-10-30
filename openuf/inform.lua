@@ -2856,15 +2856,15 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- qos.vap.<m>: "WiFi Speed Limit". Needs its own pattern rather than
 		-- the generic <section>.<idx>.<key> one below, since the index sits a
 		-- level down (qos.vap.1.*, alongside qos.if.<n>.* and qos.ebt.<n>.*).
-		local qidx, qkey, qv = line:match("^qos%.vap%.(%d+)%.(.+)=(.*)$")
+		local qidx, qkey, qv = line:match("^qos%.vap%.(%d+)%.([^=]+)=(.*)$")
 		if qidx then
 			qidx = tonumber(qidx)
 			qos_vap[qidx] = qos_vap[qidx] or {}
 			qos_vap[qidx][qkey] = qv
 		end
-		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
-		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
-		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.(.+)=(.*)$") end
+		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.([^=]+)=(.*)$")
+		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.([^=]+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.([^=]+)=(.*)$") end
 		-- stamgr.<n>: per-radio "Station Manager" block, indexed the same as
 		-- radio.<n> -- confirmed live 2026-07-14 (Devices -> [AP] -> Radios ->
 		-- "Minimum RSSI" checkbox+slider, NOT a WLAN-level setting): toggling
@@ -2873,7 +2873,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- stamgr.<n>.loadbalance.status/maxsta sharing the same block.
 		-- The whole block is simply absent when disabled (no explicit
 		-- status=false), same convention as every other optional section here.
-		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.(.+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.([^=]+)=(.*)$") end
 		-- macacl.<m>: the "MAC Address Filter". CONFIRMED live 2026-07-18 by
 		-- enabling the control with one allow-listed MAC and diffing system_cfg
 		-- -- this whole top-level section appeared at once, and it is keyed by
@@ -2887,7 +2887,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- radio.<n>.bcmc_l2_filter.status was for the broadcast blocker.
 		-- aaa.<n>.radius.macacl.status is the separate RADIUS MAC
 		-- Authentication control, read in the vap build below.
-		if not section then section, idx, key, v = line:match("^(macacl)%.(%d+)%.(.+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(macacl)%.(%d+)%.([^=]+)=(.*)$") end
 		if section then
 			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless)
 				or (section == "radio" and radio) or (section == "macacl" and macacl) or stamgr
