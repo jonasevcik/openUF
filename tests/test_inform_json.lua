@@ -9,6 +9,9 @@ local cjson  = require("cjson")
 local state  = dofile("openuf/state.lua")
 local inform = dofile("openuf/inform.lua")
 
+-- build_json looks the inform URL's host up; keep the suite off the network.
+inform._dns_toip = function() return nil end
+
 local function fixture(name)
 	local f = io.open("tests/fixtures/" .. name, "r")
 	if not f then return "" end
@@ -588,6 +591,42 @@ return {
 				assert_eq(d.connect_request_port, "41234", "port, a string")
 			end)
 			inform._stun_c = real
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: inform_ip is the controller's IPv4, resolved once per TTL for a name",
+		fn = function()
+			local real_dns, real_time = inform._dns_toip, inform._time
+			local lookups, now = 0, 1000
+			inform._time = function() return now end
+			inform._dns_toip = function(h)
+				lookups = lookups + 1
+				if h == "unifi" then return "192.0.2.9" end
+				return nil, "host not found"
+			end
+			local function ip_for(url) return inform._inform_ip(url) end
+			local ok, err = pcall(function()
+				inform._inform_ip_cache = nil
+				assert_eq(ip_for("http://192.0.2.7:8080/inform"), "192.0.2.7", "literal passes through")
+				assert_eq(lookups, 0, "no lookup for a literal")
+				assert_eq(ip_for("http://unifi:8080/inform"), "192.0.2.9", "name resolves")
+				assert_eq(ip_for("http://unifi:8080/inform"), "192.0.2.9", "cached")
+				assert_eq(lookups, 1, "one lookup inside the TTL")
+				now = now + inform.INFORM_IP_TTL
+				ip_for("http://unifi:8080/inform")
+				assert_eq(lookups, 2, "looked up again after the TTL")
+				assert_eq(ip_for("http://nowhere.invalid/inform"), nil, "unresolvable: no field")
+				assert_eq(ip_for("http://nowhere.invalid/inform"), nil, "failure cached too")
+				assert_eq(lookups, 3, "a failed lookup is remembered for the TTL")
+				assert_eq(ip_for("http://[2001:db8::1]:8080/inform"), nil, "IPv6 literal: no field")
+				-- And it rides the payload.
+				inform._inform_ip_cache = nil
+				local d = build({st = {inform_url = "http://192.0.2.7:8080/inform"}})
+				assert_eq(d.inform_ip, "192.0.2.7", "inform_ip in build_json")
+			end)
+			inform._dns_toip, inform._time = real_dns, real_time
+			inform._inform_ip_cache = nil
 			if not ok then error(err, 0) end
 		end
 	},

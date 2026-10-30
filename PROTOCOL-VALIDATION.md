@@ -1088,6 +1088,11 @@ list comes from the `fw-update.ui.com` firmware API.
 - **Whether the controller escapes a `=` in a passphrase or SSID.** The parser keeps it (unit
   test, no capture): a WLAN whose passphrase contains `=` has not been pushed from a real
   controller yet.
+- **Whether sending `inform_ip` cures `invalid inform_ip <host>` (HTTP 400).** The 400 is seen on
+  the UCG Ultra with the default `http://unifi:8080/inform`. The lab controller (10.6.106 with
+  an Inform Host Override) does not reproduce it: a host name the controller cannot resolve
+  adopts with and without the field, and the controller records its own address as the
+  device's `inform_ip`. Only the UCG can settle it.
 - **`bootrom_version`** has no counterpart in the device schema. The firmware sends it (the
   U-Boot version), so keeping it is right; whether the controller reads it is unknown.
 - **What the plaintext firmware cannot settle.** UAP BZ2 4.0.15 predates OWE, PPSK, WPA3 and FT

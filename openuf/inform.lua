@@ -299,6 +299,33 @@ function M._sane_interval(v)
 	return math.floor(v)
 end
 
+-- inform_ip: the controller's IPv4 address, from inform_url's host. Without
+-- it the controller reads that host as an IP literal and answers HTTP 400
+-- ("invalid inform_ip <host>") when it is a name, which is the shipped
+-- default. A name is looked up at most once per INFORM_IP_TTL seconds (a
+-- failed lookup is remembered as long); an IP literal costs nothing.
+M.INFORM_IP_TTL = 300
+M._inform_ip_cache = nil
+
+function M._dns_toip(host)
+	return require("socket").dns.toip(host)
+end
+
+function M._inform_ip(url)
+	local host = type(url) == "string" and url:match("^%a+://([^:/]+)") or nil
+	if not host then return nil end
+	if host:find("^%d+%.%d+%.%d+%.%d+$") then return host end
+	local now = M._time()
+	local c = M._inform_ip_cache
+	if c and c.host == host and now >= c.at and now - c.at < M.INFORM_IP_TTL then
+		return c.ip
+	end
+	local ok, ip = pcall(M._dns_toip, host)
+	ip = ok and type(ip) == "string" and ip:find("^%d+%.%d+%.%d+%.%d+$") and ip or nil
+	M._inform_ip_cache = {host = host, ip = ip, at = now}
+	return ip
+end
+
 -- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
 -- bootstrap_adopt_user and USAGE.md's SSH prerequisite section) to match
 -- the device's current adopted state. No-op if user is nil/false (feature
@@ -2209,6 +2236,7 @@ function M.build_json(st, cfg, ufhw)
 		-- strings as the firmware sends them, and only while STUN runs.
 		connect_request_ip   = stun_ip,
 		connect_request_port = stun_port,
+		inform_ip            = M._inform_ip(st.inform_url),
 		["system-stats"] = {
 			cpu    = tostring(cpu_pct),
 			mem    = tostring(mem_pct),
