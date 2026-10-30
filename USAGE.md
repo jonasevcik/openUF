@@ -1603,7 +1603,8 @@ queue per direction for that MAC, `-1` meaning unlimited that way.
 `config.selfrun_guest_mode` to something else, and then it is `off`. openUF does what
 UniFi firmware does (read from its `mcad` and `syswrapper.sh`, builds 3.9.27–4.0.15):
 selfrun starts after **3 informs in a row** go unanswered (`GUEST_SELFRUN_FAILS`). With the
-backoff (10, 20, 40 s) that is about 70 s after the last answer. Selfrun ends with the first
+backoff (10, 20, 40 s) that is about 70 s after the last answer, or about 130 s when the
+controller answered HTTP 503 (it is shedding load, so the wait goes to 60 s at once). Selfrun ends with the first
 answer, and it only does anything while the portal is on.
 - **`pass`, or never received:** openUF adds `meta pkttype other accept` to the `selfrun`
   chain. Every guest then gets through, as an authorized one would: the restricted subnets

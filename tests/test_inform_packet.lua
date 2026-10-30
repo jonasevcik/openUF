@@ -5565,6 +5565,64 @@ return {
 		end
 	},
 	{
+		name = "inform: HTTP 503 waits the cap at once, and 404 on an unadopted device keeps the cadence",
+		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			local logged = {}
+			io.stderr = {write = function(_, m) logged[#logged + 1] = m end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.handle_response = function() return false end
+			inform._logged_pending = false
+			local ok, err = pcall(function()
+				local ctx = {interval = 10, backoff = 10}
+				local st = {inform_url = "http://unifi:8080/inform", adopted = true}
+
+				inform.http_post = function() return nil, "HTTP 503" end
+				assert_eq(inform._tick(st, nil, nil, ctx), 60, "503 waits the cap straight away")
+				ctx.interval, ctx.backoff = 90, 90
+				assert_eq(inform._tick(st, nil, nil, ctx), 90, "or the controller's own longer interval")
+
+				-- Adopted: a 404 is a failure like any other and doubles.
+				ctx.interval, ctx.backoff = 10, 10
+				inform.http_post = function() return nil, "HTTP 404" end
+				assert_eq(inform._tick(st, nil, nil, ctx), 20, "404 after adoption backs off")
+
+				-- Unadopted: the controller's normal answer; keep the cadence.
+				st.adopted = false
+				ctx.interval, ctx.backoff = 10, 10
+				logged = {}
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "pending: own cadence")
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "and again")
+				local pending = 0
+				for _, m in ipairs(logged) do
+					if m:find("pending adoption", 1, true) then pending = pending + 1 end
+				end
+				assert_eq(pending, 1, "logged once")
+				-- Other failures still back off for an unadopted device.
+				inform.http_post = function() return nil, "connection refused" end
+				assert_eq(inform._tick(st, nil, nil, ctx), 20, "a refused connection backs off")
+			end)
+			io.stderr = orig.stderr
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm
+			inform._logged_pending = false
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: _tick waits the controller's interval, and backoff never polls faster",
 		fn = function()
 			local orig = {

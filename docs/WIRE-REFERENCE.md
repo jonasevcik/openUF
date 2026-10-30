@@ -31,6 +31,18 @@ encrypted inform, and the AP firmware does the same ("only support encrypted dat
 plain-HTTP path push a `setparam` without the key; `parse_packet` raises and the tick waits
 its normal interval.
 
+**HTTP status of the inform POST.** 200 carries the answer. Anything else is a failed
+inform: the wait doubles from the current cadence up to 60 s (or the controller's own
+interval, if longer). Two statuses are special:
+
+| Status | Meaning | The device |
+|---|---|---|
+| 503 | The controller is shedding inform load ("Server is busy") | waits the cap at once |
+| 404, device not adopted | The controller's normal answer to a pending device until Adopt is clicked | keeps its own cadence, logs once |
+
+The AP firmware tells neither apart: it logs one `HTTP Status %ld != 200` and enters selfrun
+after three failures in a row.
+
 ### The GCM provisioning gate
 
 **The controller will not provision a device until it has received a genuine AES-GCM

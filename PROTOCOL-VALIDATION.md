@@ -752,8 +752,10 @@ same 404).
 
 `http_post` treats any non-200 as a hard failure and never inspects the body. In every case
 observed the body was genuinely empty, so nothing is lost — but the client cannot distinguish
-"processed, nothing to say" from "rejected," and backs off identically either way. **When you
-see this on a fresh device: click Adopt.** That is the correct next move, not more debugging.
+"processed, nothing to say" from "rejected". An unadopted device therefore keeps its own
+cadence on a 404 (so the inform after the Adopt click is not up to 60 s away) and logs
+`pending adoption` once; after adoption a 404 backs off like any failure. **When you see this
+on a fresh device: click Adopt.** That is the correct next move, not more debugging.
 
 ### Historical stats live in the `unifi_stat` database, on a 5-minute cadence
 
