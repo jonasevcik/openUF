@@ -313,6 +313,25 @@ return {
 		end
 	},
 	{
+		name = "inform packet: parse refuses a response without the encrypted flag",
+		fn = function()
+			-- A plain-JSON reply would otherwise be taken as the controller's:
+			-- anyone on the HTTP path could push a setparam without the key.
+			local st = sample_state()
+			local json = '{"_type":"setparam","inform_url":"http://192.0.2.66:8080/inform"}'
+			local pkt = inform.build_packet(json, st)
+			local flags = pkt:byte(15) * 256 + pkt:byte(16)
+			assert_eq(flags % 2, 1, "the sender sets the encrypted bit")
+			flags = flags - 1
+			-- Header with the 0x01 bit cleared and the payload swapped for JSON.
+			local plain = pkt:sub(1, 14) .. string.char(math.floor(flags / 256), flags % 256)
+				.. pkt:sub(17, 36) .. string.char(0, 0, 0, #json) .. json
+			local ok, err = pcall(inform.parse_packet, plain, st)
+			assert_false(ok, "an unencrypted packet raises")
+			assert_true(tostring(err):find("unencrypted", 1, true) ~= nil, "and says why")
+		end
+	},
+	{
 		name = "inform packet: parse raises error on short packet",
 		fn = function()
 			assert_error(function()
